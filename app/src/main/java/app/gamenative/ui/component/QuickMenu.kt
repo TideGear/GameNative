@@ -12,6 +12,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusGroup
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -49,6 +50,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -151,26 +153,26 @@ fun QuickMenu(
         AnimatedVisibility(
             visible = isVisible,
             enter = slideInHorizontally(
-                initialOffsetX = { fullWidth -> fullWidth },
+                initialOffsetX = { fullWidth -> -fullWidth },
                 animationSpec = spring(
                     dampingRatio = Spring.DampingRatioLowBouncy,
                     stiffness = Spring.StiffnessMediumLow
                 )
             ),
             exit = slideOutHorizontally(
-                targetOffsetX = { fullWidth -> fullWidth },
+                targetOffsetX = { fullWidth -> -fullWidth },
                 animationSpec = spring(
                     dampingRatio = Spring.DampingRatioNoBouncy,
                     stiffness = Spring.StiffnessMedium
                 )
             ),
-            modifier = Modifier.align(Alignment.CenterEnd)
+            modifier = Modifier.align(Alignment.CenterStart)
         ) {
             Surface(
                 modifier = Modifier
                     .width(adaptivePanelWidth(280.dp))
                     .fillMaxHeight(),
-                shape = RoundedCornerShape(topStart = 24.dp, bottomStart = 24.dp),
+                shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp),
                 color = MaterialTheme.colorScheme.surface,
                 tonalElevation = 2.dp,
                 shadowElevation = 24.dp,
@@ -234,12 +236,16 @@ fun QuickMenu(
         }
     }
 
-    LaunchedEffect(isVisible) {
+    LaunchedEffect(isVisible, menuItems.size) {
         if (isVisible) {
-            try {
-                firstItemFocusRequester.requestFocus()
-            } catch (_: Exception) {
-                // Focus request may fail if composition is not ready
+            repeat(3) {
+                try {
+                    firstItemFocusRequester.requestFocus()
+                    return@LaunchedEffect
+                } catch (_: Exception) {
+                    // Focus request may fail if composition is not ready.
+                    delay(80)
+                }
             }
         }
     }
@@ -323,9 +329,7 @@ private fun QuickMenuItemRow(
 
         Text(
             text = stringResource(item.labelResId),
-            style = MaterialTheme.typography.bodyLarge.copy(
-                fontWeight = if (isFocused && isEnabled) FontWeight.SemiBold else FontWeight.Normal
-            ),
+            style = MaterialTheme.typography.bodyLarge,
             color = when {
                 !isEnabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = disabledAlpha)
                 isFocused -> accentColor

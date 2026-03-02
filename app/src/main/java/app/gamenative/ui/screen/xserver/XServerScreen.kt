@@ -67,6 +67,8 @@ import app.gamenative.externaldisplay.SwapInputOverlayView
 import app.gamenative.service.SteamService
 import app.gamenative.service.epic.EpicService
 import app.gamenative.service.gog.GOGService
+import app.gamenative.ui.component.QuickMenu
+import app.gamenative.ui.component.QuickMenuAction
 import app.gamenative.ui.data.XServerState
 import app.gamenative.utils.ContainerUtils
 import app.gamenative.utils.CustomGameScanner
@@ -78,7 +80,6 @@ import com.posthog.PostHog
 import com.winlator.alsaserver.ALSAClient
 import com.winlator.container.Container
 import com.winlator.container.ContainerManager
-import com.winlator.contentdialog.NavigationDialog
 import com.winlator.contents.AdrenotoolsManager
 import com.winlator.contents.ContentProfile
 import com.winlator.contents.ContentsManager
@@ -325,6 +326,8 @@ fun XServerScreen(
     var showPhysicalControllerDialog by remember { mutableStateOf(false) }
     var isOverlayPaused by remember { mutableStateOf(false) }
     var keyboardRequestedFromOverlay by remember { mutableStateOf(false) }
+    var showQuickMenu by remember { mutableStateOf(false) }
+    var hasPhysicalController by remember { mutableStateOf(false) }
     var keepPausedForEditor by remember { mutableStateOf(false) }
 
     fun startExitWatchForUnmappedGameWindow(window: Window) {
@@ -404,6 +407,174 @@ fun XServerScreen(
         }
     }
 
+    val dismissOverlayMenu: () -> Unit = {
+        if (!keyboardRequestedFromOverlay) {
+            imeInputReceiver?.hideKeyboard()
+        }
+        keyboardRequestedFromOverlay = false
+        if (PluviaApp.isOverlayPaused && !keepPausedForEditor) {
+            PluviaApp.xEnvironment?.onResume()
+            isOverlayPaused = false
+            PluviaApp.isOverlayPaused = false
+        }
+        showQuickMenu = false
+    }
+
+    val onQuickMenuItemSelected: (Int) -> Unit = { itemId ->
+        when (itemId) {
+            QuickMenuAction.KEYBOARD -> {
+                keyboardRequestedFromOverlay = true
+                val anchor = view // use the same composable root view
+                val c = if (Build.VERSION.SDK_INT >= 30)
+                    anchor.windowInsetsController else null
+
+                anchor.post {
+                    if (anchor.windowToken == null) return@post
+                    val show = {
+                        PostHog.capture(event = "onscreen_keyboard_enabled")
+                        val isExternalDisplaySession =
+                            (anchor.display?.displayId ?: Display.DEFAULT_DISPLAY) != Display.DEFAULT_DISPLAY
+
+                        if (isExternalDisplaySession) {
+                            imeInputReceiver?.showKeyboard() ?: imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
+                        } else {
+                            imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
+                        }
+                    }
+                    if (Build.VERSION.SDK_INT > 29 && c != null) {
+                        anchor.postDelayed({ show() }, 500)  // Pixel/Android-12+ quirk
+                    } else {
+                        show()
+                    }
+                }
+            }
+
+            QuickMenuAction.INPUT_CONTROLS -> {
+                if (areControlsVisible) {
+                    PostHog.capture(event = "onscreen_controller_disabled")
+                    hideInputControls()
+                } else {
+                    PostHog.capture(event = "onscreen_controller_enabled")
+                    val manager = PluviaApp.inputControlsManager
+                    val profiles = manager?.getProfiles(false) ?: listOf()
+                    if (profiles.isNotEmpty()) {
+                        // Use current profile (custom or Profile 0)
+                        val profileIdStr = container.getExtra("profileId", "0")
+                        val profileId = profileIdStr.toIntOrNull() ?: 0
+                        val targetProfile = if (profileId != 0) {
+                            manager?.getProfile(profileId)
+                        } else {
+                            null
+                        } ?: manager?.getProfile(0) ?: profiles.getOrNull(2) ?: profiles.first()
+
+                        showInputControls(targetProfile, xServerView!!.getxServer().winHandler, container)
+                    }
+                }
+                areControlsVisible = !areControlsVisible
+            }
+
+            QuickMenuAction.EDIT_CONTROLS -> {
+                PostHog.capture(event = "edit_controls_in_game")
+                keepPausedForEditor = true
+
+                // Get or create profile for this container
+                val manager = PluviaApp.inputControlsManager ?: InputControlsManager(context)
+                val allProfiles = manager.getProfiles(false)
+
+                val profileIdStr = container.getExtra("profileId", "0")
+                val profileId = profileIdStr.toIntOrNull() ?: 0
+
+                var activeProfile = if (profileId != 0) {
+                    manager.getProfile(profileId)
+                } else {
+                    null
+                }
+
+                // If no custom profile exists, create one automatically
+                if (activeProfile == null) {
+                    val sourceProfile = manager.getProfile(0)
+                        ?: allProfiles.firstOrNull { it.id == 2 }
+                        ?: allProfiles.firstOrNull()
+
+                    if (sourceProfile != null) {
+                        try {
+                            // Create game-specific profile by duplicating Profile 0
+                            activeProfile = manager.duplicateProfile(sourceProfile)
+
+                            // Rename to game name
+                            val gameName = currentAppInfo?.name ?: container.name
+                            activeProfile.setName("$gameName - Controls")
+                            activeProfile.save()
+
+                            // Associate with container using extraData and save
+                            container.putExtra("profileId", activeProfile.id.toString())
+                            container.saveData()
+
+                            // Apply the new profile to InputControlsView
+                            PluviaApp.inputControlsView?.setProfile(activeProfile)
+                        } catch (e: Exception) {
+                            Timber.e(e, "Failed to auto-create profile for container %s", container.name)
+                            // Fallback to existing profile
+                            activeProfile = sourceProfile
+                        }
+                    }
+                }
+
+                // Enable edit mode and show controls if not visible
+                if (activeProfile != null) {
+                    // Capture snapshot of element positions before entering edit mode
+                    val profile = PluviaApp.inputControlsView?.profile
+                    if (profile != null) {
+                        val snapshot = mutableMapOf<com.winlator.inputcontrols.ControlElement, Pair<Int, Int>>()
+                        profile.elements.forEach { element ->
+                            snapshot[element] = Pair(element.x.toInt(), element.y.toInt())
+                        }
+                        elementPositionsSnapshot = snapshot
+                    }
+
+                    isEditMode = true
+                    PluviaApp.inputControlsView?.setEditMode(true)
+                    PluviaApp.inputControlsView?.let { icView ->
+                        // Wait for view to be laid out before loading elements
+                        icView.post {
+                            activeProfile.loadElements(icView)
+                        }
+                    }
+
+                    if (!areControlsVisible) {
+                        showInputControls(activeProfile, xServerView!!.getxServer().winHandler, container)
+                        areControlsVisible = true
+                    }
+                }
+            }
+
+            QuickMenuAction.EDIT_PHYSICAL_CONTROLLER -> {
+                PostHog.capture(event = "edit_physical_controller_from_menu")
+                keepPausedForEditor = true
+                showPhysicalControllerDialog = true
+            }
+
+            QuickMenuAction.EXIT_GAME -> {
+                if (currentAppInfo != null) {
+                    PostHog.capture(
+                        event = "game_closed",
+                        properties = mapOf(
+                            "game_name" to currentAppInfo.name,
+                        ),
+                    )
+                } else {
+                    PostHog.capture(event = "game_closed")
+                }
+                imeInputReceiver?.hideKeyboard()
+                // Resume processes before exiting so they can receive SIGTERM cleanly.
+                PluviaApp.xEnvironment?.onResume()
+                isOverlayPaused = false
+                PluviaApp.isOverlayPaused = false
+                exit(xServerView!!.getxServer().winHandler, PluviaApp.xEnvironment, frameRating, currentAppInfo, container, onExit, navigateBack)
+            }
+        }
+    }
+
     val gameBack: () -> Unit = gameBack@{
         val imeVisible = ViewCompat.getRootWindowInsets(view)
             ?.isVisible(WindowInsetsCompat.Type.ime()) == true
@@ -422,6 +593,11 @@ fun XServerScreen(
             return@gameBack
         }
 
+        if (showQuickMenu) {
+            dismissOverlayMenu()
+            return@gameBack
+        }
+
         Timber.i("BackHandler")
 
         // Suspend game and audio while the navigation overlay is visible.
@@ -430,178 +606,11 @@ fun XServerScreen(
         PluviaApp.isOverlayPaused = true
         keyboardRequestedFromOverlay = false
 
-        val navDialog = NavigationDialog(
-            context,
-            object : NavigationDialog.NavigationListener {
-                override fun onNavigationItemSelected(itemId: Int) {
-                    when (itemId) {
-                        NavigationDialog.ACTION_KEYBOARD -> {
-                            keyboardRequestedFromOverlay = true
-                            val anchor = view // use the same composable root view
-                            val c = if (Build.VERSION.SDK_INT >= 30)
-                                anchor.windowInsetsController else null
+        val controllerManager = ControllerManager.getInstance()
+        controllerManager.scanForDevices()
+        hasPhysicalController = controllerManager.getDetectedDevices().isNotEmpty()
 
-                            anchor.post {
-                                if (anchor.windowToken == null) return@post
-                                val show = {
-                                    PostHog.capture(event = "onscreen_keyboard_enabled")
-                                    val isExternalDisplaySession =
-                                        (anchor.display?.displayId ?: Display.DEFAULT_DISPLAY) != Display.DEFAULT_DISPLAY
-
-                                    if (isExternalDisplaySession) {
-                                        imeInputReceiver?.showKeyboard() ?: imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
-                                    } else {
-                                        imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
-                                    }
-                                }
-                                if (Build.VERSION.SDK_INT > 29 && c != null) {
-                                    anchor.postDelayed({ show() }, 500)  // Pixel/Android-12+ quirk
-                                } else {
-                                    show()
-                                }
-                            }
-                        }
-
-                        NavigationDialog.ACTION_INPUT_CONTROLS -> {
-                            if (areControlsVisible){
-                                PostHog.capture(event = "onscreen_controller_disabled")
-                                hideInputControls();
-                            } else {
-                                PostHog.capture(event = "onscreen_controller_enabled")
-                                val manager = PluviaApp.inputControlsManager
-                                val profiles = manager?.getProfiles(false) ?: listOf()
-                                if (profiles.isNotEmpty()) {
-                                    // Use current profile (custom or Profile 0)
-                                    val profileIdStr = container.getExtra("profileId", "0")
-                                    val profileId = profileIdStr.toIntOrNull() ?: 0
-                                    val targetProfile = if (profileId != 0) {
-                                        manager?.getProfile(profileId)
-                                    } else {
-                                        null
-                                    } ?: manager?.getProfile(0) ?: profiles.getOrNull(2) ?: profiles.first()
-
-                                    showInputControls(targetProfile, xServerView!!.getxServer().winHandler, container)
-                                }
-                            }
-                            areControlsVisible = !areControlsVisible
-                        }
-
-                        NavigationDialog.ACTION_EDIT_CONTROLS -> {
-                            PostHog.capture(event = "edit_controls_in_game")
-                            keepPausedForEditor = true
-
-                            // Get or create profile for this container
-                            val manager = PluviaApp.inputControlsManager ?: InputControlsManager(context)
-                            val allProfiles = manager.getProfiles(false)
-
-                            val profileIdStr = container.getExtra("profileId", "0")
-                            val profileId = profileIdStr.toIntOrNull() ?: 0
-
-                            var activeProfile = if (profileId != 0) {
-                                manager.getProfile(profileId)
-                            } else {
-                                null
-                            }
-
-                            // If no custom profile exists, create one automatically
-                            if (activeProfile == null) {
-                                val sourceProfile = manager.getProfile(0)
-                                    ?: allProfiles.firstOrNull { it.id == 2 }
-                                    ?: allProfiles.firstOrNull()
-
-                                if (sourceProfile != null) {
-                                    try {
-                                        // Create game-specific profile by duplicating Profile 0
-                                        activeProfile = manager.duplicateProfile(sourceProfile)
-
-                                        // Rename to game name
-                                        val gameName = currentAppInfo?.name ?: container.name
-                                        activeProfile.setName("$gameName - Controls")
-                                        activeProfile.save()
-
-                                        // Associate with container using extraData and save
-                                        container.putExtra("profileId", activeProfile.id.toString())
-                                        container.saveData()
-
-                                        // Apply the new profile to InputControlsView
-                                        PluviaApp.inputControlsView?.setProfile(activeProfile)
-                                    } catch (e: Exception) {
-                                        Timber.e(e, "Failed to auto-create profile for container %s", container.name)
-                                        // Fallback to existing profile
-                                        activeProfile = sourceProfile
-                                    }
-                                }
-                            }
-
-                            // Enable edit mode and show controls if not visible
-                            if (activeProfile != null) {
-                                // Capture snapshot of element positions before entering edit mode
-                                val profile = PluviaApp.inputControlsView?.profile
-                                if (profile != null) {
-                                    val snapshot = mutableMapOf<com.winlator.inputcontrols.ControlElement, Pair<Int, Int>>()
-                                    profile.elements.forEach { element ->
-                                        snapshot[element] = Pair(element.x.toInt(), element.y.toInt())
-                                    }
-                                    elementPositionsSnapshot = snapshot
-                                }
-
-                                isEditMode = true
-                                PluviaApp.inputControlsView?.setEditMode(true)
-                                PluviaApp.inputControlsView?.let { icView ->
-                                    // Wait for view to be laid out before loading elements
-                                    icView.post {
-                                        activeProfile.loadElements(icView)
-                                    }
-                                }
-
-                                if (!areControlsVisible) {
-                                    showInputControls(activeProfile, xServerView!!.getxServer().winHandler, container)
-                                    areControlsVisible = true
-                                }
-                            }
-                        }
-
-                        NavigationDialog.ACTION_EDIT_PHYSICAL_CONTROLLER -> {
-                            PostHog.capture(event = "edit_physical_controller_from_menu")
-                            keepPausedForEditor = true
-                            showPhysicalControllerDialog = true
-                        }
-
-                        NavigationDialog.ACTION_EXIT_GAME -> {
-                            if (currentAppInfo != null) {
-                                PostHog.capture(
-                                    event = "game_closed",
-                                    properties = mapOf(
-                                        "game_name" to currentAppInfo.name,
-                                    ),
-                                )
-                            } else {
-                                PostHog.capture(event = "game_closed")
-                            }
-                            imeInputReceiver?.hideKeyboard()
-                            // Resume processes before exiting so they can receive SIGTERM cleanly.
-                            PluviaApp.xEnvironment?.onResume()
-                            isOverlayPaused = false
-                            PluviaApp.isOverlayPaused = false
-                            exit(xServerView!!.getxServer().winHandler, PluviaApp.xEnvironment, frameRating, currentAppInfo, container, onExit, navigateBack)
-                        }
-                    }
-                }
-            }
-        )
-        // Resume game when the overlay closes via back press, outside tap, or any non-exit item.
-        navDialog.setOnDismissListener {
-            if (!keyboardRequestedFromOverlay) {
-                imeInputReceiver?.hideKeyboard()
-            }
-            keyboardRequestedFromOverlay = false
-            if (PluviaApp.isOverlayPaused && !keepPausedForEditor) {
-                PluviaApp.xEnvironment?.onResume()
-                isOverlayPaused = false
-                PluviaApp.isOverlayPaused = false
-            }
-        }
-        navDialog.show()
+        showQuickMenu = true
     }
 
     DisposableEffect(container) {
@@ -624,32 +633,42 @@ fun XServerScreen(
             val isGamepad = ExternalController.isGameController(it.event.device)
             // logD("onKeyEvent(${it.event.device.sources})\n\tisGamepad: $isGamepad\n\tisKeyboard: $isKeyboard\n\t${it.event}")
 
-            var handled = false
-            if (isGamepad) {
-                handled = physicalControllerHandler?.onKeyEvent(it.event) == true
-                if (!handled) handled = PluviaApp.inputControlsView?.onKeyEvent(it.event) == true
-                // Final fallback to WinHandler passthrough
-                if (!handled) handled = xServerView!!.getxServer().winHandler.onKeyEvent(it.event)
+            if (showQuickMenu && isGamepad) {
+                // Let Compose focus system handle gamepad navigation/selection while menu is visible.
+                false
+            } else {
+                var handled = false
+                if (isGamepad) {
+                    handled = physicalControllerHandler?.onKeyEvent(it.event) == true
+                    if (!handled) handled = PluviaApp.inputControlsView?.onKeyEvent(it.event) == true
+                    // Final fallback to WinHandler passthrough
+                    if (!handled) handled = xServerView!!.getxServer().winHandler.onKeyEvent(it.event)
+                }
+                if (!handled && isKeyboard) {
+                    handled = keyboard?.onKeyEvent(it.event) == true
+                }
+                handled
             }
-            if (!handled && isKeyboard) {
-                handled = keyboard?.onKeyEvent(it.event) == true
-            }
-            handled
         }
         val onMotionEvent: (AndroidEvent.MotionEvent) -> Boolean = {
             val isGamepad = ExternalController.isGameController(it.event?.device)
 
-            var handled = false
-            if (isGamepad && it.event != null) {
-                handled = physicalControllerHandler?.onGenericMotionEvent(it.event!!) == true
-                if (!handled) handled = PluviaApp.inputControlsView?.onGenericMotionEvent(it.event) == true
-                // Final fallback to WinHandler passthrough
-                if (!handled) handled = xServerView!!.getxServer().winHandler.onGenericMotionEvent(it.event)
+            if (showQuickMenu && isGamepad) {
+                // Let Compose consume any gamepad motion while menu is visible.
+                false
+            } else {
+                var handled = false
+                if (isGamepad && it.event != null) {
+                    handled = physicalControllerHandler?.onGenericMotionEvent(it.event!!) == true
+                    if (!handled) handled = PluviaApp.inputControlsView?.onGenericMotionEvent(it.event) == true
+                    // Final fallback to WinHandler passthrough
+                    if (!handled) handled = xServerView!!.getxServer().winHandler.onGenericMotionEvent(it.event)
+                }
+                if (!handled) {
+                    handled = PluviaApp.touchpadView?.onExternalMouseEvent(it.event) == true
+                }
+                handled
             }
-            if (!handled) {
-                handled = PluviaApp.touchpadView?.onExternalMouseEvent(it.event) == true
-            }
-            handled
         }
         val onGuestProgramTerminated: (AndroidEvent.GuestProgramTerminated) -> Unit = {
             Timber.i("onGuestProgramTerminated")
@@ -1322,6 +1341,13 @@ fun XServerScreen(
                 }
             )
         }
+
+        QuickMenu(
+            isVisible = showQuickMenu,
+            onDismiss = dismissOverlayMenu,
+            onItemSelected = onQuickMenuItemSelected,
+            hasPhysicalController = hasPhysicalController,
+        )
     }
 
     // Element Editor Dialog
