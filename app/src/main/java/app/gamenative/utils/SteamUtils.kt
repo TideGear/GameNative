@@ -569,6 +569,8 @@ object SteamUtils {
 
             downloadableDepots.forEach { (depotId, depotInfo) ->
                 val manifest = depotInfo.manifests[installedBranch]
+                    ?: depotInfo.manifests["public"]
+                    ?: depotInfo.manifests.values.firstOrNull()
                 if (manifest != null && manifest.gid != 0L) {
                     regularDepots[depotId] = depotInfo
                 } else {
