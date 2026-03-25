@@ -1,8 +1,8 @@
 {
   "formatVersion": 1,
   "database": {
-    "version": 14,
-    "identityHash": "203f4c082d259edf32a84b38b53f291c",
+    "version": 15,
+    "identityHash": "013bb7ce9dc2cefaaebc51605633bca1",
     "entities": [
       {
         "tableName": "app_info",
@@ -645,7 +645,7 @@
       },
       {
         "tableName": "gog_games",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `slug` TEXT NOT NULL, `download_size` INTEGER NOT NULL, `install_size` INTEGER NOT NULL, `is_installed` INTEGER NOT NULL, `install_path` TEXT NOT NULL, `image_url` TEXT NOT NULL, `icon_url` TEXT NOT NULL, `background_url` TEXT NOT NULL DEFAULT '', `description` TEXT NOT NULL, `release_date` TEXT NOT NULL, `developer` TEXT NOT NULL, `publisher` TEXT NOT NULL, `genres` TEXT NOT NULL, `languages` TEXT NOT NULL, `last_played` INTEGER NOT NULL, `play_time` INTEGER NOT NULL, `type` INTEGER NOT NULL, `exclude` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `slug` TEXT NOT NULL, `download_size` INTEGER NOT NULL, `install_size` INTEGER NOT NULL, `is_installed` INTEGER NOT NULL, `partial_install` INTEGER NOT NULL DEFAULT 0, `install_path` TEXT NOT NULL, `image_url` TEXT NOT NULL, `icon_url` TEXT NOT NULL, `background_url` TEXT NOT NULL DEFAULT '', `description` TEXT NOT NULL, `release_date` TEXT NOT NULL, `developer` TEXT NOT NULL, `publisher` TEXT NOT NULL, `genres` TEXT NOT NULL, `languages` TEXT NOT NULL, `last_played` INTEGER NOT NULL, `play_time` INTEGER NOT NULL, `type` INTEGER NOT NULL, `exclude` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
         "fields": [
           {
             "fieldPath": "id",
@@ -682,6 +682,13 @@
             "columnName": "is_installed",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "partialInstall",
+            "columnName": "partial_install",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
           },
           {
             "fieldPath": "installPath",
@@ -779,7 +786,7 @@
       },
       {
         "tableName": "epic_games",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `catalog_id` TEXT NOT NULL, `app_name` TEXT NOT NULL, `title` TEXT NOT NULL, `namespace` TEXT NOT NULL, `developer` TEXT NOT NULL, `publisher` TEXT NOT NULL, `is_installed` INTEGER NOT NULL, `install_path` TEXT NOT NULL, `platform` TEXT NOT NULL, `version` TEXT NOT NULL, `executable` TEXT NOT NULL, `install_size` INTEGER NOT NULL, `download_size` INTEGER NOT NULL, `art_cover` TEXT NOT NULL, `art_square` TEXT NOT NULL, `art_logo` TEXT NOT NULL, `art_portrait` TEXT NOT NULL, `can_run_offline` INTEGER NOT NULL, `requires_ot` INTEGER NOT NULL, `cloud_save_enabled` INTEGER NOT NULL, `save_folder` TEXT NOT NULL, `third_party_managed_app` TEXT NOT NULL, `is_ea_managed` INTEGER NOT NULL, `is_dlc` INTEGER NOT NULL, `base_game_app_name` TEXT NOT NULL, `description` TEXT NOT NULL, `release_date` TEXT NOT NULL, `genres` TEXT NOT NULL, `tags` TEXT NOT NULL, `last_played` INTEGER NOT NULL, `play_time` INTEGER NOT NULL, `type` INTEGER NOT NULL, `eos_catalog_item_id` TEXT NOT NULL, `eos_app_id` TEXT NOT NULL)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `catalog_id` TEXT NOT NULL, `app_name` TEXT NOT NULL, `title` TEXT NOT NULL, `namespace` TEXT NOT NULL, `developer` TEXT NOT NULL, `publisher` TEXT NOT NULL, `is_installed` INTEGER NOT NULL, `partial_install` INTEGER NOT NULL DEFAULT 0, `install_path` TEXT NOT NULL, `platform` TEXT NOT NULL, `version` TEXT NOT NULL, `executable` TEXT NOT NULL, `install_size` INTEGER NOT NULL, `download_size` INTEGER NOT NULL, `art_cover` TEXT NOT NULL, `art_square` TEXT NOT NULL, `art_logo` TEXT NOT NULL, `art_portrait` TEXT NOT NULL, `can_run_offline` INTEGER NOT NULL, `requires_ot` INTEGER NOT NULL, `cloud_save_enabled` INTEGER NOT NULL, `save_folder` TEXT NOT NULL, `third_party_managed_app` TEXT NOT NULL, `is_ea_managed` INTEGER NOT NULL, `is_dlc` INTEGER NOT NULL, `base_game_app_name` TEXT NOT NULL, `description` TEXT NOT NULL, `release_date` TEXT NOT NULL, `genres` TEXT NOT NULL, `tags` TEXT NOT NULL, `last_played` INTEGER NOT NULL, `play_time` INTEGER NOT NULL, `type` INTEGER NOT NULL, `eos_catalog_item_id` TEXT NOT NULL, `eos_app_id` TEXT NOT NULL)",
         "fields": [
           {
             "fieldPath": "id",
@@ -828,6 +835,13 @@
             "columnName": "is_installed",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "partialInstall",
+            "columnName": "partial_install",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
           },
           {
             "fieldPath": "installPath",
@@ -1001,7 +1015,7 @@
       },
       {
         "tableName": "amazon_games",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`app_id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `product_id` TEXT NOT NULL, `entitlement_id` TEXT NOT NULL DEFAULT '', `title` TEXT NOT NULL, `is_installed` INTEGER NOT NULL, `install_path` TEXT NOT NULL, `art_url` TEXT NOT NULL, `hero_url` TEXT NOT NULL DEFAULT '', `purchased_date` TEXT NOT NULL, `developer` TEXT NOT NULL DEFAULT '', `publisher` TEXT NOT NULL DEFAULT '', `release_date` TEXT NOT NULL DEFAULT '', `download_size` INTEGER NOT NULL DEFAULT 0, `install_size` INTEGER NOT NULL DEFAULT 0, `version_id` TEXT NOT NULL DEFAULT '', `product_sku` TEXT NOT NULL DEFAULT '', `last_played` INTEGER NOT NULL DEFAULT 0, `play_time_minutes` INTEGER NOT NULL DEFAULT 0, `product_json` TEXT NOT NULL)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`app_id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `product_id` TEXT NOT NULL, `entitlement_id` TEXT NOT NULL DEFAULT '', `title` TEXT NOT NULL, `is_installed` INTEGER NOT NULL, `partial_install` INTEGER NOT NULL DEFAULT 0, `install_path` TEXT NOT NULL, `art_url` TEXT NOT NULL, `hero_url` TEXT NOT NULL DEFAULT '', `purchased_date` TEXT NOT NULL, `developer` TEXT NOT NULL DEFAULT '', `publisher` TEXT NOT NULL DEFAULT '', `release_date` TEXT NOT NULL DEFAULT '', `download_size` INTEGER NOT NULL DEFAULT 0, `install_size` INTEGER NOT NULL DEFAULT 0, `version_id` TEXT NOT NULL DEFAULT '', `product_sku` TEXT NOT NULL DEFAULT '', `last_played` INTEGER NOT NULL DEFAULT 0, `play_time_minutes` INTEGER NOT NULL DEFAULT 0, `product_json` TEXT NOT NULL)",
         "fields": [
           {
             "fieldPath": "appId",
@@ -1033,6 +1047,13 @@
             "columnName": "is_installed",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "partialInstall",
+            "columnName": "partial_install",
+            "affinity": "INTEGER",
+            "notNull": true,
+            "defaultValue": "0"
           },
           {
             "fieldPath": "installPath",
@@ -1174,7 +1195,7 @@
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '203f4c082d259edf32a84b38b53f291c')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '013bb7ce9dc2cefaaebc51605633bca1')"
     ]
   }
 }
