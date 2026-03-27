@@ -35,20 +35,21 @@ class AchievementWatcher(
             if (achFile.exists()) {
                 try {
                     val json = JSONObject(achFile.readText(Charsets.UTF_8))
-                    for (name in json.keys()) {
-                        val entry = json.optJSONObject(name) ?: continue
+                    for (achievementName in json.keys()) {
+                        val entry = json.optJSONObject(achievementName) ?: continue
                         if (entry.optBoolean("earned", false)) {
-                            notifiedNames.add(name)
-                            uploadedNames.add(name)
+                            notifiedNames.add(achievementName)
+                            uploadedNames.add(achievementName)
                         }
                     }
                 } catch (e: Exception) {
-                    Timber.w(e, "Failed to snapshot existing achievements.json in ${dir.absolutePath}")
+                    Timber.tag("achievements").w(e, "Failed to snapshot existing achievements.json in ${dir.absolutePath}")
                 }
             }
         }
-        Timber.d("AchievementWatcher seeded ${notifiedNames.size} pre-existing achievements")
+        Timber.tag("achievements").d("AchievementWatcher seeded ${notifiedNames.size} pre-existing achievements")
 
+        // Start Watching for the specific achievement JSON file changes
         for (dir in watchDirs) {
             val observer = object : FileObserver(dir, CLOSE_WRITE or MOVED_TO) {
                 override fun onEvent(event: Int, path: String?) {
@@ -60,14 +61,14 @@ class AchievementWatcher(
             observer.startWatching()
             observers.add(observer)
         }
-        Timber.d("AchievementWatcher started, watching ${watchDirs.size} dirs")
+        Timber.tag("achievements").d("AchievementWatcher started, watching ${watchDirs.size} dirs")
     }
 
     fun stop() {
         observers.forEach { it.stopWatching() }
         observers.clear()
         scope.cancel()
-        Timber.d("AchievementWatcher stopped")
+        Timber.tag("achievements").d("AchievementWatcher stopped")
     }
 
     private fun checkForNewUnlocks(achFile: File) {
@@ -85,10 +86,10 @@ class AchievementWatcher(
                 val displayName = displayNameMap[name] ?: name
                 val iconUrl = iconUrlMap[name]
                 AchievementNotificationManager.show(displayName, iconUrl)
-                Timber.i("Achievement unlocked: $name ($displayName)")
+                Timber.tag("achievements").i("Achievement unlocked: $name ($displayName)")
             }
         } catch (e: Exception) {
-            Timber.w(e, "Failed to parse achievements.json for watcher")
+            Timber.tag("achievements").w(e, "Failed to parse achievements.json for watcher")
         }
 
         if (hasNewUnlocks) {
@@ -97,8 +98,7 @@ class AchievementWatcher(
     }
 
     /**
-     * Debounces achievement uploads: waits 5 seconds after the last unlock
-     * before uploading to Steam, so rapid unlocks are batched together.
+     * Debounces achievement uploads: waits 5 seconds after the last unlock before uploading to stop server spam
      */
     private fun scheduleUpload() {
         uploadJob?.cancel()
@@ -110,30 +110,27 @@ class AchievementWatcher(
 
     private suspend fun uploadToSteam() {
         if (configDirectory == null) {
-            Timber.w("No configDirectory set, skipping real-time achievement upload for appId=$appId")
-            return
-        }
-        if (!SteamService.isConnected) {
-            Timber.w("Not connected to Steam, skipping real-time achievement upload for appId=$appId")
+            Timber.tag("achievements").w("No configDirectory set, skipping real-time achievement upload for appId=$appId")
             return
         }
 
+        if (!SteamService.isConnected) {
+            Timber.tag("achievements").w("Not connected to Steam, skipping real-time achievement upload for appId=$appId")
+            return
+        }
+
+        // Get unlocked and stats
         val (allUnlocked, gseStatsDir) = SteamService.collectGseUnlocksAndStats(watchDirs)
 
-        // Only upload if there are new unlocks we haven't uploaded yet
         val newToUpload = allUnlocked - uploadedNames
-        if (newToUpload.isEmpty()) {
-            Timber.d("No new achievements to upload for appId=$appId")
-            return
-        }
 
-        Timber.i("Real-time uploading ${newToUpload.size} new achievements (${allUnlocked.size} total) for appId=$appId")
+        Timber.tag("achievements").d("Real-time uploading ${newToUpload.size} new achievements (${allUnlocked.size} total) for appId=$appId")
         val result = SteamService.storeAchievementUnlocks(appId, configDirectory, allUnlocked, gseStatsDir ?: watchDirs.first().resolve("stats"))
         result.onSuccess {
             uploadedNames.addAll(allUnlocked)
-            Timber.i("Real-time achievement upload succeeded for appId=$appId")
+            Timber.tag("achievements").i("Real-time achievement upload succeeded for appId=$appId")
         }.onFailure { e ->
-            Timber.e(e, "Real-time achievement upload failed for appId=$appId, will retry on next unlock or at exit")
+            Timber.tag("achievements").e(e, "Real-time achievement upload failed for appId=$appId, will retry on next unlock or at exit")
         }
     }
 
