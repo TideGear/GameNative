@@ -292,6 +292,17 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         String evshimPath = imageFs.getLibDir() + "/libevshim.so";
         String replacePath = imageFs.getLibDir() + "/libredirect-bionic.so";
 
+        File apkEvshim = new File(context.getApplicationInfo().nativeLibraryDir, "libevshim.so");
+        File ifsEvshim = new File(evshimPath);
+        if (apkEvshim.exists()) {
+            if (FileUtils.copy(apkEvshim, ifsEvshim)) {
+                FileUtils.chmod(ifsEvshim, 0755);
+                Log.i("EvshimDeploy", "Copied APK evshim -> " + evshimPath);
+            } else {
+                Log.e("EvshimDeploy", "Failed to copy APK evshim to " + evshimPath);
+            }
+        }
+
         if (new File(sysvPath).exists()) ld_preload += sysvPath;
 
 
@@ -301,13 +312,6 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         envVars.put("LD_PRELOAD", ld_preload);
 
         envVars.put("EVSHIM_SHM_NAME", "controller-shm0");
-
-        // Check for specific shared memory libraries
-//        if ((new File(imageFs.getLibDir(), "libandroid-sysvshm.so")).exists()){
-//            ld_preload = imageFs.getLibDir() + "/libandroid-sysvshm.so";
-//        }
-
-        //String nativeDir = context.getApplicationInfo().nativeLibraryDir; // e.g. /data/app/…/lib/arm64
 
         // Merge any additional environment variables from external sources
         if (this.envVars != null) {

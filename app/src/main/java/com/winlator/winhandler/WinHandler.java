@@ -1,10 +1,16 @@
 package com.winlator.winhandler;
 
+import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioAttributes;
 import android.net.Uri;
+import android.os.Build;
+import android.os.CombinedVibration;
+import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -80,12 +86,29 @@ public class WinHandler {
     private final short[] lastLowFreqs = new short[MAX_PLAYERS];
     private final short[] lastHighFreqs = new short[MAX_PLAYERS];
     private final boolean[] isRumbling = new boolean[MAX_PLAYERS];
+    private final int[] rumbleKeepaliveCtr = new int[MAX_PLAYERS];
+    private static final int RUMBLE_KEEPALIVE_INTERVAL = 12;
+    private static final int CONTROLLER_RUMBLE_MS = 500;
+    private static final int DEVICE_RUMBLE_MS = 60000;
     private boolean isShowingAssignDialog = false;
     private Context activity;
     private final java.util.Set<Integer> ignoredDeviceIds = new java.util.HashSet<>();
 
+    private String vibrationMode = "controller";
+    private int vibrationIntensity = 100;
+
     public void setInputControlsView(InputControlsView view) {
         this.inputControlsView = view;
+    }
+
+    public void setVibrationMode(String mode) {
+        this.vibrationMode = mode != null ? mode : "controller";
+        Log.i(TAG, "Vibration mode set to: " + this.vibrationMode);
+    }
+
+    public void setVibrationIntensity(int intensity) {
+        this.vibrationIntensity = Math.max(0, Math.min(100, intensity));
+        Log.i(TAG, "Vibration intensity set to: " + this.vibrationIntensity + "%");
     }
 
     public enum PreferredInputApi {
@@ -366,6 +389,9 @@ public class WinHandler {
 
     public void stop() {
         this.running = false;
+        for (int p = 0; p < MAX_PLAYERS; p++) {
+            stopVibrationForPlayer(p);
+        }
         DatagramSocket datagramSocket = this.socket;
         if (datagramSocket != null) {
             datagramSocket.close();
@@ -600,39 +626,35 @@ public class WinHandler {
         // TODO: add phone vibration option in upcoming ux when no controller device connected
         rumblePollerThread = new Thread(() -> {
             while (running) {
-                try {
-                    for (int slot = 0; slot < MAX_PLAYERS; slot++) {
-                        MappedByteBuffer buffer = getBufferForSlot(slot);
-                        if (buffer == null) continue;
-
-                        short lowFreq = buffer.getShort(32);
-                        short highFreq = buffer.getShort(34);
-
-                        if (lowFreq != lastLowFreqs[slot] || highFreq != lastHighFreqs[slot]) {
-                            ExternalController controller = getControllerForSlot(slot);
-
-                            // case: disable vibration, attempt to disable safely
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    try {
+                        MappedByteBuffer buf = getBufferForSlot(p);
+                        if (buf == null) continue;
+                        short lowFreq = buf.getShort(32);
+                        short highFreq = buf.getShort(34);
+                        boolean changed = lowFreq != lastLowFreqs[p] || highFreq != lastHighFreqs[p];
+                        if (changed) {
+                            lastLowFreqs[p] = lowFreq;
+                            lastHighFreqs[p] = highFreq;
+                            rumbleKeepaliveCtr[p] = 0;
                             if (lowFreq == 0 && highFreq == 0) {
-                                lastLowFreqs[slot] = lowFreq;
-                                lastHighFreqs[slot] = highFreq;
-                                stopVibrationForSlot(slot, controller);
-
-                            // case: controller exists and vibration exists
-                            } else if (controller != null) {
-                                // Only mark as delivered when we can actually vibrate
-                                lastLowFreqs[slot] = lowFreq;
-                                lastHighFreqs[slot] = highFreq;
-                                startVibrationForSlot(slot, controller, lowFreq, highFreq);
+                                stopVibrationForPlayer(p);
+                            } else {
+                                startVibrationForPlayer(p, lowFreq, highFreq);
                             }
-                            // else: controller not yet adopted for this slot — don't update
-                            // lastFreqs so the poller retries on the next tick
+                        } else if (isRumbling[p]) {
+                            rumbleKeepaliveCtr[p]++;
+                            if (rumbleKeepaliveCtr[p] >= RUMBLE_KEEPALIVE_INTERVAL) {
+                                rumbleKeepaliveCtr[p] = 0;
+                                startVibrationForPlayer(p, lowFreq, highFreq);
+                            }
                         }
+                    } catch (Exception e) {
+                        // Buffer may be unmapped; continue polling
                     }
-                } catch (Exception e) {
-                    continue;
                 }
                 try {
-                    Thread.sleep(20); // Poll for new commands 50 times per second
+                    Thread.sleep(20);
                 } catch (InterruptedException e) {
                     break;
                 }
@@ -641,34 +663,241 @@ public class WinHandler {
         rumblePollerThread.start();
     }
 
-    private void startVibrationForSlot(int slot, ExternalController controller, short lowFreq, short highFreq) {
-        int unsignedLowFreq = lowFreq & 0xFFFF;
-        int unsignedHighFreq = highFreq & 0xFFFF;
-        int dominantRumble = Math.max(unsignedLowFreq, unsignedHighFreq);
-        int amplitude = Math.round((float) dominantRumble / 65535.0f * 254.0f) + 1;
-        if (amplitude > 255) amplitude = 255;
-        if (amplitude <= 1) {
-            stopVibrationForSlot(slot, controller);
-            return;
-        }
-        if (controller == null) return;
-        InputDevice device = InputDevice.getDevice(controller.getDeviceId());
-        if (device == null) return;
-        Vibrator controllerVibrator = device.getVibrator();
-        if (controllerVibrator == null || !controllerVibrator.hasVibrator()) return;
-        isRumbling[slot] = true;
-        controllerVibrator.vibrate(VibrationEffect.createOneShot(50, amplitude));
+    private boolean controllerVibrationDiagLogged = false;
+
+    private int scaleAmplitude(short rawFreq, int intensityPercent) {
+        int unsigned = rawFreq & 0xFFFF;
+        int base = (unsigned >> 8) & 0xFF;
+        return Math.min(255, Math.max(0, (base * intensityPercent) / 100));
     }
 
-    private void stopVibrationForSlot(int slot, ExternalController controller) {
-        if (!isRumbling[slot]) return;
-        isRumbling[slot] = false;  // handle before early returns - disconnected or null controller leaves slot, assures to disable
-        if (controller == null) return;
-        InputDevice device = InputDevice.getDevice(controller.getDeviceId());
-        if (device == null) return;
-        Vibrator controllerVibrator = device.getVibrator();
-        if (controllerVibrator == null || !controllerVibrator.hasVibrator()) return;
-        controllerVibrator.cancel();
+    @TargetApi(31)
+    private void logVibratorManagerDiag(InputDevice device, VibratorManager vm) {
+        if (controllerVibrationDiagLogged) return;
+        controllerVibrationDiagLogged = true;
+        int[] ids = vm.getVibratorIds();
+        StringBuilder sb = new StringBuilder();
+        sb.append("VibratorManager for '").append(device.getName())
+          .append("' (id=").append(device.getId())
+          .append("): ").append(ids.length).append(" vibrator(s)");
+        for (int id : ids) {
+            Vibrator vib = vm.getVibrator(id);
+            sb.append(" [id=").append(id)
+              .append(" hasVibrator=").append(vib.hasVibrator())
+              .append(" amplitudeCtrl=").append(vib.hasAmplitudeControl())
+              .append("]");
+        }
+        Vibrator legacyVib = device.getVibrator();
+        sb.append(" | legacy getVibrator(): hasVibrator=")
+          .append(legacyVib != null && legacyVib.hasVibrator());
+        if (legacyVib != null) {
+            sb.append(" amplitudeCtrl=").append(legacyVib.hasAmplitudeControl());
+        }
+        Log.i(TAG, sb.toString());
+    }
+
+    private VibrationAttributes buildVibrationAttrs() {
+        VibrationAttributes.Builder attrs = new VibrationAttributes.Builder();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            attrs.setUsage(VibrationAttributes.USAGE_MEDIA);
+        }
+        return attrs.build();
+    }
+
+    private AudioAttributes buildAudioAttrs() {
+        return new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .build();
+    }
+
+    private void vibrateSingle(Vibrator vibrator, int amplitude, int durationMs) {
+        if (amplitude <= 0) { vibrator.cancel(); return; }
+        int amp = Math.min(255, amplitude);
+
+        if (vibrator.hasAmplitudeControl()) {
+            VibrationEffect effect = VibrationEffect.createOneShot(durationMs, amp);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                vibrator.vibrate(effect, buildVibrationAttrs());
+            } else {
+                vibrator.vibrate(effect, buildAudioAttrs());
+            }
+        } else {
+            VibrationEffect effect = VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                vibrator.vibrate(effect, buildVibrationAttrs());
+            } else {
+                vibrator.vibrate(effect, buildAudioAttrs());
+            }
+        }
+    }
+
+    @TargetApi(31)
+    private boolean rumbleViaVibratorManager(VibratorManager vm, short lowFreq, short highFreq) {
+        int[] ids = vm.getVibratorIds();
+        if (ids.length == 0) return false;
+
+        int highAmp = scaleAmplitude(highFreq, vibrationIntensity);
+        int lowAmp = scaleAmplitude(lowFreq, vibrationIntensity);
+        if (lowAmp == 0 && highAmp == 0) { vm.cancel(); return true; }
+
+        CombinedVibration.ParallelCombination combo = CombinedVibration.startParallel();
+        boolean anyAdded = false;
+
+        if (ids.length >= 2) {
+            if (lowAmp > 0) {
+                int a = vm.getVibrator(ids[0]).hasAmplitudeControl() ? lowAmp : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(ids[0], VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                anyAdded = true;
+            }
+            if (highAmp > 0) {
+                int a = vm.getVibrator(ids[1]).hasAmplitudeControl() ? highAmp : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(ids[1], VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                anyAdded = true;
+            }
+        } else {
+            int blended = Math.min(255, (int)(lowAmp * 0.80 + highAmp * 0.33));
+            if (blended > 0) {
+                int a = vm.getVibrator(ids[0]).hasAmplitudeControl() ? blended : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(ids[0], VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                anyAdded = true;
+            }
+        }
+
+        if (!anyAdded) { vm.cancel(); return true; }
+        vm.vibrate(combo.combine(), buildVibrationAttrs());
+        return true;
+    }
+
+    /**
+     * Resolves the physical InputDevice for a player slot.
+     * Checks ControllerManager slot assignment first, then falls back to
+     * the slot's ExternalController, then to first detected gamepad (P0 only).
+     */
+    private InputDevice resolveInputDeviceForPlayer(int player) {
+        InputDevice device = controllerManager.getAssignedDeviceForSlot(player);
+        if (device != null) return device;
+
+        ExternalController ctrl = getControllerForSlot(player);
+        if (ctrl != null) {
+            device = InputDevice.getDevice(ctrl.getDeviceId());
+            if (device != null) return device;
+        }
+
+        if (player == 0) {
+            List<InputDevice> detected = controllerManager.getDetectedDevices();
+            if (!detected.isEmpty()) {
+                return detected.get(0);
+            }
+        }
+        return null;
+    }
+
+    private boolean vibrateController(int player, short lowFreq, short highFreq) {
+        InputDevice device = resolveInputDeviceForPlayer(player);
+        if (device == null) {
+            Log.w(TAG, "Rumble P" + player + ": no physical controller found");
+            return false;
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                VibratorManager vm = device.getVibratorManager();
+                logVibratorManagerDiag(device, vm);
+                if (rumbleViaVibratorManager(vm, lowFreq, highFreq)) {
+                    return true;
+                }
+            }
+
+            Vibrator v = device.getVibrator();
+            if (v != null && v.hasVibrator()) {
+                int lowMSB = scaleAmplitude(lowFreq, vibrationIntensity);
+                int highMSB = scaleAmplitude(highFreq, vibrationIntensity);
+                int blended = Math.min(255, (int)(lowMSB * 0.80 + highMSB * 0.33));
+                vibrateSingle(v, blended, CONTROLLER_RUMBLE_MS);
+                return true;
+            }
+            Log.w(TAG, "Rumble P" + player + ": no vibrators available on '" + device.getName() + "'");
+        } catch (Exception e) {
+            Log.e(TAG, "Rumble P" + player + ": exception vibrating controller", e);
+        }
+        return false;
+    }
+
+    private void vibrateDevice(short lowFreq, short highFreq) {
+        try {
+            Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+            if (phoneVibrator == null || !phoneVibrator.hasVibrator()) return;
+
+            int lowMSB = scaleAmplitude(lowFreq, vibrationIntensity);
+            int highMSB = scaleAmplitude(highFreq, vibrationIntensity);
+            int rawAmplitude = Math.min(255, (int)(lowMSB * 0.80 + highMSB * 0.33));
+
+            if (rawAmplitude == 0) { phoneVibrator.cancel(); return; }
+
+            float curved = (float) Math.pow((float) rawAmplitude / 255f, 0.6f);
+            int phoneAmp = Math.round(curved * 255);
+            if (phoneAmp > 255) phoneAmp = 255;
+            if (phoneAmp <= 0) { phoneVibrator.cancel(); return; }
+
+            vibrateSingle(phoneVibrator, phoneAmp, DEVICE_RUMBLE_MS);
+        } catch (Exception e) {
+            Log.e(TAG, "Rumble: exception vibrating device", e);
+        }
+    }
+
+    private void startVibrationForPlayer(int player, short lowFreq, short highFreq) {
+        if ("off".equals(vibrationMode)) return;
+
+        Log.d(TAG, "Rumble P" + player + ": low=" + (lowFreq & 0xFFFF) + " high=" + (highFreq & 0xFFFF)
+                + " mode=" + vibrationMode + " intensity=" + vibrationIntensity);
+
+        isRumbling[player] = true;
+
+        if ("controller".equals(vibrationMode)) {
+            vibrateController(player, lowFreq, highFreq);
+        } else if ("device".equals(vibrationMode)) {
+            vibrateDevice(lowFreq, highFreq);
+        } else if ("both".equals(vibrationMode)) {
+            vibrateController(player, lowFreq, highFreq);
+            vibrateDevice(lowFreq, highFreq);
+        }
+    }
+
+    private void stopVibrationForPlayer(int player) {
+        if (!isRumbling[player]) return;
+
+        if (!"device".equals(vibrationMode)) {
+            try {
+                InputDevice device = resolveInputDeviceForPlayer(player);
+                if (device != null) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        VibratorManager vm = device.getVibratorManager();
+                        if (vm.getVibratorIds().length > 0) {
+                            vm.cancel();
+                        }
+                    }
+                    Vibrator vibrator = device.getVibrator();
+                    if (vibrator != null && vibrator.hasVibrator()) {
+                        vibrator.cancel();
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error cancelling controller vibration", e);
+            }
+        }
+
+        if (!"controller".equals(vibrationMode)) {
+            try {
+                Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+                if (phoneVibrator != null) {
+                    phoneVibrator.cancel();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error cancelling device vibration", e);
+            }
+        }
+
+        isRumbling[player] = false;
     }
 
     public void sendGamepadState() {

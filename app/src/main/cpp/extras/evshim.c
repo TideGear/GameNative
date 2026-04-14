@@ -47,6 +47,18 @@ static int (*p_SDL_JoystickSetVirtualHat)(SDL_Joystick *joystick, int hat, uint8
 static void (*p_SDL_PumpEvents)(void);
 static void (*p_SDL_Delay)(uint32_t ms);
 static void (*p_SDL_GetVersion)(SDL_version *);
+static int (*p_SDL_JoystickRumble)(SDL_Joystick *, uint16_t, uint16_t, uint32_t);
+
+/* Per-player rumble state for SDL keepalive.
+ * Wine/XInput "set and forget" semantics expect motors to stay on until
+ * explicitly stopped, but SDL's internal timer auto-expires rumble after
+ * the duration Wine passes (~1 s).  We periodically re-send the last
+ * non-zero values to reset that timer so the auto-expiry never fires. */
+static uint16_t last_rumble_low [MAX_GAMEPADS];
+static uint16_t last_rumble_high[MAX_GAMEPADS];
+
+#define RUMBLE_KEEPALIVE_TICKS  100   /* 100 × 5 ms = 500 ms */
+#define RUMBLE_KEEPALIVE_DUR_MS 2000  /* SDL expiry reset window */
 
 
 #define GETFUNCPTR(name)\
@@ -63,11 +75,19 @@ static int OnRumble(void *userdata,
     int idx = (int)(intptr_t)userdata;
     if (idx < 0 || idx >= MAX_GAMEPADS || rumble_fd[idx] < 0) return -1;
 
+    if (low_frequency_rumble != 0 || high_frequency_rumble != 0) {
+        last_rumble_low [idx] = low_frequency_rumble;
+        last_rumble_high[idx] = high_frequency_rumble;
+    } else {
+        last_rumble_low [idx] = 0;
+        last_rumble_high[idx] = 0;
+    }
+
     uint16_t vals[2] = { low_frequency_rumble, high_frequency_rumble };
 
-    pthread_mutex_lock(&shm_mutex);             /* NEW */
+    pthread_mutex_lock(&shm_mutex);
     ssize_t w = pwrite(rumble_fd[idx], vals, sizeof(vals), 32);
-    pthread_mutex_unlock(&shm_mutex);           /* NEW */
+    pthread_mutex_unlock(&shm_mutex);
 
     if (w != (ssize_t)sizeof(vals))
         LOGE("Rumble write failed (P%d): %s\n", idx, strerror(errno));
@@ -104,13 +124,14 @@ static void *vjoy_updater(void *arg)
     }
 
     struct gamepad_io cur, last_state = {0};
+    int keepalive_ctr = 0;
 
     LOGI("VJOY UPDATER P%d running (PID %d)\n", idx, getpid());
 
     for (;;) {
         pthread_mutex_lock(&shm_mutex);
 
-        ssize_t n = read(fd, &cur, sizeof cur);
+        ssize_t n = pread(fd, &cur, sizeof cur, 0);
 
         if (n == sizeof cur && memcmp(&cur, &last_state, sizeof cur) != 0) {
 
@@ -134,6 +155,19 @@ static void *vjoy_updater(void *arg)
 
         pthread_mutex_unlock(&shm_mutex);
 
+        /* Re-send last non-zero rumble to SDL periodically so its internal
+         * expiry timer never fires the false OnRumble(0,0).  This preserves
+         * XInput "set and forget" semantics through the SDL translation. */
+        if (p_SDL_JoystickRumble && ++keepalive_ctr >= RUMBLE_KEEPALIVE_TICKS) {
+            keepalive_ctr = 0;
+            uint16_t kl = last_rumble_low[idx];
+            uint16_t kh = last_rumble_high[idx];
+            if (kl != 0 || kh != 0) {
+                p_SDL_JoystickRumble(js, kl, kh, RUMBLE_KEEPALIVE_DUR_MS);
+                LOGD("Rumble keepalive P%d  low=%u  high=%u\n", idx, kl, kh);
+            }
+        }
+
         p_SDL_Delay(5);
     }
 
@@ -156,6 +190,7 @@ static void initialize_all_pads(void)
     GETFUNCPTR(SDL_JoystickSetVirtualAxis);  GETFUNCPTR(SDL_JoystickSetVirtualButton);
     GETFUNCPTR(SDL_JoystickSetVirtualHat);   GETFUNCPTR(SDL_PumpEvents);
     GETFUNCPTR(SDL_Delay);  GETFUNCPTR(SDL_GetVersion);
+    GETFUNCPTR(SDL_JoystickRumble);
 
     p_SDL_Init(SDL_INIT_JOYSTICK);
 
