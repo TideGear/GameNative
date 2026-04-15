@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <SDL2/SDL.h>
 #include <stdarg.h>
+#include <linux/input.h>
 
 static int g_debug_enabled = 0;
 
@@ -27,6 +28,91 @@ static int read_fd  [MAX_GAMEPADS] = {-1};
 static int rumble_fd[MAX_GAMEPADS] = {-1};
 static void *handle = NULL;
 static pthread_mutex_t shm_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+typedef int     (*open_f) (const char *, int, ...);
+typedef int     (*ioctl_f)(int, int, ...);
+typedef ssize_t (*read_f) (int, void *, size_t);
+static open_f  real_open;
+static ioctl_f real_ioctl;
+static read_f  real_read;
+
+/* ── Linux Force-Feedback rumble (bypasses Android vibration API) ── */
+static int ff_fd       [MAX_GAMEPADS] = {-1, -1, -1, -1};
+static int ff_effect_id[MAX_GAMEPADS] = {-1, -1, -1, -1};
+
+#define BITS_PER_LONG_ (sizeof(long) * 8)
+#define NLONGS_(x)     (((x) + BITS_PER_LONG_ - 1) / BITS_PER_LONG_)
+#define TEST_BIT_(b,a) ((a)[(b) / BITS_PER_LONG_] & (1UL << ((b) % BITS_PER_LONG_)))
+
+static void send_ff_rumble(int idx, uint16_t strong, uint16_t weak)
+{
+    if (idx < 0 || idx >= MAX_GAMEPADS || ff_fd[idx] < 0) return;
+
+    struct ff_effect eff;
+    memset(&eff, 0, sizeof eff);
+    eff.type = FF_RUMBLE;
+    eff.id   = ff_effect_id[idx];
+    eff.u.rumble.strong_magnitude = strong;
+    eff.u.rumble.weak_magnitude   = weak;
+    eff.replay.length = 5000;
+    if (real_ioctl(ff_fd[idx], EVIOCSFF, &eff) < 0) return;
+    ff_effect_id[idx] = eff.id;
+
+    struct input_event play;
+    memset(&play, 0, sizeof play);
+    play.type  = EV_FF;
+    play.code  = eff.id;
+    play.value = (strong || weak) ? 1 : 0;
+    write(ff_fd[idx], &play, sizeof play);
+}
+
+static void init_ff_rumble(void)
+{
+    if (!real_open)  real_open  = (open_f) dlsym(RTLD_NEXT, "open");
+    if (!real_ioctl) real_ioctl = (ioctl_f)dlsym(RTLD_NEXT, "ioctl");
+
+    int found = 0;
+    for (int i = 0; i < 64 && found < MAX_GAMEPADS; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "/dev/input/event%d", i);
+
+        int fd = real_open(path, O_RDWR, 0);
+        if (fd < 0) continue;
+
+        unsigned long evbits[NLONGS_(EV_MAX + 1)];
+        memset(evbits, 0, sizeof evbits);
+        if (real_ioctl(fd, EVIOCGBIT(0, sizeof evbits), evbits) < 0 ||
+            !TEST_BIT_(EV_FF, evbits)) {
+            close(fd); continue;
+        }
+
+        unsigned long ffbits[NLONGS_(FF_MAX + 1)];
+        memset(ffbits, 0, sizeof ffbits);
+        if (real_ioctl(fd, EVIOCGBIT(EV_FF, sizeof ffbits), ffbits) < 0 ||
+            !TEST_BIT_(FF_RUMBLE, ffbits)) {
+            close(fd); continue;
+        }
+
+        struct ff_effect eff;
+        memset(&eff, 0, sizeof eff);
+        eff.type = FF_RUMBLE;
+        eff.id   = -1;
+        eff.replay.length = 5000;
+        if (real_ioctl(fd, EVIOCSFF, &eff) < 0) {
+            close(fd); continue;
+        }
+
+        char name[256] = {0};
+        real_ioctl(fd, EVIOCGNAME(sizeof name), name);
+
+        ff_fd[found]        = fd;
+        ff_effect_id[found] = eff.id;
+        LOGI("FF: [%d] '%s' at %s (effect id=%d)\n", found, name, path, eff.id);
+        found++;
+    }
+    if (found == 0)
+        LOGI("FF: no rumble-capable evdev nodes found (normal on stock Android)\n");
+}
 
 struct gamepad_io {
     int16_t lx, ly, rx, ry, lt, rt;
@@ -75,6 +161,9 @@ static int OnRumble(void *userdata,
     int idx = (int)(intptr_t)userdata;
     if (idx < 0 || idx >= MAX_GAMEPADS || rumble_fd[idx] < 0) return -1;
 
+    uint16_t vals[2] = { low_frequency_rumble, high_frequency_rumble };
+
+    pthread_mutex_lock(&shm_mutex);
     if (low_frequency_rumble != 0 || high_frequency_rumble != 0) {
         last_rumble_low [idx] = low_frequency_rumble;
         last_rumble_high[idx] = high_frequency_rumble;
@@ -82,10 +171,6 @@ static int OnRumble(void *userdata,
         last_rumble_low [idx] = 0;
         last_rumble_high[idx] = 0;
     }
-
-    uint16_t vals[2] = { low_frequency_rumble, high_frequency_rumble };
-
-    pthread_mutex_lock(&shm_mutex);
     ssize_t w = pwrite(rumble_fd[idx], vals, sizeof(vals), 32);
     pthread_mutex_unlock(&shm_mutex);
 
@@ -94,6 +179,8 @@ static int OnRumble(void *userdata,
 
     LOGD("Rumble P%d  low=%u  high=%u\n", idx,
          low_frequency_rumble, high_frequency_rumble);
+
+    send_ff_rumble(idx, low_frequency_rumble, high_frequency_rumble);
     return 0;
 }
 
@@ -160,8 +247,10 @@ static void *vjoy_updater(void *arg)
          * XInput "set and forget" semantics through the SDL translation. */
         if (p_SDL_JoystickRumble && ++keepalive_ctr >= RUMBLE_KEEPALIVE_TICKS) {
             keepalive_ctr = 0;
+            pthread_mutex_lock(&shm_mutex);
             uint16_t kl = last_rumble_low[idx];
             uint16_t kh = last_rumble_high[idx];
+            pthread_mutex_unlock(&shm_mutex);
             if (kl != 0 || kh != 0) {
                 p_SDL_JoystickRumble(js, kl, kh, RUMBLE_KEEPALIVE_DUR_MS);
                 LOGD("Rumble keepalive P%d  low=%u  high=%u\n", idx, kl, kh);
@@ -245,6 +334,8 @@ static void initialize_all_pads(void)
         pthread_create(&up_tid, NULL, vjoy_updater, (void*)(intptr_t)i);
         pthread_detach(up_tid);
     }
+
+    init_ff_rumble();
 }
 
 /* ------------  “hide /dev/input/event*” hooks  -------------------- */
@@ -252,9 +343,6 @@ static void initialize_all_pads(void)
 
 static inline int is_event_node(const char *p)
 { return p && !strncmp(p, "/dev/input/event", 16); }
-
-typedef int (*open_f)(const char *, int, ...);
-static open_f real_open;
 
 static int open_common(const char *path, int flags, va_list ap)
 {
@@ -285,9 +373,6 @@ int open64(const char *path, int flags, ...)
     return r;
 }
 
-typedef int (*ioctl_f)(int, int, ...);
-static ioctl_f real_ioctl;
-
 int ioctl(int fd, int req, ...) __attribute__((visibility("default")));
 int ioctl(int fd, int req, ...)
 {
@@ -305,9 +390,6 @@ int ioctl(int fd, int req, ...)
     va_end(ap);
     return real_ioctl(fd, req, arg);
 }
-
-typedef ssize_t (*read_f)(int, void *, size_t);
-static read_f real_read;
 
 ssize_t read(int fd, void *buf, size_t count) __attribute__((visibility("default")));
 ssize_t read(int fd, void *buf, size_t count)

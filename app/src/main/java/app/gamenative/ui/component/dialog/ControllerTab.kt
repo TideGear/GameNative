@@ -72,9 +72,17 @@ fun ControllerTabContent(state: ContainerConfigState, default: Boolean) {
                 state.config.value = config.copy(dinputMapperType = if (index == 0) 1 else 2)
             },
         )
-        val vibrationModes = listOf("Off", "Controller", "Device", "Both")
+        val vibrationModes = listOf(
+            stringResource(R.string.vibration_mode_off),
+            stringResource(R.string.vibration_mode_controller),
+            stringResource(R.string.vibration_mode_device),
+            stringResource(R.string.vibration_mode_both),
+        )
         val vibrationModeValues = listOf("off", "controller", "device", "both")
-        val vibrationModeIndex = vibrationModeValues.indexOf(config.vibrationMode).coerceAtLeast(0)
+        val normalizedMode = config.vibrationMode.trim().lowercase().let {
+            if (it in vibrationModeValues) it else "controller"
+        }
+        val vibrationModeIndex = vibrationModeValues.indexOf(normalizedMode)
         SettingsListDropdown(
             colors = settingsTileColors(),
             title = { Text(text = stringResource(R.string.vibration_mode)) },
@@ -84,7 +92,7 @@ fun ControllerTabContent(state: ContainerConfigState, default: Boolean) {
                 state.config.value = config.copy(vibrationMode = vibrationModeValues[index])
             },
         )
-        if (config.vibrationMode != "off") {
+        if (normalizedMode != "off") {
             var intensitySlider by remember(config.vibrationIntensity) {
                 mutableIntStateOf(config.vibrationIntensity.coerceIn(0, 100))
             }
