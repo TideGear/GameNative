@@ -1008,7 +1008,6 @@ fun XServerScreen(
             override fun onInputDeviceAdded(deviceId: Int) {
                 val device = InputDevice.getDevice(deviceId) ?: return
                 evaluateDevice(device)
-                xServerView?.getxServer()?.winHandler?.requestUsbPermissionsForControllers()
             }
 
             override fun onInputDeviceRemoved(deviceId: Int) {
@@ -1529,9 +1528,7 @@ fun XServerScreen(
                             }
                             handler.setPreferredInputApi(PreferredInputApi.values()[container.inputType])
                             handler.setDInputMapperType(container.dinputMapperType)
-                            handler.setVibrationMode(
-                                container.getExtra("vibrationMode", "controller").trim().lowercase()
-                            )
+                            handler.setVibrationMode(container.getExtra("vibrationMode", "controller"))
                             handler.setVibrationIntensity(container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100)
                             if (container.isDisableMouseInput()) {
                                 PluviaApp.touchpadView?.setTouchscreenMouseDisabled(true)

@@ -1,17 +1,8 @@
 package com.winlator.winhandler;
 
 import android.annotation.TargetApi;
-import android.app.PendingIntent;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
-import android.hardware.usb.UsbConstants;
-import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbDeviceConnection;
-import android.hardware.usb.UsbEndpoint;
-import android.hardware.usb.UsbInterface;
-import android.hardware.usb.UsbManager;
 import android.media.AudioAttributes;
 import android.net.Uri;
 import android.os.Build;
@@ -55,11 +46,8 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 
@@ -99,8 +87,8 @@ public class WinHandler {
     private final short[] lastHighFreqs = new short[MAX_PLAYERS];
     private final boolean[] isRumbling = new boolean[MAX_PLAYERS];
     private final int[] rumbleKeepaliveCtr = new int[MAX_PLAYERS];
-    private static final int RUMBLE_KEEPALIVE_INTERVAL = 40;
-    private static final int CONTROLLER_RUMBLE_MS = 1000;
+    private static final int RUMBLE_KEEPALIVE_INTERVAL = 12;
+    private static final int CONTROLLER_RUMBLE_MS = 500;
     private static final int DEVICE_RUMBLE_MS = 60000;
     private boolean isShowingAssignDialog = false;
     private Context activity;
@@ -109,73 +97,13 @@ public class WinHandler {
     private String vibrationMode = "controller";
     private int vibrationIntensity = 100;
 
-    private static final String USB_PERMISSION_ACTION = "app.gamenative.USB_PERMISSION";
-    private final UsbDeviceConnection[] usbRumbleConn = new UsbDeviceConnection[MAX_PLAYERS];
-    private final UsbEndpoint[] usbRumbleEndpoint = new UsbEndpoint[MAX_PLAYERS];
-    private final boolean[] usbPermissionPending = new boolean[MAX_PLAYERS];
-
     public void setInputControlsView(InputControlsView view) {
         this.inputControlsView = view;
     }
 
-    private static final Set<String> SUPPORTED_VIBRATION_MODES =
-            new HashSet<>(Arrays.asList("off", "controller", "device", "both"));
-
     public void setVibrationMode(String mode) {
-        String normalized = mode != null ? mode.trim().toLowerCase(java.util.Locale.ROOT) : "controller";
-        if (!SUPPORTED_VIBRATION_MODES.contains(normalized)) {
-            Log.w(TAG, "Unknown vibration mode '" + mode + "', falling back to 'controller'");
-            normalized = "controller";
-        }
-        this.vibrationMode = normalized;
+        this.vibrationMode = mode != null ? mode : "controller";
         Log.i(TAG, "Vibration mode set to: " + this.vibrationMode);
-        if ("controller".equals(vibrationMode) || "both".equals(vibrationMode)) {
-            requestUsbPermissionsForControllers();
-        }
-    }
-
-    /**
-     * Proactively requests USB Host API permission for any connected USB
-     * gamepads whose standard Android vibrator APIs are unavailable.  Called
-     * when the vibration mode is configured and when new controllers are
-     * detected, so the user sees the permission dialog before gameplay
-     * begins rather than mid-rumble.
-     */
-    public void requestUsbPermissionsForControllers() {
-        if (activity == null) return;
-        UsbManager usbManager = (UsbManager) activity.getSystemService(Context.USB_SERVICE);
-        if (usbManager == null) return;
-
-        for (int p = 0; p < MAX_PLAYERS; p++) {
-            InputDevice device = resolveInputDeviceForPlayer(p);
-            if (device == null) continue;
-
-            boolean hasStandardVibrator = false;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                VibratorManager vm = device.getVibratorManager();
-                if (vm != null && vm.getVibratorIds().length > 0) hasStandardVibrator = true;
-            }
-            if (!hasStandardVibrator) {
-                Vibrator v = device.getVibrator();
-                if (v != null && v.hasVibrator()) hasStandardVibrator = true;
-            }
-            if (hasStandardVibrator) continue;
-
-            int vid = device.getVendorId();
-            int pid = device.getProductId();
-            for (UsbDevice ud : usbManager.getDeviceList().values()) {
-                if (ud.getVendorId() == vid && ud.getProductId() == pid) {
-                    if (!usbManager.hasPermission(ud)) {
-                        PendingIntent pi = PendingIntent.getBroadcast(activity, 0,
-                                new Intent(USB_PERMISSION_ACTION), PendingIntent.FLAG_IMMUTABLE);
-                        usbManager.requestPermission(ud, pi);
-                        Log.i(TAG, "Proactively requesting USB permission for '" +
-                                device.getName() + "' (no standard vibrator)");
-                    }
-                    break;
-                }
-            }
-        }
     }
 
     public void setVibrationIntensity(int intensity) {
@@ -254,7 +182,7 @@ public class WinHandler {
         if (slot < 0 || slot >= MAX_PLAYERS) return;
         ExternalController old = getControllerForSlot(slot);
         if (old != null && old != controller) {
-            stopVibrationForPlayer(slot);
+            stopVibrationForSlot(slot, old);
             lastLowFreqs[slot] = 0;
             lastHighFreqs[slot] = 0;
         }
@@ -463,7 +391,6 @@ public class WinHandler {
         this.running = false;
         for (int p = 0; p < MAX_PLAYERS; p++) {
             stopVibrationForPlayer(p);
-            closeUsbRumble(p);
         }
         DatagramSocket datagramSocket = this.socket;
         if (datagramSocket != null) {
@@ -719,7 +646,7 @@ public class WinHandler {
                             rumbleKeepaliveCtr[p]++;
                             if (rumbleKeepaliveCtr[p] >= RUMBLE_KEEPALIVE_INTERVAL) {
                                 rumbleKeepaliveCtr[p] = 0;
-                                startVibrationForPlayer(p, lowFreq, highFreq, true);
+                                startVibrationForPlayer(p, lowFreq, highFreq);
                             }
                         }
                     } catch (Exception e) {
@@ -889,122 +816,11 @@ public class WinHandler {
                 vibrateSingle(v, blended, CONTROLLER_RUMBLE_MS);
                 return true;
             }
-            Log.w(TAG, "Rumble P" + player + ": standard APIs failed on '" + device.getName() + "', trying USB");
+            Log.w(TAG, "Rumble P" + player + ": no vibrators available on '" + device.getName() + "'");
         } catch (Exception e) {
             Log.e(TAG, "Rumble P" + player + ": exception vibrating controller", e);
         }
-
-        return vibrateViaUsb(player, device, lowFreq, highFreq);
-    }
-
-    private boolean vibrateViaUsb(int player, InputDevice device, short lowFreq, short highFreq) {
-        try {
-            if (usbRumbleConn[player] != null && usbRumbleEndpoint[player] != null) {
-                return sendUsbRumble(player, lowFreq, highFreq);
-            }
-
-            UsbManager usbManager = (UsbManager) activity.getSystemService(Context.USB_SERVICE);
-            if (usbManager == null) return false;
-
-            int vid = device.getVendorId();
-            int pid = device.getProductId();
-            UsbDevice usbDevice = null;
-            for (UsbDevice ud : usbManager.getDeviceList().values()) {
-                if (ud.getVendorId() == vid && ud.getProductId() == pid) {
-                    usbDevice = ud;
-                    break;
-                }
-            }
-            if (usbDevice == null) return false;
-
-            if (!usbManager.hasPermission(usbDevice)) {
-                if (!usbPermissionPending[player]) {
-                    usbPermissionPending[player] = true;
-                    PendingIntent pi = PendingIntent.getBroadcast(activity, 0,
-                            new Intent(USB_PERMISSION_ACTION), PendingIntent.FLAG_IMMUTABLE);
-                    usbManager.requestPermission(usbDevice, pi);
-                    Log.i(TAG, "USB rumble: requesting permission for " + usbDevice.getDeviceName());
-                }
-                return false;
-            }
-
-            UsbDeviceConnection conn = usbManager.openDevice(usbDevice);
-            if (conn == null) {
-                Log.w(TAG, "USB rumble: failed to open " + usbDevice.getDeviceName());
-                return false;
-            }
-
-            UsbInterface iface = null;
-            UsbEndpoint outEp = null;
-            for (int i = 0; i < usbDevice.getInterfaceCount(); i++) {
-                UsbInterface ui = usbDevice.getInterface(i);
-                for (int j = 0; j < ui.getEndpointCount(); j++) {
-                    UsbEndpoint ep = ui.getEndpoint(j);
-                    if (ep.getDirection() == UsbConstants.USB_DIR_OUT &&
-                        ep.getType() == UsbConstants.USB_ENDPOINT_XFER_INT) {
-                        iface = ui;
-                        outEp = ep;
-                        break;
-                    }
-                }
-                if (outEp != null) break;
-            }
-
-            if (iface == null || outEp == null) {
-                conn.close();
-                Log.w(TAG, "USB rumble: no interrupt OUT endpoint on " + usbDevice.getDeviceName());
-                return false;
-            }
-
-            if (!conn.claimInterface(iface, true)) {
-                conn.close();
-                Log.w(TAG, "USB rumble: failed to claim interface");
-                return false;
-            }
-
-            usbRumbleConn[player] = conn;
-            usbRumbleEndpoint[player] = outEp;
-            Log.i(TAG, "USB rumble: connection established for P" + player +
-                    " on " + usbDevice.getDeviceName() +
-                    " iface=" + iface.getId() + " ep=" + outEp.getAddress());
-
-            return sendUsbRumble(player, lowFreq, highFreq);
-        } catch (Exception e) {
-            Log.e(TAG, "USB rumble P" + player + ": exception", e);
-            return false;
-        }
-    }
-
-    private boolean sendUsbRumble(int player, short lowFreq, short highFreq) {
-        UsbDeviceConnection conn = usbRumbleConn[player];
-        UsbEndpoint ep = usbRumbleEndpoint[player];
-        if (conn == null || ep == null) return false;
-
-        int leftMotor = ((lowFreq & 0xFFFF) * vibrationIntensity / 100) >> 8;
-        int rightMotor = ((highFreq & 0xFFFF) * vibrationIntensity / 100) >> 8;
-
-        byte[] report = new byte[]{
-            0x00, 0x08, 0x00,
-            (byte) leftMotor, (byte) rightMotor,
-            0x00, 0x00, 0x00
-        };
-
-        int result = conn.bulkTransfer(ep, report, report.length, 100);
-        if (result < 0) {
-            Log.w(TAG, "USB rumble P" + player + ": bulkTransfer failed (" + result + "), releasing");
-            closeUsbRumble(player);
-            return false;
-        }
-        return true;
-    }
-
-    private void closeUsbRumble(int player) {
-        if (usbRumbleConn[player] != null) {
-            try { usbRumbleConn[player].close(); } catch (Exception ignored) {}
-            usbRumbleConn[player] = null;
-        }
-        usbRumbleEndpoint[player] = null;
-        usbPermissionPending[player] = false;
+        return false;
     }
 
     private void vibrateDevice(short lowFreq, short highFreq) {
@@ -1030,16 +846,6 @@ public class WinHandler {
     }
 
     private void startVibrationForPlayer(int player, short lowFreq, short highFreq) {
-        startVibrationForPlayer(player, lowFreq, highFreq, false);
-    }
-
-    /**
-     * @param keepalive true when called from the keepalive path — refreshes
-     *                  controller rumble but skips re-triggering the device
-     *                  vibrator (which uses a long one-shot that doesn't need
-     *                  periodic resets).
-     */
-    private void startVibrationForPlayer(int player, short lowFreq, short highFreq, boolean keepalive) {
         if ("off".equals(vibrationMode)) return;
 
         Log.d(TAG, "Rumble P" + player + ": low=" + (lowFreq & 0xFFFF) + " high=" + (highFreq & 0xFFFF)
@@ -1050,45 +856,45 @@ public class WinHandler {
         if ("controller".equals(vibrationMode)) {
             vibrateController(player, lowFreq, highFreq);
         } else if ("device".equals(vibrationMode)) {
-            if (!keepalive) vibrateDevice(lowFreq, highFreq);
+            vibrateDevice(lowFreq, highFreq);
         } else if ("both".equals(vibrationMode)) {
             vibrateController(player, lowFreq, highFreq);
-            if (!keepalive) vibrateDevice(lowFreq, highFreq);
+            vibrateDevice(lowFreq, highFreq);
         }
     }
 
     private void stopVibrationForPlayer(int player) {
         if (!isRumbling[player]) return;
 
-        // Always cancel both controller and device vibration unconditionally.
-        // The mode may have changed since vibration started, so we must ensure
-        // nothing is left buzzing from the previous mode.
-        try {
-            InputDevice device = resolveInputDeviceForPlayer(player);
-            if (device != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    VibratorManager vm = device.getVibratorManager();
-                    if (vm.getVibratorIds().length > 0) {
-                        vm.cancel();
+        if (!"device".equals(vibrationMode)) {
+            try {
+                InputDevice device = resolveInputDeviceForPlayer(player);
+                if (device != null) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        VibratorManager vm = device.getVibratorManager();
+                        if (vm.getVibratorIds().length > 0) {
+                            vm.cancel();
+                        }
+                    }
+                    Vibrator vibrator = device.getVibrator();
+                    if (vibrator != null && vibrator.hasVibrator()) {
+                        vibrator.cancel();
                     }
                 }
-                Vibrator vibrator = device.getVibrator();
-                if (vibrator != null && vibrator.hasVibrator()) {
-                    vibrator.cancel();
-                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error cancelling controller vibration", e);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error cancelling controller vibration", e);
         }
-        sendUsbRumble(player, (short) 0, (short) 0);
 
-        try {
-            Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
-            if (phoneVibrator != null) {
-                phoneVibrator.cancel();
+        if (!"controller".equals(vibrationMode)) {
+            try {
+                Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+                if (phoneVibrator != null) {
+                    phoneVibrator.cancel();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error cancelling device vibration", e);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error cancelling device vibration", e);
         }
 
         isRumbling[player] = false;

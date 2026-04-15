@@ -732,10 +732,6 @@
     <!-- Vibration Settings -->
     <string name="vibration_mode">Vibration Mode</string>
     <string name="vibration_intensity">Vibration Intensity</string>
-    <string name="vibration_mode_off">Off</string>
-    <string name="vibration_mode_controller">Controller</string>
-    <string name="vibration_mode_device">Device</string>
-    <string name="vibration_mode_both">Both</string>
 
     <!-- Gesture Settings Dialog -->
     <string name="gesture_settings">Gesture Settings</string>

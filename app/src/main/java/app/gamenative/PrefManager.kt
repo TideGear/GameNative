@@ -217,21 +217,15 @@ object PrefManager {
         }
 
     private val VIBRATION_MODE = stringPreferencesKey("vibration_mode")
-    private val VALID_VIBRATION_MODES = setOf("off", "controller", "device", "both")
     var vibrationMode: String
-        get() {
-            val stored = getPref(VIBRATION_MODE, "controller")
-            val normalized = stored.trim().lowercase()
-            return if (normalized in VALID_VIBRATION_MODES) normalized else "controller"
-        }
+        get() = getPref(VIBRATION_MODE, "controller")
         set(value) {
-            val normalized = value.trim().lowercase()
-            setPref(VIBRATION_MODE, if (normalized in VALID_VIBRATION_MODES) normalized else "controller")
+            setPref(VIBRATION_MODE, value)
         }
 
     private val VIBRATION_INTENSITY = intPreferencesKey("vibration_intensity")
     var vibrationIntensity: Int
-        get() = getPref(VIBRATION_INTENSITY, 100).coerceIn(0, 100)
+        get() = getPref(VIBRATION_INTENSITY, 100)
         set(value) {
             setPref(VIBRATION_INTENSITY, value.coerceIn(0, 100))
         }

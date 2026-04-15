@@ -860,8 +860,6 @@ object ContainerUtils {
                 portraitMode = PrefManager.portraitMode,
                 externalDisplayMode = PrefManager.externalDisplayInputMode,
                 externalDisplaySwap = PrefManager.externalDisplaySwap,
-                vibrationMode = PrefManager.vibrationMode,
-                vibrationIntensity = PrefManager.vibrationIntensity,
             )
         }
 
