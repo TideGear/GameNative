@@ -75,9 +75,9 @@ class PhysicalControllerHandler(
             if (controller != null) {
                 val controllerBinding = controller.getControllerBinding(event.keyCode)
                 if (controllerBinding != null) {
-                    // Some controllers emit BOTH a digital KeyEvent for L2/R2 and an analog axis value in MotionEvent.
-                    // If this physical key is mapped to a virtual trigger AND the device exposes trigger axes,
-                    // ignore the KeyEvent to avoid an initial "full press" spike. MotionEvent will provide the analog value.
+                    Log.d(TAG, "PCH.onKey: deviceId=${event.deviceId} name='${event.device?.name}'"
+                            + " keyCode=${event.keyCode} binding=${controllerBinding.binding}"
+                            + " action=${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"}")
                     if ((event.keyCode == KeyEvent.KEYCODE_BUTTON_L2 || event.keyCode == KeyEvent.KEYCODE_BUTTON_R2) &&
                         (controllerBinding.binding == Binding.GAMEPAD_BUTTON_L2 || controllerBinding.binding == Binding.GAMEPAD_BUTTON_R2) &&
                         deviceHasTriggerAxis(event.device, event.keyCode)
@@ -89,7 +89,11 @@ class PhysicalControllerHandler(
                     ) 1f else 0f
                     handleInputEvent(controllerBinding.binding, event.action == KeyEvent.ACTION_DOWN, offset, event.deviceId)
                     return true
+                } else {
+                    Log.d(TAG, "PCH.onKey: deviceId=${event.deviceId} keyCode=${event.keyCode} -> NO BINDING, passing through")
                 }
+            } else {
+                Log.d(TAG, "PCH.onKey: deviceId=${event.deviceId} name='${event.device?.name}' -> NO CONTROLLER IN PROFILE, passing through")
             }
         }
         return false
@@ -240,15 +244,14 @@ class PhysicalControllerHandler(
             val winHandler = xServer?.winHandler ?: return
             val controllerManager = ControllerManager.getInstance()
 
-            // Determine which player slot this device belongs to
             val slot = if (deviceId >= 0) controllerManager.autoAssignDevice(deviceId) else 0
+            Log.d(TAG, "PCH.handleInput: binding=$binding down=$isActionDown deviceId=$deviceId -> slot=$slot")
             if (slot < 0) return
 
-            // Ensure we have a controller in this slot
             var slotController = winHandler.getControllerForSlot(slot)
             if (slotController == null || (deviceId >= 0 && slotController.deviceId != deviceId)) {
-                val adopted = profile?.getController(deviceId)
-                    ?: ExternalController.getController(deviceId)
+                val adopted = ExternalController.getController(deviceId)
+                    ?: profile?.getController(deviceId)
                     ?: return
                 winHandler.setControllerForSlot(slot, adopted)
                 slotController = adopted

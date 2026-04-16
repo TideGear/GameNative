@@ -216,16 +216,29 @@ object PrefManager {
             setPref(SHARPNESS_DENOISE, value.coerceIn(0, 100))
         }
 
+    private val VALID_VIBRATION_MODES = setOf("off", "controller", "device", "both")
+    private const val DEFAULT_VIBRATION_MODE = "controller"
+
+    private fun normalizeVibrationMode(value: String?): String {
+        val v = value?.trim()?.lowercase().orEmpty()
+        return if (v in VALID_VIBRATION_MODES) v else DEFAULT_VIBRATION_MODE
+    }
+
+    /**
+     * Returns a value in `VALID_VIBRATION_MODES`, for prefs, container extras, or WinHandler.
+     */
+    fun normalizeVibrationModeInput(value: String?): String = normalizeVibrationMode(value)
+
     private val VIBRATION_MODE = stringPreferencesKey("vibration_mode")
     var vibrationMode: String
-        get() = getPref(VIBRATION_MODE, "controller")
+        get() = normalizeVibrationMode(getPref(VIBRATION_MODE, DEFAULT_VIBRATION_MODE))
         set(value) {
-            setPref(VIBRATION_MODE, value)
+            setPref(VIBRATION_MODE, normalizeVibrationMode(value))
         }
 
     private val VIBRATION_INTENSITY = intPreferencesKey("vibration_intensity")
     var vibrationIntensity: Int
-        get() = getPref(VIBRATION_INTENSITY, 100)
+        get() = getPref(VIBRATION_INTENSITY, 100).coerceIn(0, 100)
         set(value) {
             setPref(VIBRATION_INTENSITY, value.coerceIn(0, 100))
         }

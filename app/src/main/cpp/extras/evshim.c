@@ -75,6 +75,8 @@ static int OnRumble(void *userdata,
     int idx = (int)(intptr_t)userdata;
     if (idx < 0 || idx >= MAX_GAMEPADS || rumble_fd[idx] < 0) return -1;
 
+    pthread_mutex_lock(&shm_mutex);
+
     if (low_frequency_rumble != 0 || high_frequency_rumble != 0) {
         last_rumble_low [idx] = low_frequency_rumble;
         last_rumble_high[idx] = high_frequency_rumble;
@@ -84,9 +86,8 @@ static int OnRumble(void *userdata,
     }
 
     uint16_t vals[2] = { low_frequency_rumble, high_frequency_rumble };
-
-    pthread_mutex_lock(&shm_mutex);
     ssize_t w = pwrite(rumble_fd[idx], vals, sizeof(vals), 32);
+
     pthread_mutex_unlock(&shm_mutex);
 
     if (w != (ssize_t)sizeof(vals))
@@ -130,8 +131,8 @@ static void *vjoy_updater(void *arg)
 
     for (;;) {
         pthread_mutex_lock(&shm_mutex);
-
         ssize_t n = pread(fd, &cur, sizeof cur, 0);
+        pthread_mutex_unlock(&shm_mutex);
 
         if (n == sizeof cur && memcmp(&cur, &last_state, sizeof cur) != 0) {
 
@@ -153,15 +154,16 @@ static void *vjoy_updater(void *arg)
             LOGE("P%d: read error: %s\n", idx, strerror(errno));
         }
 
-        pthread_mutex_unlock(&shm_mutex);
-
         /* Re-send last non-zero rumble to SDL periodically so its internal
          * expiry timer never fires the false OnRumble(0,0).  This preserves
          * XInput "set and forget" semantics through the SDL translation. */
         if (p_SDL_JoystickRumble && ++keepalive_ctr >= RUMBLE_KEEPALIVE_TICKS) {
             keepalive_ctr = 0;
-            uint16_t kl = last_rumble_low[idx];
-            uint16_t kh = last_rumble_high[idx];
+            uint16_t kl, kh;
+            pthread_mutex_lock(&shm_mutex);
+            kl = last_rumble_low[idx];
+            kh = last_rumble_high[idx];
+            pthread_mutex_unlock(&shm_mutex);
             if (kl != 0 || kh != 0) {
                 p_SDL_JoystickRumble(js, kl, kh, RUMBLE_KEEPALIVE_DUR_MS);
                 LOGD("Rumble keepalive P%d  low=%u  high=%u\n", idx, kl, kh);

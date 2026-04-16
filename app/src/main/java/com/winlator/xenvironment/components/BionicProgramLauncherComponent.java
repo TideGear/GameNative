@@ -179,10 +179,24 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
     private int execGuestProgram() {
 
-        // Always pre-create all 4 mem files so controllers can be hot-plugged during gameplay.
-        // Unused gamepads just read zeroes (no-op in evshim).
-        final int enabledPlayerCount = WinHandler.MAX_PLAYERS;
-        for (int i = 0; i < enabledPlayerCount; i++) {
+        // Pre-create all 4 mem files so controllers can be hot-plugged during gameplay.
+        // Only tell evshim to create virtual joysticks for currently connected controllers.
+        int connectedControllers = 0;
+        for (int id : android.view.InputDevice.getDeviceIds()) {
+            android.view.InputDevice dev = android.view.InputDevice.getDevice(id);
+            boolean isGamepad = dev != null && !dev.isVirtual() && dev.supportsSource(android.view.InputDevice.SOURCE_GAMEPAD);
+            Log.d("EvshimDeploy", "InputDevice id=" + id
+                    + " name='" + (dev != null ? dev.getName() : "null") + "'"
+                    + " sources=0x" + (dev != null ? Integer.toHexString(dev.getSources()) : "0")
+                    + " virtual=" + (dev != null && dev.isVirtual())
+                    + " isGamepad=" + isGamepad);
+            if (isGamepad) {
+                connectedControllers++;
+            }
+        }
+        final int enabledPlayerCount = Math.max(1, Math.min(connectedControllers, WinHandler.MAX_PLAYERS));
+        Log.i("EvshimDeploy", "Connected controllers: " + connectedControllers + ", evshim players: " + enabledPlayerCount);
+        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
             String memPath;
             if (i == 0) {
                 // Player 1 uses the original, non-numbered path that is known to work.

@@ -20,6 +20,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import app.gamenative.PrefManager
 import app.gamenative.R
 import app.gamenative.data.TouchGestureConfig
 import app.gamenative.ui.component.settings.SettingsListDropdown
@@ -34,6 +35,7 @@ import kotlin.math.roundToInt
 @Composable
 fun ControllerTabContent(state: ContainerConfigState, default: Boolean) {
     val config = state.config.value
+    val normalizedVibrationMode = PrefManager.normalizeVibrationModeInput(config.vibrationMode)
     var showGestureDialog by remember { mutableStateOf(false) }
 
     SettingsGroup() {
@@ -72,9 +74,14 @@ fun ControllerTabContent(state: ContainerConfigState, default: Boolean) {
                 state.config.value = config.copy(dinputMapperType = if (index == 0) 1 else 2)
             },
         )
-        val vibrationModes = listOf("Off", "Controller", "Device", "Both")
+        val vibrationModes = listOf(
+            stringResource(R.string.vibration_mode_option_off),
+            stringResource(R.string.vibration_mode_option_controller),
+            stringResource(R.string.vibration_mode_option_device),
+            stringResource(R.string.vibration_mode_option_both),
+        )
         val vibrationModeValues = listOf("off", "controller", "device", "both")
-        val vibrationModeIndex = vibrationModeValues.indexOf(config.vibrationMode).coerceAtLeast(0)
+        val vibrationModeIndex = vibrationModeValues.indexOf(normalizedVibrationMode).coerceAtLeast(0)
         SettingsListDropdown(
             colors = settingsTileColors(),
             title = { Text(text = stringResource(R.string.vibration_mode)) },
@@ -84,7 +91,7 @@ fun ControllerTabContent(state: ContainerConfigState, default: Boolean) {
                 state.config.value = config.copy(vibrationMode = vibrationModeValues[index])
             },
         )
-        if (config.vibrationMode != "off") {
+        if (normalizedVibrationMode != "off") {
             var intensitySlider by remember(config.vibrationIntensity) {
                 mutableIntStateOf(config.vibrationIntensity.coerceIn(0, 100))
             }
