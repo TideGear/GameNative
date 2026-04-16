@@ -7,6 +7,7 @@ import android.media.AudioAttributes;
 import android.net.Uri;
 import android.os.Build;
 import android.os.CombinedVibration;
+import android.os.FileObserver;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -90,16 +91,23 @@ public class WinHandler {
     private final short[] lastLowFreqs = new short[MAX_PLAYERS];
     private final short[] lastHighFreqs = new short[MAX_PLAYERS];
     private final boolean[] isRumbling = new boolean[MAX_PLAYERS];
-    private final int[] rumbleKeepaliveCtr = new int[MAX_PLAYERS];
-    private final int[] deviceRumbleTickCtr = new int[MAX_PLAYERS];
+    // Wall-clock timestamps (ms) used instead of tick counters so that the
+    // keepalive cadence is correct even when the poller wakes early (FileObserver)
+    // or late (GC pause).
+    private final long[] lastKeepaliveMs = new long[MAX_PLAYERS];
+    private final long[] lastDeviceRefreshMs = new long[MAX_PLAYERS];
+    // Notified by FileObserver.onEvent() and by stop() to wake the poller thread.
+    private final Object rumbleNotifyLock = new Object();
+    private final FileObserver[] gamepadFileObservers = new FileObserver[MAX_PLAYERS];
     // Per-player phone-vibrator amplitude. Written by the rumble poller thread; read by
     // vibrateDevice/stopVibrationForPlayer which also run on the same thread, so no lock needed.
     private final int[] playerPhoneAmplitudes = new int[MAX_PLAYERS];
-    private static final int RUMBLE_KEEPALIVE_INTERVAL = 12;
+    // How often (ms) to re-send rumble to the controller to reset its internal expiry timer.
+    private static final int RUMBLE_KEEPALIVE_MS = 240;   // was: 12 ticks × 20 ms
     private static final int CONTROLLER_RUMBLE_MS = 500;
     private static final int DEVICE_RUMBLE_MS = 60000;
-    private static final int POLLER_INTERVAL_MS = 20;
-    private static final int DEVICE_RUMBLE_REFRESH_TICKS = (DEVICE_RUMBLE_MS - 5000) / POLLER_INTERVAL_MS;
+    // How long before the device one-shot expires to issue a refresh (DEVICE_RUMBLE_MS - 5 s).
+    private static final long DEVICE_RUMBLE_REFRESH_MS = DEVICE_RUMBLE_MS - 5_000L;
     private boolean isShowingAssignDialog = false;
     private Context activity;
     private final java.util.Set<Integer> ignoredDeviceIds = new java.util.HashSet<>();
@@ -231,7 +239,7 @@ public class WinHandler {
             stopVibrationForPlayer(slot);
             lastLowFreqs[slot] = 0;
             lastHighFreqs[slot] = 0;
-            deviceRumbleTickCtr[slot] = 0;
+            lastDeviceRefreshMs[slot] = System.currentTimeMillis();
             // Zero the shared-memory rumble bytes so the next poll doesn't see
             // the old controller's stale rumble values and immediately vibrate
             // the new controller.
@@ -445,6 +453,10 @@ public class WinHandler {
     /** Stops all WinHandler threads, cancels vibration for all players, and closes the UDP socket. */
     public void stop() {
         this.running = false;
+        // Wake the rumble poller so it can observe running==false and exit.
+        synchronized (rumbleNotifyLock) {
+            rumbleNotifyLock.notifyAll();
+        }
         for (int p = 0; p < MAX_PLAYERS; p++) {
             stopVibrationForPlayer(p);
         }
@@ -674,10 +686,54 @@ public class WinHandler {
         startRumblePoller();
     }
 
-    /** Starts a background thread that polls shared-memory buffers for per-player rumble values. */
+    /**
+     * Starts a background thread that reacts to rumble changes in shared-memory buffers.
+     *
+     * <p>Instead of sleeping a fixed interval, the thread waits on {@code rumbleNotifyLock}.
+     * A {@link FileObserver} per player slot watches the corresponding {@code gamepad.mem} file;
+     * when evshim's {@code pwrite()} at offset 32 triggers {@code IN_MODIFY}, the observer
+     * calls {@code notifyAll()} and the thread wakes within microseconds.
+     *
+     * <p>The keepalive path (periodic controller re-rumble to prevent motor auto-expiry) still
+     * fires on a wall-clock schedule via the {@code wait(timeoutMs)} overload.
+     */
+    @SuppressWarnings("deprecation")  // FileObserver(String, int) deprecated API 29; File ctor not available below Q
     private void startRumblePoller() {
+        final String[] memPaths = {
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem",
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad1.mem",
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad2.mem",
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad3.mem",
+        };
+
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            final String path = memPaths[i];
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                gamepadFileObservers[i] = new FileObserver(new File(path), FileObserver.MODIFY) {
+                    @Override public void onEvent(int event, String filename) {
+                        synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
+                    }
+                };
+            } else {
+                gamepadFileObservers[i] = new FileObserver(path, FileObserver.MODIFY) {
+                    @Override public void onEvent(int event, String filename) {
+                        synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
+                    }
+                };
+            }
+            gamepadFileObservers[i].startWatching();
+        }
+
         rumblePollerThread = new Thread(() -> {
+            long now = System.currentTimeMillis();
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                lastKeepaliveMs[p] = now;
+                lastDeviceRefreshMs[p] = now;
+            }
+
             while (running) {
+                now = System.currentTimeMillis();
+
                 for (int p = 0; p < MAX_PLAYERS; p++) {
                     try {
                         MappedByteBuffer buf = getBufferForSlot(p);
@@ -688,20 +744,20 @@ public class WinHandler {
                         if (changed) {
                             lastLowFreqs[p] = lowFreq;
                             lastHighFreqs[p] = highFreq;
-                            rumbleKeepaliveCtr[p] = 0;
-                            deviceRumbleTickCtr[p] = 0;
+                            lastKeepaliveMs[p] = now;
+                            lastDeviceRefreshMs[p] = now;
                             if (lowFreq == 0 && highFreq == 0) {
                                 stopVibrationForPlayer(p);
                             } else {
                                 startVibrationForPlayer(p, lowFreq, highFreq, false);
                             }
                         } else if (isRumbling[p]) {
-                            rumbleKeepaliveCtr[p]++;
-                            deviceRumbleTickCtr[p]++;
-                            if (rumbleKeepaliveCtr[p] >= RUMBLE_KEEPALIVE_INTERVAL) {
-                                rumbleKeepaliveCtr[p] = 0;
-                                boolean deviceRefresh = deviceRumbleTickCtr[p] >= DEVICE_RUMBLE_REFRESH_TICKS;
-                                if (deviceRefresh) deviceRumbleTickCtr[p] = 0;
+                            long elapsedKeepalive = now - lastKeepaliveMs[p];
+                            if (elapsedKeepalive >= RUMBLE_KEEPALIVE_MS) {
+                                lastKeepaliveMs[p] = now;
+                                long elapsedDeviceRefresh = now - lastDeviceRefreshMs[p];
+                                boolean deviceRefresh = elapsedDeviceRefresh >= DEVICE_RUMBLE_REFRESH_MS;
+                                if (deviceRefresh) lastDeviceRefreshMs[p] = now;
                                 refreshVibrationForPlayer(p, lowFreq, highFreq, deviceRefresh);
                             }
                         }
@@ -709,13 +765,34 @@ public class WinHandler {
                         // Buffer may be unmapped; continue polling
                     }
                 }
+
+                // Compute how long to wait: until the next keepalive deadline among
+                // all rumbling players.  If no player is rumbling, wait indefinitely
+                // (until a FileObserver notification or stop() wakes us).
+                long waitMs = Long.MAX_VALUE;
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    if (isRumbling[p]) {
+                        long timeToNextKeepalive = RUMBLE_KEEPALIVE_MS - (now - lastKeepaliveMs[p]);
+                        if (timeToNextKeepalive < waitMs) waitMs = timeToNextKeepalive;
+                    }
+                }
+                if (waitMs <= 0) waitMs = 1; // never spin; ensure we yield to other threads
                 try {
-                    Thread.sleep(POLLER_INTERVAL_MS);
+                    synchronized (rumbleNotifyLock) {
+                        // wait(0) means indefinite; cap at keepalive interval when rumbling.
+                        rumbleNotifyLock.wait(waitMs == Long.MAX_VALUE ? 0 : waitMs);
+                    }
                 } catch (InterruptedException e) {
                     break;
                 }
             }
+
+            // Clean up inotify watches when the poller exits.
+            for (FileObserver obs : gamepadFileObservers) {
+                if (obs != null) obs.stopWatching();
+            }
         });
+        rumblePollerThread.setName("rumble-poller");
         rumblePollerThread.start();
     }
 

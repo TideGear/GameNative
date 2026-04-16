@@ -15,6 +15,9 @@
 #include <SDL2/SDL.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <sys/inotify.h>
+#include <poll.h>
+#include <time.h>
 
 static int g_debug_enabled = 0;
 
@@ -126,7 +129,7 @@ static void *vjoy_updater(void *arg)
 
     int fd = read_fd[idx];
     if (fd < 0) {
-        LOGE("P%d: read_fd not initialised – aborting thread\n", idx);
+        LOGE("P%d: read_fd not initialised - aborting thread\n", idx);
         return NULL;
     }
 
@@ -137,9 +140,39 @@ static void *vjoy_updater(void *arg)
     }
 
     struct gamepad_io cur, last_state = {0};
-    int keepalive_ctr = 0;
 
-    LOGI("VJOY UPDATER P%d running (PID %d)\n", idx, getpid());
+    /* Set up inotify to wake immediately when WinHandler writes new input
+     * state (offsets 0-31) rather than sleeping a fixed 5 ms between reads.
+     * The same watch also fires on rumble writes (offset 32-35); those
+     * wakeups are benign - we re-read and find the input portion unchanged. */
+    char watch_path[256];
+    if (idx == 0) {
+        snprintf(watch_path, sizeof watch_path,
+                 "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem");
+    } else {
+        snprintf(watch_path, sizeof watch_path,
+                 "/data/data/app.gamenative/files/imagefs/tmp/gamepad%d.mem", idx);
+    }
+    int ino_fd = inotify_init1(IN_NONBLOCK);
+    if (ino_fd >= 0) {
+        if (inotify_add_watch(ino_fd, watch_path, IN_MODIFY) < 0) {
+            LOGE("P%d: inotify_add_watch failed: %s - falling back to 5 ms poll\n",
+                 idx, strerror(errno));
+            close(ino_fd);
+            ino_fd = -1;
+        }
+    } else {
+        LOGE("P%d: inotify_init1 failed: %s - falling back to 5 ms poll\n",
+             idx, strerror(errno));
+    }
+
+    /* Wall-clock keepalive: replaces tick counter so the rumble refresh
+     * cadence stays correct regardless of how fast inotify wakes the loop. */
+    struct timespec last_keepalive;
+    clock_gettime(CLOCK_MONOTONIC, &last_keepalive);
+
+    LOGI("VJOY UPDATER P%d running (PID %d, inotify=%s)\n",
+         idx, getpid(), ino_fd >= 0 ? "on" : "off");
 
     for (;;) {
         pthread_mutex_lock(&shm_mutex);
@@ -168,28 +201,49 @@ static void *vjoy_updater(void *arg)
 
         /* Re-send last non-zero rumble to SDL periodically so its internal
          * expiry timer never fires the false OnRumble(0,0).  This preserves
-         * XInput "set and forget" semantics through the SDL translation. */
-        if (p_SDL_JoystickRumble && ++keepalive_ctr >= RUMBLE_KEEPALIVE_TICKS) {
-            keepalive_ctr = 0;
-            uint16_t kl, kh;
-            pthread_mutex_lock(&shm_mutex);
-            kl = last_rumble_low[idx];
-            kh = last_rumble_high[idx];
-            pthread_mutex_unlock(&shm_mutex);
-            if (kl != 0 || kh != 0) {
-                /* Flag this player's slot before calling SDL so that the
-                 * synchronous OnRumble() re-entry is recognised as a
-                 * keepalive and does not overwrite shared memory. */
-                atomic_store(&g_keepalive_active[idx], 1);
-                p_SDL_JoystickRumble(js, kl, kh, RUMBLE_KEEPALIVE_DUR_MS);
-                atomic_store(&g_keepalive_active[idx], 0);
-                LOGD("Rumble keepalive P%d  low=%u  high=%u\n", idx, kl, kh);
+         * XInput "set and forget" semantics through the SDL translation.
+         * Use wall clock so the 500 ms cadence is correct even when inotify
+         * wakes the loop much faster than the old fixed 5 ms sleep did. */
+        if (p_SDL_JoystickRumble) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (now.tv_sec  - last_keepalive.tv_sec)  * 1000L
+                            + (now.tv_nsec - last_keepalive.tv_nsec) / 1000000L;
+            if (elapsed_ms >= RUMBLE_KEEPALIVE_TICKS * 5) { /* 100 * 5 ms = 500 ms */
+                last_keepalive = now;
+                uint16_t kl, kh;
+                pthread_mutex_lock(&shm_mutex);
+                kl = last_rumble_low[idx];
+                kh = last_rumble_high[idx];
+                pthread_mutex_unlock(&shm_mutex);
+                if (kl != 0 || kh != 0) {
+                    /* Flag this player's slot before calling SDL so that the
+                     * synchronous OnRumble() re-entry is recognised as a
+                     * keepalive and does not overwrite shared memory. */
+                    atomic_store(&g_keepalive_active[idx], 1);
+                    p_SDL_JoystickRumble(js, kl, kh, RUMBLE_KEEPALIVE_DUR_MS);
+                    atomic_store(&g_keepalive_active[idx], 0);
+                    LOGD("Rumble keepalive P%d  low=%u  high=%u\n", idx, kl, kh);
+                }
             }
         }
 
-        p_SDL_Delay(5);
+        /* Wait up to 5 ms for the next file modification then drain the
+         * inotify queue so events do not accumulate across iterations.
+         * Falls back to p_SDL_Delay(5) if inotify is unavailable. */
+        if (ino_fd >= 0) {
+            struct pollfd pfd = { ino_fd, POLLIN, 0 };
+            poll(&pfd, 1, 5);
+            /* Drain all queued events (non-blocking). */
+            char ibuf[256];
+            while (read(ino_fd, ibuf, sizeof ibuf) > 0) {}
+        } else {
+            p_SDL_Delay(5);
+        }
     }
 
+    /* Unreachable in normal operation; cleanup for early-return paths above. */
+    if (ino_fd >= 0) close(ino_fd);
     return NULL;
 }
 
