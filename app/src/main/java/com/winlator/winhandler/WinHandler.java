@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.CombinedVibration;
 import android.os.FileObserver;
+import android.os.SystemClock;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -239,7 +240,7 @@ public class WinHandler {
             stopVibrationForPlayer(slot);
             lastLowFreqs[slot] = 0;
             lastHighFreqs[slot] = 0;
-            lastDeviceRefreshMs[slot] = System.currentTimeMillis();
+            lastDeviceRefreshMs[slot] = SystemClock.elapsedRealtime();
             // Zero the shared-memory rumble bytes so the next poll doesn't see
             // the old controller's stale rumble values and immediately vibrate
             // the new controller.
@@ -725,14 +726,14 @@ public class WinHandler {
         }
 
         rumblePollerThread = new Thread(() -> {
-            long now = System.currentTimeMillis();
+            long now = SystemClock.elapsedRealtime();
             for (int p = 0; p < MAX_PLAYERS; p++) {
                 lastKeepaliveMs[p] = now;
                 lastDeviceRefreshMs[p] = now;
             }
 
             while (running) {
-                now = System.currentTimeMillis();
+                now = SystemClock.elapsedRealtime();
 
                 for (int p = 0; p < MAX_PLAYERS; p++) {
                     try {
