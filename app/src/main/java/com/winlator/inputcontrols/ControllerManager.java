@@ -41,6 +41,11 @@ public class ControllerManager {
     private SharedPreferences preferences;
     private InputManager inputManager;
 
+    // Guards detectedDevices, slotAssignments, and enabledSlots against concurrent
+    // access from the UI thread (scanForDevices, autoAssignDevice, …) and the
+    // rumble poller thread (getAssignedDeviceForSlot, getDetectedDevices).
+    private final Object deviceStateLock = new Object();
+
     // This list will hold all physical game controllers detected by Android.
     private final List<InputDevice> detectedDevices = new ArrayList<>();
 
@@ -79,15 +84,17 @@ public class ControllerManager {
      * always occupies slot 0 regardless of historical assignment order.
      */
     public void scanForDevices() {
-        detectedDevices.clear();
-        int[] deviceIds = inputManager.getInputDeviceIds();
-        for (int deviceId : deviceIds) {
-            InputDevice device = inputManager.getInputDevice(deviceId);
-            if (device != null && !device.isVirtual() && isGameController(device)) {
-                detectedDevices.add(device);
+        synchronized (deviceStateLock) {
+            detectedDevices.clear();
+            int[] deviceIds = inputManager.getInputDeviceIds();
+            for (int deviceId : deviceIds) {
+                InputDevice device = inputManager.getInputDevice(deviceId);
+                if (device != null && !device.isVirtual() && isGameController(device)) {
+                    detectedDevices.add(device);
+                }
             }
+            evictDisconnectedAndCompact();
         }
-        evictDisconnectedAndCompact();
     }
 
     /**
@@ -226,20 +233,24 @@ public class ControllerManager {
      * Returns the list of all detected physical game controllers.
      */
     public List<InputDevice> getDetectedDevices() {
-        return detectedDevices;
+        synchronized (deviceStateLock) {
+            return new ArrayList<>(detectedDevices);
+        }
     }
 
     /**
      * Returns the number of player slots the user has enabled.
      */
     public int getEnabledPlayerCount() {
-        int count = 0;
-        for (boolean enabled : enabledSlots) {
-            if (enabled) {
-                count++;
+        synchronized (deviceStateLock) {
+            int count = 0;
+            for (boolean enabled : enabledSlots) {
+                if (enabled) {
+                    count++;
+                }
             }
+            return count;
         }
-        return count;
     }
 
     /**
@@ -254,16 +265,15 @@ public class ControllerManager {
         String newDeviceIdentifier = getDeviceIdentifier(device);
         if (newDeviceIdentifier == null) return;
 
-        // First, remove the new device from any slot it might already be in.
-        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            if (newDeviceIdentifier.equals(slotAssignments.get(i))) {
-                slotAssignments.remove(i);
+        synchronized (deviceStateLock) {
+            for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+                if (newDeviceIdentifier.equals(slotAssignments.get(i))) {
+                    slotAssignments.remove(i);
+                }
             }
+            slotAssignments.put(slotIndex, newDeviceIdentifier);
         }
-
-        // Assign the new device to the target slot.
-        slotAssignments.put(slotIndex, newDeviceIdentifier);
-        saveAssignments(); // Persist the change immediately.
+        saveAssignments();
     }
 
     /**
@@ -272,7 +282,9 @@ public class ControllerManager {
      */
     public void unassignSlot(int slotIndex) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return;
-        slotAssignments.remove(slotIndex);
+        synchronized (deviceStateLock) {
+            slotAssignments.remove(slotIndex);
+        }
         saveAssignments();
     }
 
@@ -286,16 +298,17 @@ public class ControllerManager {
         String deviceIdentifier = getDeviceIdentifier(device);
         if (deviceIdentifier == null) return -1;
 
-        // Correctly loop through the sparse array to find the key for our value.
-        for (int i = 0; i < slotAssignments.size(); i++) {
-            int key = slotAssignments.keyAt(i);
-            String value = slotAssignments.valueAt(i);
-            if (deviceIdentifier.equals(value)) {
-                return key; // Return the key (the slot index), not the internal index!
+        synchronized (deviceStateLock) {
+            for (int i = 0; i < slotAssignments.size(); i++) {
+                int key = slotAssignments.keyAt(i);
+                String value = slotAssignments.valueAt(i);
+                if (deviceIdentifier.equals(value)) {
+                    return key;
+                }
             }
         }
 
-        return -1; // Not found
+        return -1;
     }
 
 
@@ -305,17 +318,18 @@ public class ControllerManager {
      * @return The assigned InputDevice, or null if no device is assigned or if the device is not currently connected.
      */
     public InputDevice getAssignedDeviceForSlot(int slotIndex) {
-        String assignedIdentifier = slotAssignments.get(slotIndex);
-        if (assignedIdentifier == null) return null;
+        synchronized (deviceStateLock) {
+            String assignedIdentifier = slotAssignments.get(slotIndex);
+            if (assignedIdentifier == null) return null;
 
-        // Search our current list of connected devices for one that matches the saved identifier.
-        for (InputDevice device : detectedDevices) {
-            if (assignedIdentifier.equals(getDeviceIdentifier(device))) {
-                return device; // Found it.
+            for (InputDevice device : detectedDevices) {
+                if (assignedIdentifier.equals(getDeviceIdentifier(device))) {
+                    return device;
+                }
             }
-        }
 
-        return null; // The assigned device is not currently connected.
+            return null;
+        }
     }
 
     /**
@@ -325,14 +339,18 @@ public class ControllerManager {
      */
     public void setSlotEnabled(int slotIndex, boolean isEnabled) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return;
-        enabledSlots[slotIndex] = isEnabled;
+        synchronized (deviceStateLock) {
+            enabledSlots[slotIndex] = isEnabled;
+        }
         saveAssignments();
     }
 
     /** Returns whether the given player slot is enabled. */
     public boolean isSlotEnabled(int slotIndex) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return false;
-        return enabledSlots[slotIndex];
+        synchronized (deviceStateLock) {
+            return enabledSlots[slotIndex];
+        }
     }
 
     /**
@@ -352,22 +370,24 @@ public class ControllerManager {
             return -1;
         }
 
-        // Keep detectedDevices in sync so getAssignedDeviceForSlot can
-        // resolve this device without waiting for the next scanForDevices().
-        String identifier = getDeviceIdentifier(device);
-        boolean alreadyDetected = false;
-        for (InputDevice d : detectedDevices) {
-            if (identifier.equals(getDeviceIdentifier(d))) { alreadyDetected = true; break; }
-        }
-        if (!alreadyDetected) detectedDevices.add(device);
+        synchronized (deviceStateLock) {
+            // Keep detectedDevices in sync so getAssignedDeviceForSlot can
+            // resolve this device without waiting for the next scanForDevices().
+            String identifier = getDeviceIdentifier(device);
+            boolean alreadyDetected = false;
+            for (InputDevice d : detectedDevices) {
+                if (identifier.equals(getDeviceIdentifier(d))) { alreadyDetected = true; break; }
+            }
+            if (!alreadyDetected) detectedDevices.add(device);
 
-        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            if (slotAssignments.get(i) == null) {
-                assignDeviceToSlot(i, device);
-                setSlotEnabled(i, true);
-                android.util.Log.i("ControllerSlot", "autoAssign: '" + device.getName()
-                        + "' -> slot=" + i);
-                return i;
+            for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+                if (slotAssignments.get(i) == null) {
+                    assignDeviceToSlot(i, device);
+                    setSlotEnabled(i, true);
+                    android.util.Log.i("ControllerSlot", "autoAssign: '" + device.getName()
+                            + "' -> slot=" + i);
+                    return i;
+                }
             }
         }
         android.util.Log.w("ControllerSlot", "autoAssign: no slot available for '"

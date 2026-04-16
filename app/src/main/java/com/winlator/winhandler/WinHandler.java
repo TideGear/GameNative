@@ -735,8 +735,8 @@ public class WinHandler {
 
     /**
      * Drives per-motor rumble through VibratorManager (API 31+).
-     * Assigns low-frequency to the first motor and high-frequency to the second,
-     * with motor order swapped for DS4/DualSense controllers.
+     * Assigns low-frequency to {@code ids[0]} and high-frequency to {@code ids[1]}.
+     * Falls back to a blended single-motor vibration when only one vibrator is available.
      */
     @TargetApi(31)
     private boolean rumbleViaVibratorManager(VibratorManager vm, short lowFreq, short highFreq) {

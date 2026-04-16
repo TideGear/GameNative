@@ -32,9 +32,10 @@ class PhysicalControllerHandler(
     // release on actual transitions. Keyed by deviceId to prevent one controller's
     // release from consuming another's tracking when both press the same direction.
     private val activeAxisBindings = mutableMapOf<Int, MutableSet<Int>>()
-    // Devices confirmed at runtime to actually send HAT MotionEvents.
-    // Only after a device delivers a non-zero HAT value do we suppress its d-pad KeyEvents.
-    private val devicesWithConfirmedHat = mutableSetOf<Int>()
+    // Devices confirmed at runtime to actually send HAT MotionEvents, keyed by
+    // InputDevice.getDescriptor() rather than the transient deviceId int so that
+    // recycled IDs after hotplug cannot cause incorrect d-pad suppression.
+    private val devicesWithConfirmedHat = mutableSetOf<String>()
 
     /** Sends release events for all tracked axis bindings across all devices, then clears tracking state. */
     private fun releaseActiveAxes() {
@@ -99,7 +100,7 @@ class PhysicalControllerHandler(
                     // double presses when KeyEvent release and MotionEvent update interleave.
                     // Only suppress after the device has actually delivered a non-zero HAT
                     // MotionEvent, so controllers with buggy descriptors still work via KeyEvents.
-                    if (isDpadKeyCode(event.keyCode) && event.deviceId in devicesWithConfirmedHat) {
+                    if (isDpadKeyCode(event.keyCode) && event.device?.descriptor in devicesWithConfirmedHat) {
                         return true
                     }
                     val offset = if (event.action == KeyEvent.ACTION_DOWN &&
@@ -150,11 +151,12 @@ class PhysicalControllerHandler(
 
                 // Once we see a real HAT value, we know this device sends d-pad
                 // via MotionEvent and can safely suppress its duplicate KeyEvents.
-                if (deviceId !in devicesWithConfirmedHat) {
+                val descriptor = event.device?.descriptor
+                if (descriptor != null && descriptor !in devicesWithConfirmedHat) {
                     val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
                     val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
                     if (hatX != 0f || hatY != 0f) {
-                        devicesWithConfirmedHat.add(deviceId)
+                        devicesWithConfirmedHat.add(descriptor)
                     }
                 }
 

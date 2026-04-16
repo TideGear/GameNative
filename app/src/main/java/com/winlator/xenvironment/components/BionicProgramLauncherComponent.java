@@ -316,9 +316,12 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
         if (new File(sysvPath).exists()) ld_preload += sysvPath;
 
-
-        ld_preload += ":" + evshimPath;
-        ld_preload += ":" + replacePath;
+        if (ifsEvshim.exists()) {
+            ld_preload += (ld_preload.isEmpty() ? "" : ":") + evshimPath;
+        } else {
+            Log.w("EvshimDeploy", "evshim not present at " + evshimPath + "; skipping LD_PRELOAD entry");
+        }
+        ld_preload += (ld_preload.isEmpty() ? "" : ":") + replacePath;
 
         envVars.put("LD_PRELOAD", ld_preload);
 
