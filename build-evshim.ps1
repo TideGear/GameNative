@@ -19,9 +19,18 @@ if (-not (Test-Path $CLANG)) {
     Write-Error "Clang not found at: $CLANG`nCheck that NDK $NDK_VERSION is installed."
 }
 
+# Ensure the output directory exists (needed on a fresh clone).
+$outDir = Split-Path -Parent $OUT
+if (-not (Test-Path $outDir)) {
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    Write-Host "Created output directory: $outDir"
+}
+
 Write-Host "Compiling evshim.c with NDK $NDK_VERSION ..."
 
-$args = @(
+# Use $clangArgs (not $args) — $args is a PowerShell automatic variable and
+# assigning to it can interfere with parameter passing in some contexts.
+$clangArgs = @(
     "-shared", "-fPIC", "-O2",
     "-I", $INCLUDES,
     "-Wl,--as-needed",
@@ -30,7 +39,7 @@ $args = @(
     $SRC
 )
 
-& $CLANG @args
+& $CLANG @clangArgs
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Compilation failed (exit $LASTEXITCODE)"

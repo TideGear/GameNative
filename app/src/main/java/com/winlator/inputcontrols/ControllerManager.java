@@ -221,12 +221,9 @@ public class ControllerManager {
      */
     public static String getDeviceIdentifier(InputDevice device) {
         if (device == null) return null;
-        // The descriptor is the most reliable unique ID for a device.
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            return device.getDescriptor();
-        }
-        // Fallback for older Android versions
-        return "vendor_" + device.getVendorId() + "_product_" + device.getProductId();
+        // getDescriptor() is stable across reconnects and unique per physical device
+        // even when multiple identical-model controllers are connected. Available since API 16.
+        return device.getDescriptor();
     }
 
     /**
