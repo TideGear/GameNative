@@ -631,8 +631,6 @@ public class WinHandler {
         });
 
         startRumblePoller();
-        running = true;
-        startSendThread();
     }
 
     private void startRumblePoller() {

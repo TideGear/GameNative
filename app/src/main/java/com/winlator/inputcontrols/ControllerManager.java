@@ -350,6 +350,15 @@ public class ControllerManager {
             return -1;
         }
 
+        // Keep detectedDevices in sync so getAssignedDeviceForSlot can
+        // resolve this device without waiting for the next scanForDevices().
+        String identifier = getDeviceIdentifier(device);
+        boolean alreadyDetected = false;
+        for (InputDevice d : detectedDevices) {
+            if (identifier.equals(getDeviceIdentifier(d))) { alreadyDetected = true; break; }
+        }
+        if (!alreadyDetected) detectedDevices.add(device);
+
         for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
             if (slotAssignments.get(i) == null) {
                 assignDeviceToSlot(i, device);

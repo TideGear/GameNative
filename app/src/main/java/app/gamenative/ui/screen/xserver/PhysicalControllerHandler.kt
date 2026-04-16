@@ -32,13 +32,17 @@ class PhysicalControllerHandler(
     // release on actual transitions. Keyed by deviceId to prevent one controller's
     // release from consuming another's tracking when both press the same direction.
     private val activeAxisBindings = mutableMapOf<Int, MutableSet<Int>>()
+    // Devices confirmed at runtime to actually send HAT MotionEvents.
+    // Only after a device delivers a non-zero HAT value do we suppress its d-pad KeyEvents.
+    private val devicesWithConfirmedHat = mutableSetOf<Int>()
 
     private fun releaseActiveAxes() {
-        val controller = profile?.getController("*") ?: return
-        for ((_, bindings) in activeAxisBindings) {
+        val prof = profile ?: return
+        for ((deviceId, bindings) in activeAxisBindings) {
+            val controller = prof.getController(deviceId) ?: continue
             for (keyCode in bindings) {
                 controller.getControllerBinding(keyCode)?.let {
-                    handleInputEvent(it.binding, false, 0f)
+                    handleInputEvent(it.binding, false, 0f, deviceId)
                 }
             }
         }
@@ -87,6 +91,15 @@ class PhysicalControllerHandler(
                     ) {
                         return true
                     }
+                    // Same pattern for d-pad: controllers that expose HAT_X/HAT_Y axes also
+                    // emit DPAD KeyEvents. Prefer the MotionEvent path (processJoystickInput)
+                    // which tracks per-device activeAxisBindings and avoids timing-based
+                    // double presses when KeyEvent release and MotionEvent update interleave.
+                    // Only suppress after the device has actually delivered a non-zero HAT
+                    // MotionEvent, so controllers with buggy descriptors still work via KeyEvents.
+                    if (isDpadKeyCode(event.keyCode) && event.deviceId in devicesWithConfirmedHat) {
+                        return true
+                    }
                     val offset = if (event.action == KeyEvent.ACTION_DOWN &&
                         (controllerBinding.binding == Binding.GAMEPAD_BUTTON_L2 || controllerBinding.binding == Binding.GAMEPAD_BUTTON_R2)
                     ) 1f else 0f
@@ -96,6 +109,11 @@ class PhysicalControllerHandler(
             }
         }
         return false
+    }
+
+    private fun isDpadKeyCode(keyCode: Int): Boolean {
+        return keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
+            keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
     }
 
     private fun deviceHasTriggerAxis(device: InputDevice?, keyCode: Int): Boolean {
@@ -124,6 +142,16 @@ class PhysicalControllerHandler(
             val controller = profile?.getController(event.deviceId)
             if (controller != null && controller.updateStateFromMotionEvent(event)) {
                 val deviceId = event.deviceId
+
+                // Once we see a real HAT value, we know this device sends d-pad
+                // via MotionEvent and can safely suppress its duplicate KeyEvents.
+                if (deviceId !in devicesWithConfirmedHat) {
+                    val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+                    val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+                    if (hatX != 0f || hatY != 0f) {
+                        devicesWithConfirmedHat.add(deviceId)
+                    }
+                }
 
                 // Process trigger buttons (L2/R2)
                 var controllerBinding = controller.getControllerBinding(KeyEvent.KEYCODE_BUTTON_L2)
