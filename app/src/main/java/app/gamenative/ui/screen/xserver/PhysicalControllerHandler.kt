@@ -28,15 +28,18 @@ class PhysicalControllerHandler(
     private val TAG = "gncontrol"
     private val mouseMoveOffset = PointF(0f, 0f)
     private var mouseMoveTimer: Timer? = null
-    // track which axis keycodes are currently "pressed" so we only release on actual transitions.
-    // accessed only from main thread (MotionEvent dispatch + Compose lifecycle), no sync needed.
-    private val activeAxisBindings = mutableSetOf<Int>()
+    // Per-device tracking of which axis keycodes are currently "pressed" so we only
+    // release on actual transitions. Keyed by deviceId to prevent one controller's
+    // release from consuming another's tracking when both press the same direction.
+    private val activeAxisBindings = mutableMapOf<Int, MutableSet<Int>>()
 
     private fun releaseActiveAxes() {
         val controller = profile?.getController("*") ?: return
-        for (keyCode in activeAxisBindings) {
-            controller.getControllerBinding(keyCode)?.let {
-                handleInputEvent(it.binding, false, 0f)
+        for ((_, bindings) in activeAxisBindings) {
+            for (keyCode in bindings) {
+                controller.getControllerBinding(keyCode)?.let {
+                    handleInputEvent(it.binding, false, 0f)
+                }
             }
         }
         activeAxisBindings.clear()
@@ -75,9 +78,9 @@ class PhysicalControllerHandler(
             if (controller != null) {
                 val controllerBinding = controller.getControllerBinding(event.keyCode)
                 if (controllerBinding != null) {
-                    Log.d(TAG, "PCH.onKey: deviceId=${event.deviceId} name='${event.device?.name}'"
-                            + " keyCode=${event.keyCode} binding=${controllerBinding.binding}"
-                            + " action=${if (event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"}")
+                    // Some controllers emit BOTH a digital KeyEvent for L2/R2 and an analog axis value in MotionEvent.
+                    // If this physical key is mapped to a virtual trigger AND the device exposes trigger axes,
+                    // ignore the KeyEvent to avoid an initial "full press" spike. MotionEvent will provide the analog value.
                     if ((event.keyCode == KeyEvent.KEYCODE_BUTTON_L2 || event.keyCode == KeyEvent.KEYCODE_BUTTON_R2) &&
                         (controllerBinding.binding == Binding.GAMEPAD_BUTTON_L2 || controllerBinding.binding == Binding.GAMEPAD_BUTTON_R2) &&
                         deviceHasTriggerAxis(event.device, event.keyCode)
@@ -89,11 +92,7 @@ class PhysicalControllerHandler(
                     ) 1f else 0f
                     handleInputEvent(controllerBinding.binding, event.action == KeyEvent.ACTION_DOWN, offset, event.deviceId)
                     return true
-                } else {
-                    Log.d(TAG, "PCH.onKey: deviceId=${event.deviceId} keyCode=${event.keyCode} -> NO BINDING, passing through")
                 }
-            } else {
-                Log.d(TAG, "PCH.onKey: deviceId=${event.deviceId} name='${event.device?.name}' -> NO CONTROLLER IN PROFILE, passing through")
             }
         }
         return false
@@ -183,8 +182,9 @@ class PhysicalControllerHandler(
      * Extracted from InputControlsView.processJoystickInput()
      */
     private fun processJoystickInput(controller: ExternalController, deviceId: Int = -1) {
-        // Reset mouse movement offset at the start - contributions will be added during processing
         mouseMoveOffset.set(0f, 0f)
+
+        val deviceBindings = activeAxisBindings.getOrPut(deviceId) { mutableSetOf() }
 
         val axes = intArrayOf(
             MotionEvent.AXIS_X,
@@ -211,22 +211,22 @@ class PhysicalControllerHandler(
                 val activeKey = ExternalControllerBinding.getKeyCodeForAxis(axes[i], Mathf.sign(values[i]))
                 val oppositeKey = if (activeKey == posKeyCode) negKeyCode else posKeyCode
 
-                activeAxisBindings.add(activeKey)
+                deviceBindings.add(activeKey)
                 controller.getControllerBinding(activeKey)?.let {
                     handleInputEvent(it.binding, true, values[i], deviceId)
                 }
-                if (activeAxisBindings.remove(oppositeKey)) {
+                if (deviceBindings.remove(oppositeKey)) {
                     controller.getControllerBinding(oppositeKey)?.let {
                         handleInputEvent(it.binding, false, 0f, deviceId)
                     }
                 }
             } else {
-                if (activeAxisBindings.remove(posKeyCode)) {
+                if (deviceBindings.remove(posKeyCode)) {
                     controller.getControllerBinding(posKeyCode)?.let {
                         handleInputEvent(it.binding, false, 0f, deviceId)
                     }
                 }
-                if (activeAxisBindings.remove(negKeyCode)) {
+                if (deviceBindings.remove(negKeyCode)) {
                     controller.getControllerBinding(negKeyCode)?.let {
                         handleInputEvent(it.binding, false, 0f, deviceId)
                     }
@@ -245,7 +245,6 @@ class PhysicalControllerHandler(
             val controllerManager = ControllerManager.getInstance()
 
             val slot = if (deviceId >= 0) controllerManager.autoAssignDevice(deviceId) else 0
-            Log.d(TAG, "PCH.handleInput: binding=$binding down=$isActionDown deviceId=$deviceId -> slot=$slot")
             if (slot < 0) return
 
             var slotController = winHandler.getControllerForSlot(slot)

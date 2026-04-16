@@ -1060,8 +1060,6 @@ fun XServerScreen(
                     PluviaApp.isOverlayPaused &&
                     !showQuickMenu &&
                     !keepPausedForEditor
-            Timber.d("XSS.onKey: device='${it.event.device?.name}' id=${it.event.deviceId} src=0x${Integer.toHexString(it.event.device?.sources ?: 0)} keyCode=${it.event.keyCode} isGamepad=$isGamepad isKeyboard=$isKeyboard action=${if (it.event.action == KeyEvent.ACTION_DOWN) "DOWN" else "UP"}")
-
             if (waitingForManualResume) {
                 when (it.event.keyCode) {
                     KeyEvent.KEYCODE_ENTER,
@@ -1089,16 +1087,8 @@ fun XServerScreen(
                 var handled = false
                 if (isGamepad) {
                     handled = physicalControllerHandler?.onKeyEvent(it.event) == true
-                    if (handled) { Timber.d("XSS.onKey: HANDLED by PhysicalControllerHandler") }
-                    if (!handled) {
-                        handled = PluviaApp.inputControlsView?.onKeyEvent(it.event) == true
-                        if (handled) { Timber.d("XSS.onKey: HANDLED by InputControlsView") }
-                    }
-                    if (!handled) {
-                        handled = xServerView!!.getxServer().winHandler.onKeyEvent(it.event)
-                        if (handled) { Timber.d("XSS.onKey: HANDLED by WinHandler") }
-                    }
-                    if (!handled) { Timber.d("XSS.onKey: NOT HANDLED by any gamepad handler") }
+                    if (!handled) handled = PluviaApp.inputControlsView?.onKeyEvent(it.event) == true
+                    if (!handled) handled = xServerView!!.getxServer().winHandler.onKeyEvent(it.event)
                 }
                 if (!handled && isKeyboard) {
                     val isShiftEscPressed = it.event.keyCode == KeyEvent.KEYCODE_ESCAPE &&

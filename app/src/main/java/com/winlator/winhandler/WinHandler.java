@@ -91,9 +91,12 @@ public class WinHandler {
     private final short[] lastHighFreqs = new short[MAX_PLAYERS];
     private final boolean[] isRumbling = new boolean[MAX_PLAYERS];
     private final int[] rumbleKeepaliveCtr = new int[MAX_PLAYERS];
+    private final int[] deviceRumbleTickCtr = new int[MAX_PLAYERS];
     private static final int RUMBLE_KEEPALIVE_INTERVAL = 12;
     private static final int CONTROLLER_RUMBLE_MS = 500;
     private static final int DEVICE_RUMBLE_MS = 60000;
+    private static final int POLLER_INTERVAL_MS = 20;
+    private static final int DEVICE_RUMBLE_REFRESH_TICKS = (DEVICE_RUMBLE_MS - 5000) / POLLER_INTERVAL_MS;
     private boolean isShowingAssignDialog = false;
     private Context activity;
     private final java.util.Set<Integer> ignoredDeviceIds = new java.util.HashSet<>();
@@ -110,29 +113,16 @@ public class WinHandler {
     }
 
     public void setVibrationMode(String mode) {
-        final String resolved;
         if (mode == null) {
-            resolved = DEFAULT_VIBRATION_MODE;
-            Log.i(TAG, "Vibration mode normalized from null to \"" + resolved + "\"");
+            this.vibrationMode = DEFAULT_VIBRATION_MODE;
         } else {
             String normalized = mode.trim().toLowerCase(Locale.US);
-            if (!VALID_VIBRATION_MODES.contains(normalized)) {
-                Log.i(TAG, "Vibration mode normalized from \"" + mode + "\" to \"" + DEFAULT_VIBRATION_MODE + "\" (invalid)");
-                resolved = DEFAULT_VIBRATION_MODE;
-            } else {
-                resolved = normalized;
-                if (!mode.equals(resolved)) {
-                    Log.i(TAG, "Vibration mode normalized from \"" + mode + "\" to \"" + resolved + "\"");
-                }
-            }
+            this.vibrationMode = VALID_VIBRATION_MODES.contains(normalized) ? normalized : DEFAULT_VIBRATION_MODE;
         }
-        this.vibrationMode = resolved;
-        Log.i(TAG, "Vibration mode set to: " + this.vibrationMode);
     }
 
     public void setVibrationIntensity(int intensity) {
         this.vibrationIntensity = Math.max(0, Math.min(100, intensity));
-        Log.i(TAG, "Vibration intensity set to: " + this.vibrationIntensity + "%");
     }
 
     public enum PreferredInputApi {
@@ -209,6 +199,7 @@ public class WinHandler {
             stopVibrationForPlayer(slot);
             lastLowFreqs[slot] = 0;
             lastHighFreqs[slot] = 0;
+            deviceRumbleTickCtr[slot] = 0;
         }
         if (slot == 0) { currentController = controller; return; }
         if (slot > 0 && slot <= extraControllers.length) extraControllers[slot - 1] = controller;
@@ -661,6 +652,7 @@ public class WinHandler {
                             lastLowFreqs[p] = lowFreq;
                             lastHighFreqs[p] = highFreq;
                             rumbleKeepaliveCtr[p] = 0;
+                            deviceRumbleTickCtr[p] = 0;
                             if (lowFreq == 0 && highFreq == 0) {
                                 stopVibrationForPlayer(p);
                             } else {
@@ -668,9 +660,12 @@ public class WinHandler {
                             }
                         } else if (isRumbling[p]) {
                             rumbleKeepaliveCtr[p]++;
+                            deviceRumbleTickCtr[p]++;
                             if (rumbleKeepaliveCtr[p] >= RUMBLE_KEEPALIVE_INTERVAL) {
                                 rumbleKeepaliveCtr[p] = 0;
-                                startVibrationForPlayer(p, lowFreq, highFreq, true);
+                                boolean deviceRefresh = deviceRumbleTickCtr[p] >= DEVICE_RUMBLE_REFRESH_TICKS;
+                                if (deviceRefresh) deviceRumbleTickCtr[p] = 0;
+                                refreshVibrationForPlayer(p, lowFreq, highFreq, deviceRefresh);
                             }
                         }
                     } catch (Exception e) {
@@ -678,7 +673,7 @@ public class WinHandler {
                     }
                 }
                 try {
-                    Thread.sleep(20);
+                    Thread.sleep(POLLER_INTERVAL_MS);
                 } catch (InterruptedException e) {
                     break;
                 }
@@ -687,37 +682,10 @@ public class WinHandler {
         rumblePollerThread.start();
     }
 
-    private boolean controllerVibrationDiagLogged = false;
-
     private int scaleAmplitude(short rawFreq, int intensityPercent) {
         int unsigned = rawFreq & 0xFFFF;
         int base = (unsigned >> 8) & 0xFF;
         return Math.min(255, Math.max(0, (base * intensityPercent) / 100));
-    }
-
-    @TargetApi(31)
-    private void logVibratorManagerDiag(InputDevice device, VibratorManager vm) {
-        if (controllerVibrationDiagLogged) return;
-        controllerVibrationDiagLogged = true;
-        int[] ids = vm.getVibratorIds();
-        StringBuilder sb = new StringBuilder();
-        sb.append("VibratorManager for '").append(device.getName())
-          .append("' (id=").append(device.getId())
-          .append("): ").append(ids.length).append(" vibrator(s)");
-        for (int id : ids) {
-            Vibrator vib = vm.getVibrator(id);
-            sb.append(" [id=").append(id)
-              .append(" hasVibrator=").append(vib.hasVibrator())
-              .append(" amplitudeCtrl=").append(vib.hasAmplitudeControl())
-              .append("]");
-        }
-        Vibrator legacyVib = device.getVibrator();
-        sb.append(" | legacy getVibrator(): hasVibrator=")
-          .append(legacyVib != null && legacyVib.hasVibrator());
-        if (legacyVib != null) {
-            sb.append(" amplitudeCtrl=").append(legacyVib.hasAmplitudeControl());
-        }
-        Log.i(TAG, sb.toString());
     }
 
     private VibrationAttributes buildVibrationAttrs() {
@@ -828,7 +796,6 @@ public class WinHandler {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 VibratorManager vm = device.getVibratorManager();
-                logVibratorManagerDiag(device, vm);
                 if (rumbleViaVibratorManager(vm, lowFreq, highFreq)) {
                     return true;
                 }
@@ -871,36 +838,42 @@ public class WinHandler {
         }
     }
 
-    /**
-     * @param keepaliveRefresh when true, only the short controller rumble pulse is
-     *        refreshed; device (phone) vibration is skipped because it uses a long one-shot.
-     */
-    private void startVibrationForPlayer(int player, short lowFreq, short highFreq, boolean keepaliveRefresh) {
+    private void startVibrationForPlayer(int player, short lowFreq, short highFreq, boolean skipDevice) {
         if ("off".equals(vibrationMode)) return;
-        if (keepaliveRefresh && "device".equals(vibrationMode)) {
-            return;
-        }
-
-        Log.d(TAG, "Rumble P" + player + ": low=" + (lowFreq & 0xFFFF) + " high=" + (highFreq & 0xFFFF)
-                + " mode=" + vibrationMode + " intensity=" + vibrationIntensity
-                + (keepaliveRefresh ? " keepalive" : ""));
 
         isRumbling[player] = true;
 
         if ("controller".equals(vibrationMode)) {
             vibrateController(player, lowFreq, highFreq);
         } else if ("device".equals(vibrationMode)) {
-            vibrateDevice(lowFreq, highFreq);
+            if (!skipDevice) vibrateDevice(lowFreq, highFreq);
         } else if ("both".equals(vibrationMode)) {
             vibrateController(player, lowFreq, highFreq);
-            if (!keepaliveRefresh) {
-                vibrateDevice(lowFreq, highFreq);
-            }
+            if (!skipDevice) vibrateDevice(lowFreq, highFreq);
+        }
+    }
+
+    /**
+     * Periodic refresh for ongoing vibration. Controller rumble uses short pulses
+     * and must be refreshed frequently. Device vibration uses a long one-shot and
+     * only needs refresh when {@code deviceRefresh} signals the one-shot is about
+     * to expire.
+     */
+    private void refreshVibrationForPlayer(int player, short lowFreq, short highFreq, boolean deviceRefresh) {
+        if ("off".equals(vibrationMode)) return;
+        if ("device".equals(vibrationMode)) {
+            if (deviceRefresh) vibrateDevice(lowFreq, highFreq);
+            return;
+        }
+        vibrateController(player, lowFreq, highFreq);
+        if ("both".equals(vibrationMode) && deviceRefresh) {
+            vibrateDevice(lowFreq, highFreq);
         }
     }
 
     private void stopVibrationForPlayer(int player) {
         if (!isRumbling[player]) return;
+        isRumbling[player] = false;
 
         try {
             InputDevice device = resolveInputDeviceForPlayer(player);
@@ -920,16 +893,22 @@ public class WinHandler {
             Log.e(TAG, "Error cancelling controller vibration", e);
         }
 
-        try {
-            Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
-            if (phoneVibrator != null) {
-                phoneVibrator.cancel();
+        if ("device".equals(vibrationMode) || "both".equals(vibrationMode)) {
+            boolean anyOtherRumbling = false;
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                if (isRumbling[p]) { anyOtherRumbling = true; break; }
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error cancelling device vibration", e);
+            if (!anyOtherRumbling) {
+                try {
+                    Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+                    if (phoneVibrator != null) {
+                        phoneVibrator.cancel();
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Error cancelling device vibration", e);
+                }
+            }
         }
-
-        isRumbling[player] = false;
     }
 
     public void sendGamepadState() {
@@ -988,10 +967,7 @@ public class WinHandler {
         if (!ExternalController.isJoystickDevice(event)) return false;
 
         int slot = resolveControllerSlot(event.getDeviceId());
-        if (slot < 0) {
-            Log.d(TAG, "WH.onMotion: deviceId=" + event.getDeviceId() + " -> slot=-1 REJECTED");
-            return false;
-        }
+        if (slot < 0) return false;
 
         ExternalController controller = getControllerForSlot(slot);
         if (controller != null && controller.updateStateFromMotionEvent(event)) {
@@ -1006,24 +982,14 @@ public class WinHandler {
     public boolean onKeyEvent(KeyEvent event) {
         InputDevice device = event.getDevice();
         if (device == null || !ExternalController.isGameController(device) || event.getRepeatCount() != 0) {
-            Log.d(TAG, "WH.onKey: REJECTED device=" + (device != null ? device.getName() : "null")
-                    + " keyCode=" + event.getKeyCode()
-                    + " isGameCtrl=" + (device != null && ExternalController.isGameController(device)));
             return false;
         }
 
         int slot = resolveControllerSlot(event.getDeviceId());
-        if (slot < 0) {
-            Log.d(TAG, "WH.onKey: deviceId=" + event.getDeviceId()
-                    + " name='" + device.getName() + "' -> slot=-1 REJECTED");
-            return false;
-        }
+        if (slot < 0) return false;
 
         ExternalController controller = getControllerForSlot(slot);
-        if (controller == null) {
-            Log.d(TAG, "WH.onKey: slot=" + slot + " has NO controller");
-            return false;
-        }
+        if (controller == null) return false;
 
         boolean handled = false;
         int action = event.getAction();
@@ -1031,9 +997,6 @@ public class WinHandler {
             handled = controller.updateStateFromKeyEvent(event);
         }
         MappedByteBuffer buffer = getBufferForSlot(slot);
-        Log.d(TAG, "WH.onKey: slot=" + slot + " keyCode=" + event.getKeyCode()
-                + " action=" + (action == KeyEvent.ACTION_DOWN ? "DOWN" : "UP")
-                + " handled=" + handled + " buffer=" + (buffer != null ? "OK" : "NULL"));
         if (buffer != null) sendMemoryFileState(controller, buffer);
         if (handled && slot == 0) sendGamepadState();
         return handled;
@@ -1057,23 +1020,6 @@ public class WinHandler {
             return;
         }
         GamepadState state = controller.state;
-
-        int slotIdx = -1;
-        if (buffer == gamepadBuffer) slotIdx = 0;
-        else {
-            for (int i = 0; i < extraGamepadBuffers.length; i++) {
-                if (buffer == extraGamepadBuffers[i]) { slotIdx = i + 1; break; }
-            }
-        }
-        int anyBtn = 0;
-        for (int b = 0; b < 10; b++) if (state.isPressed(b)) anyBtn |= (1 << b);
-        if (anyBtn != 0) {
-            Log.d(TAG, "sendMemState: slot=" + slotIdx + " ctrl='" + controller.getName()
-                    + "' btnMask=0x" + Integer.toHexString(anyBtn)
-                    + " lx=" + String.format("%.2f", state.thumbLX)
-                    + " ly=" + String.format("%.2f", state.thumbLY));
-        }
-
         buffer.clear();
 
         // --- Sticks and Buttons are perfect. No changes here. ---

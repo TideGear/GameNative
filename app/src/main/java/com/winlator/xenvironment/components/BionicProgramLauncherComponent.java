@@ -185,11 +185,6 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         for (int id : android.view.InputDevice.getDeviceIds()) {
             android.view.InputDevice dev = android.view.InputDevice.getDevice(id);
             boolean isGamepad = dev != null && !dev.isVirtual() && dev.supportsSource(android.view.InputDevice.SOURCE_GAMEPAD);
-            Log.d("EvshimDeploy", "InputDevice id=" + id
-                    + " name='" + (dev != null ? dev.getName() : "null") + "'"
-                    + " sources=0x" + (dev != null ? Integer.toHexString(dev.getSources()) : "0")
-                    + " virtual=" + (dev != null && dev.isVirtual())
-                    + " isGamepad=" + isGamepad);
             if (isGamepad) {
                 connectedControllers++;
             }

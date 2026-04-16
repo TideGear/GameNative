@@ -102,12 +102,14 @@ public class ControllerManager {
             if (id != null) connectedIds.add(id);
         }
 
-        List<String> kept = new ArrayList<>();
+        List<String> keptIdentifiers = new ArrayList<>();
+        List<Boolean> keptEnabled = new ArrayList<>();
         for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
             String identifier = slotAssignments.get(i);
             if (identifier != null) {
                 if (connectedIds.contains(identifier)) {
-                    kept.add(identifier);
+                    keptIdentifiers.add(identifier);
+                    keptEnabled.add(enabledSlots[i]);
                 } else {
                     android.util.Log.i("ControllerSlot",
                             "evicting stale slot=" + i + " identifier=" + identifier);
@@ -116,18 +118,16 @@ public class ControllerManager {
         }
 
         slotAssignments.clear();
-        for (int i = 0; i < kept.size() && i < WinHandler.MAX_PLAYERS; i++) {
-            slotAssignments.put(i, kept.get(i));
-            enabledSlots[i] = true;
+        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+            if (i < keptIdentifiers.size()) {
+                slotAssignments.put(i, keptIdentifiers.get(i));
+                enabledSlots[i] = keptEnabled.get(i);
+            } else {
+                enabledSlots[i] = false;
+            }
         }
 
         saveAssignments();
-
-        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            android.util.Log.i("ControllerSlot", "compacted slot=" + i
-                    + " identifier=" + slotAssignments.get(i)
-                    + " enabled=" + enabledSlots[i]);
-        }
     }
 
     /**
@@ -144,9 +144,6 @@ public class ControllerManager {
 
             String enabledKey = PREF_ENABLED_SLOTS_PREFIX + i;
             enabledSlots[i] = preferences.getBoolean(enabledKey, i == 0);
-
-            android.util.Log.i("ControllerSlot", "loadAssignments slot=" + i
-                    + " identifier=" + deviceIdentifier + " enabled=" + enabledSlots[i]);
         }
     }
 
@@ -345,17 +342,11 @@ public class ControllerManager {
     public int autoAssignDevice(int deviceId) {
         int existingSlot = getSlotForDevice(deviceId);
         if (existingSlot >= 0) {
-            boolean enabled = isSlotEnabled(existingSlot);
-            android.util.Log.d("ControllerSlot", "autoAssign deviceId=" + deviceId
-                    + " existing slot=" + existingSlot + " enabled=" + enabled);
-            return enabled ? existingSlot : -1;
+            return isSlotEnabled(existingSlot) ? existingSlot : -1;
         }
 
         InputDevice device = inputManager.getInputDevice(deviceId);
         if (device == null || !isGameController(device)) {
-            android.util.Log.d("ControllerSlot", "autoAssign deviceId=" + deviceId
-                    + " rejected (null=" + (device == null) + " isGameController="
-                    + (device != null && isGameController(device)) + ")");
             return -1;
         }
 
@@ -363,14 +354,13 @@ public class ControllerManager {
             if (slotAssignments.get(i) == null) {
                 assignDeviceToSlot(i, device);
                 setSlotEnabled(i, true);
-                android.util.Log.i("ControllerSlot", "autoAssign deviceId=" + deviceId
-                        + " name='" + device.getName() + "' -> NEW slot=" + i
-                        + " identifier=" + getDeviceIdentifier(device));
+                android.util.Log.i("ControllerSlot", "autoAssign: '" + device.getName()
+                        + "' -> slot=" + i);
                 return i;
             }
         }
-        android.util.Log.w("ControllerSlot", "autoAssign deviceId=" + deviceId
-                + " name='" + device.getName() + "' -> NO SLOT AVAILABLE");
+        android.util.Log.w("ControllerSlot", "autoAssign: no slot available for '"
+                + device.getName() + "'");
         return -1;
     }
 }
