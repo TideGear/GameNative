@@ -370,6 +370,7 @@ public class ControllerManager {
             return -1;
         }
 
+        int assignedSlot = -1;
         synchronized (deviceStateLock) {
             // Keep detectedDevices in sync so getAssignedDeviceForSlot can
             // resolve this device without waiting for the next scanForDevices().
@@ -382,13 +383,26 @@ public class ControllerManager {
 
             for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
                 if (slotAssignments.get(i) == null) {
-                    assignDeviceToSlot(i, device);
-                    setSlotEnabled(i, true);
-                    android.util.Log.i("ControllerSlot", "autoAssign: '" + device.getName()
-                            + "' -> slot=" + i);
-                    return i;
+                    // Inline the mutations that assignDeviceToSlot/setSlotEnabled
+                    // would perform so both updates are atomic under one lock
+                    // acquisition and saveAssignments() is called only once.
+                    for (int j = 0; j < WinHandler.MAX_PLAYERS; j++) {
+                        if (identifier.equals(slotAssignments.get(j))) {
+                            slotAssignments.remove(j);
+                        }
+                    }
+                    slotAssignments.put(i, identifier);
+                    enabledSlots[i] = true;
+                    assignedSlot = i;
+                    break;
                 }
             }
+        }
+        if (assignedSlot >= 0) {
+            saveAssignments();
+            android.util.Log.i("ControllerSlot", "autoAssign: '" + device.getName()
+                    + "' -> slot=" + assignedSlot);
+            return assignedSlot;
         }
         android.util.Log.w("ControllerSlot", "autoAssign: no slot available for '"
                 + device.getName() + "'");

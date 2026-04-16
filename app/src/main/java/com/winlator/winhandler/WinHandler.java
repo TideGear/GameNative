@@ -750,6 +750,8 @@ public class WinHandler {
         CombinedVibration.ParallelCombination combo = CombinedVibration.startParallel();
         boolean anyAdded = false;
 
+        // Assumes Android exposes motors in standard order: ids[0] = left/low-freq,
+        // ids[1] = right/high-freq. If a vendor exposes them differently, adjust here.
         if (ids.length >= 2) {
             if (lowAmp > 0) {
                 int a = vm.getVibrator(ids[0]).hasAmplitudeControl() ? lowAmp : VibrationEffect.DEFAULT_AMPLITUDE;
