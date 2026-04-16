@@ -6,8 +6,18 @@
 
 $ErrorActionPreference = "Stop"
 
-$NDK_VERSION = "26.1.10909125"
-$SDK_ROOT    = "$env:LOCALAPPDATA\Android\Sdk"
+# Match the NDK version pinned in app/build.gradle.kts.
+$NDK_VERSION = "22.1.7171670"
+
+# Prefer explicit SDK root env vars; fall back to the Android Studio default.
+if     ($env:ANDROID_SDK_ROOT) { $SDK_ROOT = $env:ANDROID_SDK_ROOT }
+elseif ($env:ANDROID_HOME)     { $SDK_ROOT = $env:ANDROID_HOME }
+else                           { $SDK_ROOT = "$env:LOCALAPPDATA\Android\Sdk" }
+
+if (-not $SDK_ROOT) {
+    Write-Error "Android SDK root could not be determined. Set ANDROID_SDK_ROOT or ANDROID_HOME."
+}
+
 $NDK_ROOT    = "$SDK_ROOT\ndk\$NDK_VERSION"
 $CLANG       = "$NDK_ROOT\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21-clang.cmd"
 
@@ -28,7 +38,7 @@ if (-not (Test-Path $outDir)) {
 
 Write-Host "Compiling evshim.c with NDK $NDK_VERSION ..."
 
-# Use $clangArgs (not $args) — $args is a PowerShell automatic variable and
+# Use $clangArgs (not $args) - $args is a PowerShell automatic variable and
 # assigning to it can interfere with parameter passing in some contexts.
 $clangArgs = @(
     "-shared", "-fPIC", "-O2",

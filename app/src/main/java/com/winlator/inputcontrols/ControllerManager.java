@@ -157,22 +157,30 @@ public class ControllerManager {
 
     /**
      * Saves the current player slot assignments and enabled states to SharedPreferences.
+     * Takes a consistent snapshot under deviceStateLock before writing, so concurrent
+     * mutations on the rumble-poller or UI thread cannot produce a torn save.
+     * SharedPreferences.apply() is called outside the lock to avoid holding it during I/O.
      */
     public void saveAssignments() {
+        // Snapshot mutable state under lock for a consistent view.
+        String[] identifiers = new String[WinHandler.MAX_PLAYERS];
+        boolean[] enabled = new boolean[WinHandler.MAX_PLAYERS];
+        synchronized (deviceStateLock) {
+            for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+                identifiers[i] = slotAssignments.get(i);
+                enabled[i] = enabledSlots[i];
+            }
+        }
+
         SharedPreferences.Editor editor = preferences.edit();
         for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            // Save the assigned device identifier
-            String deviceIdentifier = slotAssignments.get(i);
             String prefKey = PREF_PLAYER_SLOT_PREFIX + i;
-            if (deviceIdentifier != null) {
-                editor.putString(prefKey, deviceIdentifier);
+            if (identifiers[i] != null) {
+                editor.putString(prefKey, identifiers[i]);
             } else {
                 editor.remove(prefKey);
             }
-
-            // Save the enabled state
-            String enabledKey = PREF_ENABLED_SLOTS_PREFIX + i;
-            editor.putBoolean(enabledKey, enabledSlots[i]);
+            editor.putBoolean(PREF_ENABLED_SLOTS_PREFIX + i, enabled[i]);
         }
         editor.apply();
     }
