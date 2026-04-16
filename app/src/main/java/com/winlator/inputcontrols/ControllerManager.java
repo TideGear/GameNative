@@ -24,6 +24,7 @@ public class ControllerManager {
     private static ControllerManager instance;
 
 
+    /** Returns the singleton instance, creating it on first access. */
     public static synchronized ControllerManager getInstance() {
         if (instance == null) {
             instance = new ControllerManager();
@@ -328,6 +329,7 @@ public class ControllerManager {
         saveAssignments();
     }
 
+    /** Returns whether the given player slot is enabled. */
     public boolean isSlotEnabled(int slotIndex) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return false;
         return enabledSlots[slotIndex];

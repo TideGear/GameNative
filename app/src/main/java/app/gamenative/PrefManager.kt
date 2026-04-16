@@ -219,6 +219,7 @@ object PrefManager {
     private val VALID_VIBRATION_MODES = setOf("off", "controller", "device", "both")
     private const val DEFAULT_VIBRATION_MODE = "controller"
 
+    /** Normalizes a vibration mode string to a known value, falling back to the default. */
     private fun normalizeVibrationMode(value: String?): String {
         val v = value?.trim()?.lowercase().orEmpty()
         return if (v in VALID_VIBRATION_MODES) v else DEFAULT_VIBRATION_MODE

@@ -112,6 +112,7 @@ public class WinHandler {
         this.inputControlsView = view;
     }
 
+    /** Sets the vibration routing mode (off/controller/device/both), normalizing and validating input. */
     public void setVibrationMode(String mode) {
         if (mode == null) {
             this.vibrationMode = DEFAULT_VIBRATION_MODE;
@@ -121,6 +122,7 @@ public class WinHandler {
         }
     }
 
+    /** Sets the vibration intensity percentage, clamped to 0–100. */
     public void setVibrationIntensity(int intensity) {
         this.vibrationIntensity = Math.max(0, Math.min(100, intensity));
     }
@@ -154,6 +156,7 @@ public class WinHandler {
         this.activity = xServerView.getContext();
     }
 
+    /** Re-scans connected devices and re-initializes per-slot ExternalController references. */
     public void refreshControllerMappings() {
         Log.d(TAG, "Refreshing controller assignments from settings...");
         currentController = null;
@@ -180,18 +183,21 @@ public class WinHandler {
         }
     }
 
+    /** Returns the shared-memory buffer for the given player slot (0-based), or null if unavailable. */
     public MappedByteBuffer getBufferForSlot(int slot) {
         if (slot == 0) return gamepadBuffer;
         if (slot > 0 && slot <= extraGamepadBuffers.length) return extraGamepadBuffers[slot - 1];
         return null;
     }
 
+    /** Returns the ExternalController assigned to the given player slot, or null if none. */
     public ExternalController getControllerForSlot(int slot) {
         if (slot == 0) return currentController;
         if (slot > 0 && slot <= extraControllers.length) return extraControllers[slot - 1];
         return null;
     }
 
+    /** Assigns a controller to a player slot, stopping any active vibration on the previous occupant. */
     public void setControllerForSlot(int slot, ExternalController controller) {
         if (slot < 0 || slot >= MAX_PLAYERS) return;
         ExternalController old = getControllerForSlot(slot);
@@ -402,6 +408,7 @@ public class WinHandler {
         });
     }
 
+    /** Stops all WinHandler threads, cancels vibration for all players, and closes the UDP socket. */
     public void stop() {
         this.running = false;
         for (int p = 0; p < MAX_PLAYERS; p++) {
@@ -633,6 +640,7 @@ public class WinHandler {
         startRumblePoller();
     }
 
+    /** Starts a background thread that polls shared-memory buffers for per-player rumble values. */
     private void startRumblePoller() {
         // poller skips case where controller is null and we
         // do NOT vibrate phone as of now to prevent issues with docked users.
@@ -680,12 +688,14 @@ public class WinHandler {
         rumblePollerThread.start();
     }
 
+    /** Converts a raw 16-bit rumble frequency to a 0–255 amplitude, scaled by intensity percent. */
     private int scaleAmplitude(short rawFreq, int intensityPercent) {
         int unsigned = rawFreq & 0xFFFF;
         int base = (unsigned >> 8) & 0xFF;
         return Math.min(255, Math.max(0, (base * intensityPercent) / 100));
     }
 
+    /** Builds VibrationAttributes with USAGE_MEDIA for API 33+ haptic feedback. */
     private VibrationAttributes buildVibrationAttrs() {
         VibrationAttributes.Builder attrs = new VibrationAttributes.Builder();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -694,12 +704,14 @@ public class WinHandler {
         return attrs.build();
     }
 
+    /** Builds AudioAttributes with USAGE_GAME for pre-API 33 vibration calls. */
     private AudioAttributes buildAudioAttrs() {
         return new AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_GAME)
             .build();
     }
 
+    /** Issues a one-shot vibration on a single vibrator, respecting amplitude control availability. */
     private void vibrateSingle(Vibrator vibrator, int amplitude, int durationMs) {
         if (amplitude <= 0) { vibrator.cancel(); return; }
         int amp = Math.min(255, amplitude);
@@ -721,6 +733,11 @@ public class WinHandler {
         }
     }
 
+    /**
+     * Drives per-motor rumble through VibratorManager (API 31+).
+     * Assigns low-frequency to the first motor and high-frequency to the second,
+     * with motor order swapped for DS4/DualSense controllers.
+     */
     @TargetApi(31)
     private boolean rumbleViaVibratorManager(VibratorManager vm, short lowFreq, short highFreq) {
         int[] ids = vm.getVibratorIds();
@@ -784,6 +801,7 @@ public class WinHandler {
         return null;
     }
 
+    /** Vibrates the physical controller assigned to [player], trying VibratorManager first, then legacy Vibrator. */
     private boolean vibrateController(int player, short lowFreq, short highFreq) {
         InputDevice device = resolveInputDeviceForPlayer(player);
         if (device == null) {
@@ -814,6 +832,7 @@ public class WinHandler {
         return false;
     }
 
+    /** Vibrates the Android device's built-in vibrator with a perceptually curved amplitude. */
     private void vibrateDevice(short lowFreq, short highFreq) {
         try {
             Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
@@ -836,6 +855,7 @@ public class WinHandler {
         }
     }
 
+    /** Routes vibration to controller, device, or both based on the current vibration mode. */
     private void startVibrationForPlayer(int player, short lowFreq, short highFreq, boolean skipDevice) {
         if ("off".equals(vibrationMode)) return;
 
@@ -869,6 +889,7 @@ public class WinHandler {
         }
     }
 
+    /** Cancels all vibration for a player, only stopping the device vibrator if no other player is rumbling. */
     private void stopVibrationForPlayer(int player) {
         if (!isRumbling[player]) return;
         isRumbling[player] = false;
@@ -909,6 +930,7 @@ public class WinHandler {
         }
     }
 
+    /** Broadcasts the current Player 1 gamepad state to all connected gamepad clients. */
     public void sendGamepadState() {
         if (!this.initReceived || this.gamepadClients.isEmpty()) {
             return;
@@ -961,6 +983,7 @@ public class WinHandler {
         return slot;
     }
 
+    /** Handles joystick/gamepad motion events, routing them to the correct player slot. */
     public boolean onGenericMotionEvent(MotionEvent event) {
         if (!ExternalController.isJoystickDevice(event)) return false;
 
@@ -977,6 +1000,7 @@ public class WinHandler {
         return false;
     }
 
+    /** Handles controller button press/release events, routing them to the correct player slot. */
     public boolean onKeyEvent(KeyEvent event) {
         InputDevice device = event.getDevice();
         if (device == null || !ExternalController.isGameController(device) || event.getRepeatCount() != 0) {
@@ -1008,11 +1032,13 @@ public class WinHandler {
         this.preferredInputApi = preferredInputApi;
     }
 
+    /** Returns the ExternalController assigned to Player 1. */
     public ExternalController getCurrentController() {
         return this.currentController;
     }
 
 
+    /** Writes a controller's current gamepad state into the shared-memory buffer for evshim consumption. */
     public void sendMemoryFileState(ExternalController controller, MappedByteBuffer buffer) {
         if (buffer == null || controller == null) {
             return;
@@ -1054,6 +1080,7 @@ public class WinHandler {
         buffer.put((byte)0); // Ignored HAT value
     }
 
+    /** Writes a virtual on-screen gamepad's state into the Player 1 shared-memory buffer. */
     public void sendVirtualGamepadState(GamepadState state) {
         if (gamepadBuffer == null || state == null) {
             return;
@@ -1094,6 +1121,7 @@ public class WinHandler {
         gamepadBuffer.put((byte)0); // Ignored HAT value
     }
 
+    /** Populates per-slot ExternalController references from the saved ControllerManager assignments. */
     private void initializeAssignedControllers() {
         Log.d(TAG, "Initializing controller assignments from saved settings...");
         for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -1114,6 +1142,7 @@ public class WinHandler {
         // This ensures P1-specific settings (like trigger type) are applied from preferences.
         refreshControllerMappings();
     }
+    /** Clears the set of device IDs that were rejected from slot assignment. */
     public void clearIgnoredDevices() {
         ignoredDeviceIds.clear();
     }

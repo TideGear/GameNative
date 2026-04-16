@@ -36,6 +36,7 @@ class PhysicalControllerHandler(
     // Only after a device delivers a non-zero HAT value do we suppress its d-pad KeyEvents.
     private val devicesWithConfirmedHat = mutableSetOf<Int>()
 
+    /** Sends release events for all tracked axis bindings across all devices, then clears tracking state. */
     private fun releaseActiveAxes() {
         val prof = profile ?: return
         for ((deviceId, bindings) in activeAxisBindings) {
@@ -49,6 +50,7 @@ class PhysicalControllerHandler(
         activeAxisBindings.clear()
     }
 
+    /** Replaces the active controls profile, releasing any held axis bindings from the previous one. */
     fun setProfile(profile: ControlsProfile?) {
         releaseActiveAxes()
         this.profile = profile
@@ -111,11 +113,13 @@ class PhysicalControllerHandler(
         return false
     }
 
+    /** Returns true if [keyCode] is one of the four cardinal d-pad directions. */
     private fun isDpadKeyCode(keyCode: Int): Boolean {
         return keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
             keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT
     }
 
+    /** Checks whether [device] exposes an analog axis for the given trigger [keyCode] (L2/R2). */
     private fun deviceHasTriggerAxis(device: InputDevice?, keyCode: Int): Boolean {
         return when (keyCode) {
             KeyEvent.KEYCODE_BUTTON_L2 ->
@@ -126,6 +130,7 @@ class PhysicalControllerHandler(
         }
     }
 
+    /** Returns true if [device] reports a motion range for [axis] under any common source. */
     private fun hasMotionRange(device: InputDevice?, axis: Int): Boolean {
         if (device == null) return false
         return device.getMotionRange(axis, InputDevice.SOURCE_JOYSTICK) != null ||
