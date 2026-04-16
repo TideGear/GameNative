@@ -105,8 +105,18 @@ public class WinHandler {
             "off", "controller", "device", "both"));
     private static final String DEFAULT_VIBRATION_MODE = "controller";
 
-    private String vibrationMode = "controller";
-    private int vibrationIntensity = 100;
+    // Pre-built attribute objects — constructing these on every keepalive tick
+    // (every 240 ms × up to 4 players) causes unnecessary allocations.
+    // AudioAttributes is available on all supported API levels.
+    private static final AudioAttributes AUDIO_ATTRS_GAME = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .build();
+    // VibrationAttributes requires API 31; USAGE_MEDIA requires API 33.
+    // Computed once at construction time to avoid repeated API-version checks.
+    private final VibrationAttributes vibrationAttrs;
+
+    private volatile String vibrationMode = "controller";
+    private volatile int vibrationIntensity = 100;
 
     public void setInputControlsView(InputControlsView view) {
         this.inputControlsView = view;
@@ -154,6 +164,17 @@ public class WinHandler {
         this.xServerView = xServerView;
         this.controllerManager = ControllerManager.getInstance();
         this.activity = xServerView.getContext();
+
+        // Build VibrationAttributes once — requires API 31, USAGE_MEDIA requires API 33.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            VibrationAttributes.Builder vab = new VibrationAttributes.Builder();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                vab.setUsage(VibrationAttributes.USAGE_MEDIA);
+            }
+            this.vibrationAttrs = vab.build();
+        } else {
+            this.vibrationAttrs = null;
+        }
     }
 
     /** Re-scans connected devices and re-initializes per-slot ExternalController references. */
@@ -642,9 +663,6 @@ public class WinHandler {
 
     /** Starts a background thread that polls shared-memory buffers for per-player rumble values. */
     private void startRumblePoller() {
-        // poller skips case where controller is null and we
-        // do NOT vibrate phone as of now to prevent issues with docked users.
-        // TODO: add phone vibration option in upcoming ux when no controller device connected
         rumblePollerThread = new Thread(() -> {
             while (running) {
                 for (int p = 0; p < MAX_PLAYERS; p++) {
@@ -688,55 +706,40 @@ public class WinHandler {
         rumblePollerThread.start();
     }
 
-    /** Converts a raw 16-bit rumble frequency to a 0–255 amplitude, scaled by intensity percent. */
+    /** Converts a raw 16-bit XInput rumble value (0–65535) to a 0–255 amplitude, scaled by intensity percent. */
     private int scaleAmplitude(short rawFreq, int intensityPercent) {
         int unsigned = rawFreq & 0xFFFF;
-        int base = (unsigned >> 8) & 0xFF;
-        return Math.min(255, Math.max(0, (base * intensityPercent) / 100));
-    }
-
-    /** Builds VibrationAttributes with USAGE_MEDIA for API 33+ haptic feedback. */
-    private VibrationAttributes buildVibrationAttrs() {
-        VibrationAttributes.Builder attrs = new VibrationAttributes.Builder();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            attrs.setUsage(VibrationAttributes.USAGE_MEDIA);
-        }
-        return attrs.build();
-    }
-
-    /** Builds AudioAttributes with USAGE_GAME for pre-API 33 vibration calls. */
-    private AudioAttributes buildAudioAttrs() {
-        return new AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_GAME)
-            .build();
+        if (unsigned == 0) return 0;
+        // Map full 16-bit range to 1–255 so that any non-zero game rumble produces
+        // a non-zero amplitude, then scale by the user's intensity preference.
+        int base = (int) Math.round(unsigned * 255.0 / 65535.0);
+        return Math.min(255, Math.max(1, (base * intensityPercent) / 100));
     }
 
     /** Issues a one-shot vibration on a single vibrator, respecting amplitude control availability. */
     private void vibrateSingle(Vibrator vibrator, int amplitude, int durationMs) {
         if (amplitude <= 0) { vibrator.cancel(); return; }
         int amp = Math.min(255, amplitude);
-
-        if (vibrator.hasAmplitudeControl()) {
-            VibrationEffect effect = VibrationEffect.createOneShot(durationMs, amp);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                vibrator.vibrate(effect, buildVibrationAttrs());
-            } else {
-                vibrator.vibrate(effect, buildAudioAttrs());
-            }
+        int finalAmp = vibrator.hasAmplitudeControl() ? amp : VibrationEffect.DEFAULT_AMPLITUDE;
+        VibrationEffect effect = VibrationEffect.createOneShot(durationMs, finalAmp);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && vibrationAttrs != null) {
+            vibrator.vibrate(effect, vibrationAttrs);
         } else {
-            VibrationEffect effect = VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                vibrator.vibrate(effect, buildVibrationAttrs());
-            } else {
-                vibrator.vibrate(effect, buildAudioAttrs());
-            }
+            vibrator.vibrate(effect, AUDIO_ATTRS_GAME);
         }
     }
 
     /**
      * Drives per-motor rumble through VibratorManager (API 31+).
-     * Assigns low-frequency to {@code ids[0]} and high-frequency to {@code ids[1]}.
-     * Falls back to a blended single-motor vibration when only one vibrator is available.
+     *
+     * <p>Motor identification strategy:
+     * <p>Motor identification: Sort vibrator IDs ascending. The kernel evdev layer enumerates
+     * vibrators in HID descriptor order, which for XInput-compatible controllers is
+     * heavy-then-light (low-freq first), matching ascending ID order for most drivers.
+     * The IDs are logged on first use so swapped-motor behaviour on untested hardware can be
+     * diagnosed and reported.
+     *
+     * <p>Falls back to a blended single-motor vibration when only one vibrator is available.
      */
     @TargetApi(31)
     private boolean rumbleViaVibratorManager(VibratorManager vm, short lowFreq, short highFreq) {
@@ -744,23 +747,31 @@ public class WinHandler {
         if (ids.length == 0) return false;
 
         int highAmp = scaleAmplitude(highFreq, vibrationIntensity);
-        int lowAmp = scaleAmplitude(lowFreq, vibrationIntensity);
+        int lowAmp  = scaleAmplitude(lowFreq,  vibrationIntensity);
         if (lowAmp == 0 && highAmp == 0) { vm.cancel(); return true; }
+
+        // Determine which ID drives the low-freq (heavy/left) motor and which drives
+        // the high-freq (light/right) motor by sorting IDs ascending.
+        int lowMotorId  = ids[0];
+        int highMotorId = ids.length >= 2 ? ids[1] : ids[0];
+
+        if (ids.length >= 2) {
+            if (ids[0] > ids[1]) { lowMotorId = ids[1]; highMotorId = ids[0]; }
+            Log.d(TAG, "Rumble motors: lowMotor=" + lowMotorId + " highMotor=" + highMotorId);
+        }
 
         CombinedVibration.ParallelCombination combo = CombinedVibration.startParallel();
         boolean anyAdded = false;
 
-        // Assumes Android exposes motors in standard order: ids[0] = left/low-freq,
-        // ids[1] = right/high-freq. If a vendor exposes them differently, adjust here.
         if (ids.length >= 2) {
             if (lowAmp > 0) {
-                int a = vm.getVibrator(ids[0]).hasAmplitudeControl() ? lowAmp : VibrationEffect.DEFAULT_AMPLITUDE;
-                combo.addVibrator(ids[0], VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                int a = vm.getVibrator(lowMotorId).hasAmplitudeControl() ? lowAmp : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(lowMotorId, VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
                 anyAdded = true;
             }
             if (highAmp > 0) {
-                int a = vm.getVibrator(ids[1]).hasAmplitudeControl() ? highAmp : VibrationEffect.DEFAULT_AMPLITUDE;
-                combo.addVibrator(ids[1], VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                int a = vm.getVibrator(highMotorId).hasAmplitudeControl() ? highAmp : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(highMotorId, VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
                 anyAdded = true;
             }
         } else {
@@ -773,7 +784,7 @@ public class WinHandler {
         }
 
         if (!anyAdded) { vm.cancel(); return true; }
-        vm.vibrate(combo.combine(), buildVibrationAttrs());
+        vm.vibrate(combo.combine(), vibrationAttrs);
         return true;
     }
 
@@ -900,14 +911,19 @@ public class WinHandler {
             InputDevice device = resolveInputDeviceForPlayer(player);
             if (device != null) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    // vibrateController uses VibratorManager exclusively on API >= 31,
+                    // so cancel only via VibratorManager — no need to also call
+                    // device.getVibrator().cancel(), which would double-cancel the same
+                    // hardware and can cause a brief motor jitter on some controllers.
                     VibratorManager vm = device.getVibratorManager();
                     if (vm.getVibratorIds().length > 0) {
                         vm.cancel();
                     }
-                }
-                Vibrator vibrator = device.getVibrator();
-                if (vibrator != null && vibrator.hasVibrator()) {
-                    vibrator.cancel();
+                } else {
+                    Vibrator vibrator = device.getVibrator();
+                    if (vibrator != null && vibrator.hasVibrator()) {
+                        vibrator.cancel();
+                    }
                 }
             }
         } catch (Exception e) {

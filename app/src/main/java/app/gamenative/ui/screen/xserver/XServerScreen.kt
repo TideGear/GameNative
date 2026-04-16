@@ -353,7 +353,21 @@ fun XServerScreen(
     var exitWatchJob: Job? by remember { mutableStateOf(null) }
 
     DisposableEffect(Unit) {
+        // Forward controller-removed events so PhysicalControllerHandler can
+        // release stale axis state and d-pad suppression for the lost device
+        // before Android potentially recycles its deviceId for a new controller.
+        val inputManager = context.getSystemService(Context.INPUT_SERVICE) as InputManager
+        val deviceListener = object : InputManager.InputDeviceListener {
+            override fun onInputDeviceAdded(deviceId: Int) = Unit
+            override fun onInputDeviceChanged(deviceId: Int) = Unit
+            override fun onInputDeviceRemoved(deviceId: Int) {
+                physicalControllerHandler?.onDeviceDisconnected(deviceId)
+            }
+        }
+        inputManager.registerInputDeviceListener(deviceListener, null)
+
         onDispose {
+            inputManager.unregisterInputDeviceListener(deviceListener)
             physicalControllerHandler?.cleanup()
             physicalControllerHandler = null
             exitWatchJob?.cancel()

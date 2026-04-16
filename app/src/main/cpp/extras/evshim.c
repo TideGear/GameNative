@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <SDL2/SDL.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 
 static int g_debug_enabled = 0;
 
@@ -27,6 +28,11 @@ static int read_fd  [MAX_GAMEPADS] = {-1};
 static int rumble_fd[MAX_GAMEPADS] = {-1};
 static void *handle = NULL;
 static pthread_mutex_t shm_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Set to 1 on the player index being refreshed by the SDL keepalive so that
+ * the resulting re-entrant OnRumble() call does not overwrite shared memory
+ * (which may have been zeroed by a stop command that raced the keepalive). */
+static atomic_int g_keepalive_active[MAX_GAMEPADS];
 
 struct gamepad_io {
     int16_t lx, ly, rx, ry, lt, rt;
@@ -75,15 +81,21 @@ static int OnRumble(void *userdata,
     int idx = (int)(intptr_t)userdata;
     if (idx < 0 || idx >= MAX_GAMEPADS || rumble_fd[idx] < 0) return -1;
 
+    /* When the SDL keepalive re-invokes SDL_JoystickRumble to reset SDL's
+     * internal expiry timer, it synchronously calls back into OnRumble.
+     * We must NOT update last_rumble or pwrite in that case: the game may
+     * have already sent OnRumble(0,0) to stop vibration, and re-writing
+     * the old non-zero values would restart rumble on the Android side. */
+    if (atomic_load(&g_keepalive_active[idx])) {
+        LOGD("Rumble P%d  low=%u  high=%u [keepalive noop]\n", idx,
+             low_frequency_rumble, high_frequency_rumble);
+        return 0;
+    }
+
     pthread_mutex_lock(&shm_mutex);
 
-    if (low_frequency_rumble != 0 || high_frequency_rumble != 0) {
-        last_rumble_low [idx] = low_frequency_rumble;
-        last_rumble_high[idx] = high_frequency_rumble;
-    } else {
-        last_rumble_low [idx] = 0;
-        last_rumble_high[idx] = 0;
-    }
+    last_rumble_low [idx] = low_frequency_rumble;
+    last_rumble_high[idx] = high_frequency_rumble;
 
     uint16_t vals[2] = { low_frequency_rumble, high_frequency_rumble };
     ssize_t w = pwrite(rumble_fd[idx], vals, sizeof(vals), 32);
@@ -165,7 +177,12 @@ static void *vjoy_updater(void *arg)
             kh = last_rumble_high[idx];
             pthread_mutex_unlock(&shm_mutex);
             if (kl != 0 || kh != 0) {
+                /* Flag this player's slot before calling SDL so that the
+                 * synchronous OnRumble() re-entry is recognised as a
+                 * keepalive and does not overwrite shared memory. */
+                atomic_store(&g_keepalive_active[idx], 1);
                 p_SDL_JoystickRumble(js, kl, kh, RUMBLE_KEEPALIVE_DUR_MS);
+                atomic_store(&g_keepalive_active[idx], 0);
                 LOGD("Rumble keepalive P%d  low=%u  high=%u\n", idx, kl, kh);
             }
         }

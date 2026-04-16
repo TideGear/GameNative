@@ -36,6 +36,11 @@ class PhysicalControllerHandler(
     // InputDevice.getDescriptor() rather than the transient deviceId int so that
     // recycled IDs after hotplug cannot cause incorrect d-pad suppression.
     private val devicesWithConfirmedHat = mutableSetOf<String>()
+    // Reverse map so we can clean devicesWithConfirmedHat when a device is
+    // removed — InputDevice.getDevice(id) returns null by the time the removal
+    // callback fires on many Android versions, so we cache the descriptor here
+    // when the HAT is first confirmed.
+    private val deviceIdToDescriptor = mutableMapOf<Int, String>()
 
     /** Sends release events for all tracked axis bindings across all devices, then clears tracking state. */
     private fun releaseActiveAxes() {
@@ -66,10 +71,40 @@ class PhysicalControllerHandler(
     }
 
     /**
+     * Called when a physical input device is removed so that stale per-device
+     * state is released immediately rather than waiting for a profile change.
+     * This prevents phantom inputs and incorrect d-pad suppression if Android
+     * recycles the same deviceId for a newly connected controller.
+     */
+    fun onDeviceDisconnected(deviceId: Int) {
+        // Release any axis directions that the disconnected device was holding.
+        val bindings = activeAxisBindings.remove(deviceId)
+        if (bindings != null) {
+            val prof = profile ?: return
+            val controller = prof.getController(deviceId)
+            if (controller != null) {
+                for (keyCode in bindings) {
+                    controller.getControllerBinding(keyCode)?.let {
+                        handleInputEvent(it.binding, false, 0f, deviceId)
+                    }
+                }
+            }
+        }
+        // Remove d-pad suppression state for this device.
+        val descriptor = deviceIdToDescriptor.remove(deviceId)
+        if (descriptor != null) {
+            devicesWithConfirmedHat.remove(descriptor)
+        }
+        Log.d(TAG, "onDeviceDisconnected: cleaned up deviceId=$deviceId")
+    }
+
+    /**
      * Clean up resources when handler is destroyed
      */
     fun cleanup() {
         releaseActiveAxes()
+        devicesWithConfirmedHat.clear()
+        deviceIdToDescriptor.clear()
         mouseMoveTimer?.cancel()
         mouseMoveTimer = null
         mouseMoveOffset.set(0f, 0f)
@@ -157,6 +192,7 @@ class PhysicalControllerHandler(
                     val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
                     if (hatX != 0f || hatY != 0f) {
                         devicesWithConfirmedHat.add(descriptor)
+                        deviceIdToDescriptor[event.deviceId] = descriptor
                     }
                 }
 

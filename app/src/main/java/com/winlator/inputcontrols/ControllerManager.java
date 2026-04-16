@@ -375,6 +375,7 @@ public class ControllerManager {
             // Keep detectedDevices in sync so getAssignedDeviceForSlot can
             // resolve this device without waiting for the next scanForDevices().
             String identifier = getDeviceIdentifier(device);
+            if (identifier == null) return -1;
             boolean alreadyDetected = false;
             for (InputDevice d : detectedDevices) {
                 if (identifier.equals(getDeviceIdentifier(d))) { alreadyDetected = true; break; }
