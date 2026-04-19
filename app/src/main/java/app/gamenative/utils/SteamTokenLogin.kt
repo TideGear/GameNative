@@ -14,6 +14,10 @@ import `in`.dragonbra.javasteam.types.KeyValue
 import timber.log.Timber
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.zip.CRC32
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.createDirectories
@@ -22,6 +26,12 @@ import kotlin.io.path.exists
 // This is the key to make config.vdf work
 const val NULL_CHAR = '\u0000'
 const val TOKEN_EXPIRE_TIME = 86400L // 1 day
+
+// SteamFix #24: cap synchronous Wine invocations. `steam-token.exe` shells out
+// through box64 + wine, which on cold boot can wedge forever when Wine's
+// prefix is mid-update. 30 s is generous enough for cold boots and still
+// prevents an infinite black screen.
+private const val WINE_EXEC_TIMEOUT_SECONDS = 30L
 
 class SteamTokenLogin(
     private val steamId: String,
@@ -43,8 +53,26 @@ class SteamTokenLogin(
     }
 
     private fun execCommand(command: String) : String {
-        return guestProgramLauncherComponent?.execShellCommand(command, false)
+        val launcher = guestProgramLauncherComponent
             ?: throw IllegalStateException("GuestProgramLauncherComponent is required for command execution")
+        // SteamFix #24: bound wall-clock so a stuck wine invocation can't black-screen us.
+        val executor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "SteamTokenLogin-exec").apply { isDaemon = true }
+        }
+        return try {
+            val future = CompletableFuture.supplyAsync({
+                launcher.execShellCommand(command, false)
+            }, executor)
+            try {
+                future.get(WINE_EXEC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            } catch (e: TimeoutException) {
+                future.cancel(true)
+                Timber.tag("SteamFix").e("wine exec timed out after %ds: %s", WINE_EXEC_TIMEOUT_SECONDS, command)
+                throw IllegalStateException("wine exec timed out: $command", e)
+            }
+        } finally {
+            executor.shutdownNow()
+        }
     }
 
     private fun killWineServer() {
@@ -178,16 +206,24 @@ class SteamTokenLogin(
                 if (mtbf != null && connectCacheValue != null) {
                     try {
                         val dToken = deobfuscateToken(connectCacheValue.trimEnd(NULL_CHAR), mtbf.toLong()).trimEnd(NULL_CHAR)
-                        if (JWT(dToken).isExpired(TOKEN_EXPIRE_TIME)) {
-                            Timber.tag("SteamTokenLogin").d("Saved JWT expired, overriding config.vdf")
-                            // If the saved JWT is expired, override it
+                        // SteamFix #9: compare the decoded token against the refresh
+                        // token we're about to write. If they diverge, the user
+                        // logged in with a different account or we corrupted the
+                        // value — either way force a rewrite instead of trusting
+                        // the in-prefix value.
+                        val tokenMatches = dToken == token
+                        if (!tokenMatches) {
+                            Timber.tag("SteamFix").w("config.vdf: saved JWT != current refresh token, forcing rewrite")
+                            shouldWriteConfig = true
+                        } else if (JWT(dToken).isExpired(TOKEN_EXPIRE_TIME)) {
+                            Timber.tag("SteamFix").i("config.vdf: saved JWT expired, rewriting")
                             shouldWriteConfig = true
                         } else {
-                            Timber.tag("SteamTokenLogin").d("Saved JWT is not expired, do not override config.vdf")
+                            Timber.tag("SteamFix").d("config.vdf: saved JWT matches + valid, keeping")
                             shouldWriteConfig = false
                         }
                     } catch (_: Exception) {
-                        Timber.tag("SteamTokenLogin").d("Cannot parse saved JWT, overriding config.vdf")
+                        Timber.tag("SteamFix").w("config.vdf: saved JWT unparseable, forcing rewrite")
                         shouldWriteConfig = true
                     }
                 } else {

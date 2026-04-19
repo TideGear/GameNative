@@ -53,6 +53,13 @@ object VcRedistStep : PreInstallStep {
         gameSource: GameSource,
         gameDirPath: String,
     ): Boolean {
+        // vcredist installs system-wide into the Wine prefix, not per-game. Check a
+        // container-root marker first so reinstalling the game (which wipes the game
+        // dir) doesn't force a redundant re-run + wineserver kill on every launch.
+        val containerRoot = container.rootDir?.absolutePath
+        if (containerRoot != null && MarkerUtils.hasMarker(containerRoot, Marker.VCREDIST_INSTALLED)) {
+            return false
+        }
         return !MarkerUtils.hasMarker(gameDirPath, Marker.VCREDIST_INSTALLED)
     }
 

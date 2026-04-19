@@ -101,6 +101,7 @@ object ContainerUtils {
             execArgs = PrefManager.execArgs,
             showFPS = false,
             launchRealSteam = PrefManager.launchRealSteam,
+            disableSteamOverlay = PrefManager.disableSteamOverlay,
             cpuList = PrefManager.cpuList,
             cpuListWoW64 = PrefManager.cpuListWoW64,
             wow64Mode = PrefManager.wow64Mode,
@@ -160,6 +161,7 @@ object ContainerUtils {
         PrefManager.drives = containerData.drives
         PrefManager.execArgs = containerData.execArgs
         PrefManager.launchRealSteam = containerData.launchRealSteam
+        PrefManager.disableSteamOverlay = containerData.disableSteamOverlay
         PrefManager.cpuList = containerData.cpuList
         PrefManager.cpuListWoW64 = containerData.cpuListWoW64
         PrefManager.wow64Mode = containerData.wow64Mode
@@ -273,6 +275,7 @@ object ContainerUtils {
             executablePath = container.executablePath,
             showFPS = false,
             launchRealSteam = container.isLaunchRealSteam,
+            disableSteamOverlay = container.isDisableSteamOverlay,
             allowSteamUpdates = container.isAllowSteamUpdates,
             steamType = container.getSteamType(),
             cpuList = container.cpuList,
@@ -448,6 +451,7 @@ object ContainerUtils {
         container.executablePath = containerData.executablePath
         container.isShowFPS = false
         container.isLaunchRealSteam = containerData.launchRealSteam
+        container.isDisableSteamOverlay = containerData.disableSteamOverlay
         container.isAllowSteamUpdates = containerData.allowSteamUpdates
         container.setSteamType(containerData.steamType)
         container.cpuList = containerData.cpuList
