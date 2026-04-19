@@ -97,6 +97,7 @@ import app.gamenative.utils.ContainerUtils
 import app.gamenative.utils.CustomGameScanner
 import app.gamenative.utils.ExecutableSelectionUtils
 import app.gamenative.utils.PreInstallSteps
+import app.gamenative.utils.SteamFixDiagnostics
 import app.gamenative.utils.SteamTokenLogin
 import app.gamenative.utils.SteamUtils
 import com.posthog.PostHog
@@ -159,6 +160,7 @@ import com.winlator.xserver.ScreenInfo
 import com.winlator.xserver.Window
 import com.winlator.xserver.WindowManager
 import com.winlator.xserver.XServer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -195,6 +197,23 @@ private const val EXIT_PROCESS_TIMEOUT_MS = 30_000L
 private const val EXIT_PROCESS_POLL_INTERVAL_MS = 1_000L
 private const val EXIT_PROCESS_RESPONSE_TIMEOUT_MS = 2_000L
 private const val QUICK_MENU_PROCESS_POLL_INTERVAL_MS = 2_000L
+
+/**
+ * SteamFix #21: flags passed to `steam.exe` when launching through real Steam.
+ * Kept as a constant so (a) we can override via a per-container extra if we
+ * ever need to expose it to power users, and (b) the log line right before
+ * launch is inspectable.
+ *
+ * - `-silent`: start without the main window
+ * - `-vgui`: use the classic UI renderer (more compatible under Wine)
+ * - `-tcp`: force TCP client so Steam doesn't wait on named-pipe handshake
+ * - `-nobigpicture -nofriendsui -nochatui -nointro`: suppress optional UIs
+ */
+private const val STEAM_LAUNCH_FLAGS = "-silent -vgui -tcp -nobigpicture -nofriendsui -nochatui -nointro"
+
+/** SteamFix #8: if we launched real Steam but the game window hasn't appeared
+ *  in this long, log a loud "likely stall" line so users can grab it. */
+private const val REAL_STEAM_STALL_WATCHDOG_MS = 60_000L
 
 private data class XServerViewReleaseBinding(
     val xServerView: XServerView,
@@ -2746,6 +2765,17 @@ private fun setupXEnvironment(
 
         envVars.putAll(container.envVars)
         if (!envVars.has("WINEESYNC")) envVars.put("WINEESYNC", "1")
+
+        // Disable the Steam Vulkan overlay layer via its own disable_environment
+        // hook when the user has opted out. This is the Khronos-canonical way to
+        // skip an implicit layer — the loader sees the env var and never
+        // initializes the layer, which avoids the race where Steam re-extracts
+        // the stashed layer files during client startup.
+        if (container.isDisableSteamOverlay) {
+            envVars.put("DISABLE_VK_LAYER_VALVE_steam_overlay_1", "1")
+            envVars.put("SteamNoOverlayUIDrawing", "1")
+        }
+
         val graphicsDriverConfig = KeyValueSet(container.getGraphicsDriverConfig())
         if (graphicsDriverConfig.get("version").lowercase(Locale.getDefault()).contains("gen8")) {
             var tuDebug = envVars.get("TU_DEBUG")
@@ -2899,6 +2929,10 @@ private fun setupXEnvironment(
     // Moved here, as guestProgramLauncherComponent.environment is setup after addComponent()
     if (container != null) {
         if (container.isLaunchRealSteam) {
+            Timber.tag("SteamFix").i(
+                "SteamTokenLogin: writing config.vdf for login=%s steamId=%s (refreshToken len=%d)",
+                PrefManager.username, PrefManager.steamUserSteamId64, PrefManager.refreshToken.length,
+            )
             SteamTokenLogin(
                 steamId = PrefManager.steamUserSteamId64.toString(),
                 login = PrefManager.username,
@@ -2906,6 +2940,7 @@ private fun setupXEnvironment(
                 imageFs = imageFs,
                 guestProgramLauncherComponent = guestProgramLauncherComponent,
             ).setupSteamFiles()
+            Timber.tag("SteamFix").i("SteamTokenLogin: setupSteamFiles complete")
         }
     }
 
@@ -2932,7 +2967,11 @@ private fun setupXEnvironment(
         Timber.i("---------------------------")
     }
 
-    // Request encrypted app ticket for Steam games at launch time
+    // Request encrypted app ticket for Steam games at launch time.
+    // SteamFix #16: in real-Steam mode, steam.exe fetches its own session ticket
+    // through the official libsteam_api path, so we deliberately skip pre-warming
+    // the GSE-facing ticket cache. Noted in logs so a real-Steam black-screen
+    // investigation can rule this branch in/out.
     val isCustomGame = gameSource == GameSource.CUSTOM_GAME
     val gameIdForTicket = ContainerUtils.extractGameIdFromContainerId(appId)
     if (!bootToContainer && !isCustomGame && gameIdForTicket != null && !container.isLaunchRealSteam) {
@@ -2940,17 +2979,24 @@ private fun setupXEnvironment(
             try {
                 val ticket = SteamService.instance?.getEncryptedAppTicket(gameIdForTicket)
                 if (ticket != null) {
-                    Timber.i("Successfully retrieved encrypted app ticket for app $gameIdForTicket")
+                    Timber.tag("SteamFix").i("Encrypted app ticket retrieved for app %s", gameIdForTicket)
                 } else {
-                    Timber.w("Failed to retrieve encrypted app ticket for app $gameIdForTicket")
+                    Timber.tag("SteamFix").w("Encrypted app ticket came back null for app %s", gameIdForTicket)
                 }
             } catch (e: Exception) {
-                Timber.e(e, "Error requesting encrypted app ticket for app $gameIdForTicket")
+                Timber.tag("SteamFix").e(e, "Encrypted app ticket request threw for app %s", gameIdForTicket)
             }
         }
+    } else if (container.isLaunchRealSteam) {
+        Timber.tag("SteamFix").i("Skipping encrypted app-ticket pre-warm for app %s (real Steam owns ticket)", gameIdForTicket)
     }
 
     try {
+        Timber.tag("SteamFix").i(
+            "startEnvironmentComponents: mode=%s steamClientComponentLoaded=%s",
+            if (container.isLaunchRealSteam) "REAL" else "EMU",
+            !container.isLaunchRealSteam,
+        )
         environment.startEnvironmentComponents()
     } catch (e: Exception) {
         Timber.e(e, "Failed to start environment components, cleaning up")
@@ -2960,6 +3006,54 @@ private fun setupXEnvironment(
             Timber.e(cleanupEx, "Error during environment cleanup")
         }
         throw e
+    }
+
+    // SteamFix #8: watchdog. If we're launching real Steam, log breadcrumbs
+    // and fire a loud warning after REAL_STEAM_STALL_WATCHDOG_MS if we
+    // haven't observed a game-window map yet. Gets cancelled by onWindowMapped
+    // via the global event bus hook elsewhere — worst case it fires once and
+    // gives the user a precise log line to report.
+    // SteamFix #17: log that the Steam pipe is expected NOT to be up (we did
+    // not add SteamClientComponent in real-Steam mode) so a user chasing the
+    // black screen doesn't assume the pipe is the culprit.
+    if (container.isLaunchRealSteam) {
+        // SteamFix: reset diagnostic breadcrumbs so the watchdog reports what
+        // happened in THIS launch, not leftover state from a prior one.
+        SteamFixDiagnostics.reset()
+        Timber.tag("SteamFix").i("real-Steam mode: emulated Steam pipe NOT started (real Steam will own it via steam.exe)")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                delay(REAL_STEAM_STALL_WATCHDOG_MS)
+                // SteamFix: the game window may have mapped successfully before
+                // the delay elapsed. If so, emit a short "ok" breadcrumb
+                // instead of the false-alarm stall warning — previous version
+                // always warned because later helper windows clobbered the
+                // `lastMappedClass` field.
+                if (SteamFixDiagnostics.gameWindowMapped) {
+                    Timber.tag("SteamFix").i(
+                        "STALL WATCHDOG: %d ms elapsed but game window already mapped (class=%s). No stall.",
+                        REAL_STEAM_STALL_WATCHDOG_MS,
+                        SteamFixDiagnostics.gameWindowClass ?: "<null>",
+                    )
+                    return@launch
+                }
+                val lastMapped = SteamFixDiagnostics.lastMappedWindowClass ?: "<none>"
+                val lastUnmatched = SteamFixDiagnostics.lastUnmatchedWindowClass ?: "<none>"
+                val unmatchedCount = SteamFixDiagnostics.unmatchedWindowCount
+                Timber.tag("SteamFix").w(
+                    "STALL WATCHDOG: >%d ms after launch of real Steam for %s, no game window mapped yet. " +
+                        "lastMappedClass=%s lastUnmatchedClass=%s unmatchedCount=%d. " +
+                        "If lastUnmatchedClass is a real window (not a Steam helper), that's the dialog the user needs to click.",
+                    REAL_STEAM_STALL_WATCHDOG_MS, appId, lastMapped, lastUnmatched, unmatchedCount,
+                )
+            } catch (_: CancellationException) {
+                // expected when the scope is cancelled at exit
+            } catch (e: Exception) {
+                Timber.tag("SteamFix").w(e, "stall watchdog failed")
+            }
+        }
+    } else {
+        Timber.tag("SteamFix").i("emulated mode: SteamClientComponent started as in-process pipe")
     }
 
     if (gameSource == GameSource.STEAM) {
@@ -3365,8 +3459,8 @@ private fun getWineStartCommand(
     } else {
         if (container.isLaunchRealSteam) {
             // Launch Steam with the applaunch parameter to start the game
-            "\"C:\\\\Program Files (x86)\\\\Steam\\\\steam.exe\" -silent -vgui -tcp " +
-                    "-nobigpicture -nofriendsui -nochatui -nointro -applaunch $gameId"
+            Timber.tag("SteamFix").i("Building real-Steam launch command for gameId=%s flags=%s", gameId, STEAM_LAUNCH_FLAGS)
+            "\"C:\\\\Program Files (x86)\\\\Steam\\\\steam.exe\" $STEAM_LAUNCH_FLAGS -applaunch $gameId"
         } else {
             var executablePath = ""
             if (container.executablePath.isNotEmpty()) {
@@ -3887,7 +3981,27 @@ private fun setupWineSystemFiles(
     }
 
     if (container.isLaunchRealSteam){
+        // SteamFix #6: invalidate the Steam extraction when Wine version or
+        // variant has changed. A stale steam.exe compiled against an older Wine
+        // ABI is one of the quiet ways the ON toggle goes black-screen.
+        val steamExtractedKey = "${container.wineVersion}|${container.containerVariant}"
+        val steamExtractedPrev = container.getExtra("steamExtractedForWine")
+        val steamExeFile = File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam/steam.exe")
+        val wineChanged = steamExtractedPrev != steamExtractedKey
+        if (wineChanged && steamExeFile.exists()) {
+            Timber.tag("SteamFix").w("Wine change detected (%s -> %s), wiping old Steam install to force re-extract", steamExtractedPrev, steamExtractedKey)
+            val steamDir = File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam")
+            // SteamFix: symlink-safe delete. `File.deleteRecursively()` follows
+            // symlinks, and `steamapps/common/<installdir>` is a symlink to the
+            // real game-content directory under GameNative's own Steam dir. A
+            // plain recursive delete here was deleting every installed game's
+            // files as a side effect of toggling Wine/Steam Client.
+            SteamUtils.deleteTreeNoFollowSymlinks(steamDir)
+        }
+        Timber.tag("SteamFix").i("extractSteamFiles: wineKey=%s steamExeExists=%s", steamExtractedKey, steamExeFile.exists())
         extractSteamFiles(context, container, onExtractFileListener)
+        container.putExtra("steamExtractedForWine", steamExtractedKey)
+        containerDataChanged = true
     }
 
     val desktopTheme = container.desktopTheme

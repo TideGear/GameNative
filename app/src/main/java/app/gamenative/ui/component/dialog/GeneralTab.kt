@@ -366,6 +366,15 @@ fun GeneralTabContent(
             state = config.launchRealSteam,
             onCheckedChange = { state.config.value = config.copy(launchRealSteam = it) },
         )
+        if (config.launchRealSteam) {
+            SettingsSwitch(
+                colors = settingsTileColorsAlt(),
+                title = { Text(text = stringResource(R.string.disable_steam_overlay)) },
+                subtitle = { Text(text = stringResource(R.string.disable_steam_overlay_description)) },
+                state = config.disableSteamOverlay,
+                onCheckedChange = { state.config.value = config.copy(disableSteamOverlay = it) },
+            )
+        }
         val steamTypeItems = listOf("Normal", "Light", "Ultra Light")
         val currentSteamTypeIndex = when (config.steamType.lowercase()) {
             Container.STEAM_TYPE_LIGHT -> 1

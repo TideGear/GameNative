@@ -667,6 +667,8 @@
     <string name="local_saves_only_description">Disable cloud save sync for this game and keep saves on device only</string>
     <string name="launch_steam_client_beta">Launch Steam Client (Beta)</string>
     <string name="launch_steam_client_description">Reduces performance and slows down launch\nAllows online play and fixes DRM and controller issues\nNot all games work</string>
+    <string name="disable_steam_overlay">Disable Steam Overlay</string>
+    <string name="disable_steam_overlay_description">Skip injecting gameoverlayrenderer64.dll\nAchievements still unlock but popups won\'t appear\nMay fix crashes on Unity/Vulkan games</string>
     <string name="steam_offline_mode">Steam Offline Mode</string>
     <string name="steam_offline_mode_description">Launch Steam games in offline mode</string>
     <string name="achievement_unlocked">Achievement Unlocked</string>
