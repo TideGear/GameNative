@@ -237,22 +237,35 @@ object SteamUtils {
     }
 
     /**
-     * SteamFix #7: verify RESTORED marker. Each steam_api DLL must have a .orig
-     * sibling and match it byte-for-byte.
+     * SteamFix #7: verify RESTORED marker. A restored DLL is defined as "NOT our
+     * pipe DLL" — we compare each on-disk `steam_api*.dll` against the pipe DLL
+     * shipped in assets. If the hash matches the pipe, the DLL is still replaced
+     * and the marker is lying. If the hash differs, the DLL is either the game's
+     * original (never replaced) or successfully put back from .orig; either way
+     * RESTORED is a truthful state. The .orig sibling is optional — games whose
+     * emu-mode path never called replaceSteamApi (e.g. non-legacy-DRM games like
+     * Shiren) never have a .orig, and that is fine.
      */
-    private fun verifyRestoredState(appDirPath: String): Boolean {
+    private fun verifyRestoredState(context: Context, appDirPath: String): Boolean {
         return try {
+            val assetHashes = mutableMapOf<String, String>()
+            listOf("steam_api.dll", "steam_api64.dll").forEach { name ->
+                runCatching {
+                    context.assets.open("steampipe/$name").use { ins ->
+                        assetHashes[name.lowercase()] = sha256OfStream(ins)
+                    }
+                }
+            }
             Paths.get(appDirPath).toFile().walkTopDown().maxDepth(10).forEach { file ->
                 if (!file.isFile) return@forEach
                 val n = file.name.lowercase()
                 if (n == "steam_api.dll" || n == "steam_api64.dll") {
-                    val orig = File(file.parentFile, "${file.name}.orig")
-                    if (!orig.exists()) {
-                        Timber.tag("SteamFix").w("DLL marker desync: %s has no .orig sibling (marker says RESTORED)", file.absolutePath)
-                        return false
-                    }
-                    if (sha256OfFile(file) != sha256OfFile(orig)) {
-                        Timber.tag("SteamFix").w("DLL marker desync: %s != %s.orig (marker says RESTORED)", file.absolutePath, file.name)
+                    val pipeHash = assetHashes[n] ?: return@forEach
+                    if (sha256OfFile(file) == pipeHash) {
+                        Timber.tag("SteamFix").w(
+                            "DLL marker desync: %s is still the pipe DLL (marker says RESTORED)",
+                            file.absolutePath,
+                        )
                         return false
                     }
                 }
@@ -277,6 +290,81 @@ object SteamUtils {
             md.update(buf, 0, n)
         }
         return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * SteamFix: tell the Wine-hosted Steam client that the Steamworks Common
+     * Redistributables (228980) plus each canonical child depot's install
+     * script has already executed, so `steam.exe -applaunch` does not
+     * re-launch the bundled `vc_redist.x86.exe` / `vc_redist.x64.exe` /
+     * `DXSETUP.exe` installers on every boot. Those installers race the
+     * Unity MSVC runtime (we've seen the resulting crash on Shiren, appId
+     * 2178480) and also grab focus away from the game window.
+     *
+     * Steam checks these registry paths before running an InstallScript:
+     *   - HKLM\Software\Valve\Steam\Apps\<appid>                    (app registry)
+     *   - HKLM\Software\Wow6432Node\Valve\Steam\Apps\<appid>        (32-bit view)
+     *   - HKLM\Software\Valve\Steam\Apps\<appid>\Depots\<depotid>   (per-depot)
+     *   - HKLM\Software\Valve\Steam\InstallScripts\<depotid>        (script tracker)
+     *
+     * We set `Installed=1` and `Run=1` across all of them. Writes go to
+     * `system.reg` (HKLM) via WineRegistryEditor. Idempotent: if a key
+     * already has the value, the editor short-circuits. Safe to fail — the
+     * worst outcome is that Steam runs the installer again (status quo).
+     */
+    fun applySteamInstallScriptShim(context: Context, steamAppId: Int) {
+        try {
+            val imageFs = ImageFs.find(context)
+            val systemRegFile = File(imageFs.wineprefix, "system.reg")
+            if (!systemRegFile.isFile) {
+                Timber.tag("SteamFix").w(
+                    "applySteamInstallScriptShim: system.reg missing at %s — skipping",
+                    systemRegFile.absolutePath,
+                )
+                return
+            }
+
+            val appKeys = listOf(
+                "Software\\Valve\\Steam\\Apps\\228980",
+                "Software\\Wow6432Node\\Valve\\Steam\\Apps\\228980",
+                "Software\\Valve\\Steam\\Apps\\$steamAppId",
+                "Software\\Wow6432Node\\Valve\\Steam\\Apps\\$steamAppId",
+            )
+            val depotIds = canonical228980Depots.map { it.id }
+            var writes = 0
+
+            WineRegistryEditor(systemRegFile).use { reg ->
+                reg.setCreateKeyIfNotExist(true)
+                appKeys.forEach { key ->
+                    reg.setDwordValue(key, "Installed", 1)
+                    reg.setDwordValue(key, "Updating", 0)
+                    reg.setDwordValue(key, "Running", 0)
+                    writes += 3
+                }
+                depotIds.forEach { depotId ->
+                    val perDepotKeys = listOf(
+                        "Software\\Valve\\Steam\\Apps\\228980\\Depots\\$depotId",
+                        "Software\\Wow6432Node\\Valve\\Steam\\Apps\\228980\\Depots\\$depotId",
+                        "Software\\Valve\\Steam\\Apps\\$steamAppId\\Depots\\$depotId",
+                        "Software\\Wow6432Node\\Valve\\Steam\\Apps\\$steamAppId\\Depots\\$depotId",
+                        "Software\\Valve\\Steam\\InstallScripts\\$depotId",
+                        "Software\\Wow6432Node\\Valve\\Steam\\InstallScripts\\$depotId",
+                    )
+                    perDepotKeys.forEach { key ->
+                        reg.setDwordValue(key, "Installed", 1)
+                        reg.setDwordValue(key, "Run", 1)
+                        writes += 2
+                    }
+                }
+            }
+
+            Timber.tag("SteamFix").i(
+                "applySteamInstallScriptShim: wrote %d reg entries for appId=%d + 228980 (%d canonical depots)",
+                writes, steamAppId, depotIds.size,
+            )
+        } catch (e: Exception) {
+            Timber.tag("SteamFix").w(e, "applySteamInstallScriptShim failed for appId=%d", steamAppId)
+        }
     }
 
     /**
@@ -953,15 +1041,28 @@ object SteamUtils {
             // on the game itself. Bail out instead of overwriting a previously-good acf.
             if (regularDepots.isEmpty()) {
                 val existing = File(steamappsDir, "appmanifest_$steamAppId.acf")
-                Timber.tag("SteamFix").w(
-                    "createAppManifest ABORT: appId=%d regularDepots empty (downloadableDepots=%s sharedDepots=%s branch=%s). Keeping existing acf=%s (exists=%s) to avoid regressing Steam into Update Required.",
-                    steamAppId,
-                    downloadableDepots.keys,
-                    sharedDepots.keys,
-                    installedBranch,
-                    existing.absolutePath,
-                    existing.exists(),
-                )
+                val existingBuildId = if (existing.isFile) parseAcfBuildId(existing) else 0L
+                val existingDepotCount = if (existing.isFile) parseAcfInstalledDepotIds(existing).size else 0
+                val hasValidExisting = existing.isFile && existingBuildId > 0L && existingDepotCount > 0
+                if (hasValidExisting) {
+                    // Transient PICS flake (partial depot list). The existing acf is
+                    // structurally sound and will continue to serve Steam — quiet info,
+                    // not a scary warn.
+                    Timber.tag("SteamFix").i(
+                        "createAppManifest: PICS returned empty regularDepots for appId=%d (downloadable=%s shared=%s). Existing acf is valid (buildid=%d, %d depots); keeping.",
+                        steamAppId, downloadableDepots.keys, sharedDepots.keys, existingBuildId, existingDepotCount,
+                    )
+                } else {
+                    Timber.tag("SteamFix").w(
+                        "createAppManifest ABORT: appId=%d regularDepots empty (downloadableDepots=%s sharedDepots=%s branch=%s) and no valid existing acf=%s (exists=%s). Steam will likely gray Play until PICS returns full data.",
+                        steamAppId,
+                        downloadableDepots.keys,
+                        sharedDepots.keys,
+                        installedBranch,
+                        existing.absolutePath,
+                        existing.exists(),
+                    )
+                }
                 // Still write 228980's manifest — it's independent of the child's
                 // state and we just resolved fresh GIDs for it.
                 writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner)
@@ -1448,7 +1549,7 @@ object SteamUtils {
         val appDirPath = SteamService.getAppDirPath(steamAppId)
 
         val needsDllRestore = if (MarkerUtils.hasMarker(appDirPath, Marker.STEAM_DLL_RESTORED)) {
-            if (verifyRestoredState(appDirPath)) {
+            if (verifyRestoredState(context, appDirPath)) {
                 Timber.tag("SteamFix").i("restoreSteamApi: DLL marker + hash ok, skipping DLL copy")
                 false
             } else {
@@ -1483,6 +1584,12 @@ object SteamUtils {
         // launch. Multi-account contamination and branch changes otherwise leave
         // stale LastOwner / buildid / installdir until the DLL marker is cleared.
         createAppManifest(context, steamAppId)
+
+        // SteamFix #36: suppress per-launch vcredist/DirectX installer invocations
+        // by claiming all 228980 install scripts have already run. See doc on
+        // applySteamInstallScriptShim — fixes the Unity crash on Shiren where
+        // Steam was racing VC_redist.x64.exe against the game's MSVC loader.
+        applySteamInstallScriptShim(context, steamAppId)
 
         // Game-specific Handling
         ensureSaveLocationsForGames(context, steamAppId)
