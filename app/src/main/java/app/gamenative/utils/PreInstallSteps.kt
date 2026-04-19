@@ -50,7 +50,10 @@ object PreInstallSteps {
         val gameDir = getGameDir(container) ?: return emptyList()
         val gameDirPath = gameDir.absolutePath
 
-        if (containerVariantChanged) resetMarkers(gameDirPath)
+        if (containerVariantChanged) {
+            resetMarkers(gameDirPath)
+            container.rootDir?.absolutePath?.let { resetMarkers(it) }
+        }
 
         val commands = mutableListOf<PreInstallCommand>()
 
@@ -93,6 +96,14 @@ object PreInstallSteps {
         val gameDir = getGameDir(container) ?: return
         val gameDirPath = gameDir.absolutePath
         MarkerUtils.addMarker(gameDirPath, marker)
+        // Also persist container-scoped prereqs at the Wine prefix root so a
+        // game reinstall doesn't force a redundant re-run of an installer that
+        // already landed system-wide. Matches the appliesTo check in VcRedistStep.
+        if (marker == Marker.VCREDIST_INSTALLED) {
+            container.rootDir?.absolutePath?.let { containerRoot ->
+                MarkerUtils.addMarker(containerRoot, marker)
+            }
+        }
     }
 
     private fun resetMarkers(gameDirPath: String) {
