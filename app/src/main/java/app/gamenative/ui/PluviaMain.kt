@@ -1996,6 +1996,7 @@ fun preLaunchApp(
             preferredSave = preferredSave,
             parentScope = this,
             isOffline = isOffline,
+            isLaunchRealSteam = container.isLaunchRealSteam,
             onProgress = { message, progress ->
                 setLoadingMessage(message)
                 setLoadingProgress(if (progress < 0) -1f else progress)

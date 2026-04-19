@@ -461,6 +461,13 @@ object PrefManager {
             setPref(LAUNCH_REAL_STEAM, value)
         }
 
+    private val DISABLE_STEAM_OVERLAY = booleanPreferencesKey("disable_steam_overlay")
+    var disableSteamOverlay: Boolean
+        get() = getPref(DISABLE_STEAM_OVERLAY, false)
+        set(value) {
+            setPref(DISABLE_STEAM_OVERLAY, value)
+        }
+
     private val FORCE_DLC = booleanPreferencesKey("force_dlc")
     var forceDlc: Boolean
         get() = getPref(FORCE_DLC, false)

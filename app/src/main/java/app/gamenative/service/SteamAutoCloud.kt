@@ -882,46 +882,58 @@ object SteamAutoCloud {
 
                     val hasUncachedLocalFiles = cacheIsAbsentOrEmpty && allLocalUserFiles.isNotEmpty()
                     var rehydratedSilently = false
-                    if (hasUncachedLocalFiles) {
-                        // no cache but local files exist. before declaring conflict,
-                        // check if local state is byte-identical to remote — this is
-                        // the "cache-wiped by destructive migration, nothing actually
-                        // changed" case and should be silent. key by absolute filesystem
-                        // path: cloud stores files as (pathPrefixIndex, basename) while
-                        // local scan stores filename as subdir-relative path with a
-                        // single pattern prefix, so basename-only keys won't match for
-                        // nested files.
-                        // windows paths are case-insensitive; steam cloud and wine may
-                        // disagree on case. lowercase the keys so content-identical
-                        // files compare equal regardless.
+
+                    // Shared byte-identical check: local vs remote SHAs keyed by
+                    // absolute path (lowercased to sidestep windows case quirks).
+                    // Used by both the cache-absent branch and the cache-present
+                    // "stale cache, content unchanged" fast-path below.
+                    val localMatchesRemote: () -> Boolean = {
                         val localByPath = allLocalUserFiles.associate {
                             it.getAbsPath(prefixToPath).toString().lowercase() to it.sha
                         }
                         val remoteByPath = appFileListChange.files.associate {
                             getFullFilePath(it, appFileListChange).toString().lowercase() to it.shaFile
                         }
-                        val localMatchesRemote = localByPath.keys == remoteByPath.keys &&
+                        localByPath.keys == remoteByPath.keys &&
                             localByPath.all { (path, sha) ->
                                 sha.contentEquals(remoteByPath[path])
                             }
+                    }
 
-                        if (localMatchesRemote) {
-                            Timber.i("Cache absent but local matches remote — rehydrating cache silently")
-                            with(steamInstance) {
-                                db.withTransaction {
-                                    fileChangeListsDao.insert(appInfo.id, allLocalUserFiles)
-                                    changeNumbersDao.insert(appInfo.id, cloudAppChangeNumber)
-                                }
+                    val rehydrateCacheSilently: suspend (String) -> Unit = { reason ->
+                        Timber.tag("SteamFix").i("Cloud sync: $reason — rehydrating cache silently")
+                        with(steamInstance) {
+                            db.withTransaction {
+                                fileChangeListsDao.insert(appInfo.id, allLocalUserFiles)
+                                changeNumbersDao.insert(appInfo.id, cloudAppChangeNumber)
                             }
-                            syncResult = SyncResult.UpToDate
-                            filesManaged = allLocalUserFiles.size
-                            rehydratedSilently = true
+                        }
+                        syncResult = SyncResult.UpToDate
+                        filesManaged = allLocalUserFiles.size
+                        rehydratedSilently = true
+                    }
+
+                    if (hasUncachedLocalFiles) {
+                        // no cache but local files exist. before declaring conflict,
+                        // check if local state is byte-identical to remote — this is
+                        // the "cache-wiped by destructive migration, nothing actually
+                        // changed" case and should be silent.
+                        if (localMatchesRemote()) {
+                            rehydrateCacheSilently("cache absent but local matches remote")
                         } else {
                             hasLocalChanges = true
                             conflictUfsVersion = CURRENT_UFS_PARSE_VERSION
                             remoteTimestamp = appFileListChange.files.map { it.timestamp.time }.maxOrNull() ?: 0L
                             localTimestamp = allLocalUserFiles.map { it.timestamp }.maxOrNull() ?: 0L
                         }
+                    } else if (hasLocalChanges && localMatchesRemote()) {
+                        // SteamFix: cache present but stale (diff-from-cache says
+                        // local changed) yet local is byte-identical to remote.
+                        // Happens after the Steam DLL swap / any path that touches
+                        // userdata without going through the cache writer. Without
+                        // this branch, the user gets a conflict prompt for a save
+                        // that didn't actually change.
+                        rehydrateCacheSilently("cache stale but local matches remote")
                     }
 
                     if (rehydratedSilently) {
