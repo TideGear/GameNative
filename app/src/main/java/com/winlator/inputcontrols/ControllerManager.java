@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.hardware.input.InputManager;
+import android.os.Build;
 import android.preference.PreferenceManager;
 import android.util.SparseArray;
 import android.view.InputDevice;
@@ -229,8 +230,12 @@ public class ControllerManager {
      */
     public static String getDeviceIdentifier(InputDevice device) {
         if (device == null) return null;
-        // getDescriptor() is stable across reconnects and unique per physical device
-        // even when multiple identical-model controllers are connected. Available since API 16.
+        // Pre-Q descriptors were unstable across reconnects for some vendors, so
+        // persisted assignments from old installs use "vendor_X_product_Y". Keep
+        // that format on < Q so upgrade paths don't lose slot bindings.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return "vendor_" + device.getVendorId() + "_product_" + device.getProductId();
+        }
         return device.getDescriptor();
     }
 
