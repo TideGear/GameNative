@@ -27,10 +27,8 @@ import kotlin.io.path.exists
 const val NULL_CHAR = '\u0000'
 const val TOKEN_EXPIRE_TIME = 86400L // 1 day
 
-// SteamFix #24: cap synchronous Wine invocations. `steam-token.exe` shells out
-// through box64 + wine, which on cold boot can wedge forever when Wine's
-// prefix is mid-update. 30 s is generous enough for cold boots and still
-// prevents an infinite black screen.
+// Bound synchronous Wine invocations — steam-token.exe can wedge forever on cold
+// boot when the Wine prefix is mid-update, which otherwise black-screens the app.
 private const val WINE_EXEC_TIMEOUT_SECONDS = 30L
 
 class SteamTokenLogin(
@@ -55,7 +53,6 @@ class SteamTokenLogin(
     private fun execCommand(command: String) : String {
         val launcher = guestProgramLauncherComponent
             ?: throw IllegalStateException("GuestProgramLauncherComponent is required for command execution")
-        // SteamFix #24: bound wall-clock so a stuck wine invocation can't black-screen us.
         val executor = Executors.newSingleThreadExecutor { r ->
             Thread(r, "SteamTokenLogin-exec").apply { isDaemon = true }
         }
@@ -67,7 +64,7 @@ class SteamTokenLogin(
                 future.get(WINE_EXEC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             } catch (e: TimeoutException) {
                 future.cancel(true)
-                Timber.tag("SteamFix").e("wine exec timed out after %ds: %s", WINE_EXEC_TIMEOUT_SECONDS, command)
+                Timber.tag("SteamTokenLogin").e("wine exec timed out after %ds: %s", WINE_EXEC_TIMEOUT_SECONDS, command)
                 throw IllegalStateException("wine exec timed out: $command", e)
             }
         } finally {
@@ -206,24 +203,10 @@ class SteamTokenLogin(
                 if (mtbf != null && connectCacheValue != null) {
                     try {
                         val dToken = deobfuscateToken(connectCacheValue.trimEnd(NULL_CHAR), mtbf.toLong()).trimEnd(NULL_CHAR)
-                        // SteamFix #9: compare the decoded token against the refresh
-                        // token we're about to write. If they diverge, the user
-                        // logged in with a different account or we corrupted the
-                        // value — either way force a rewrite instead of trusting
-                        // the in-prefix value.
-                        val tokenMatches = dToken == token
-                        if (!tokenMatches) {
-                            Timber.tag("SteamFix").w("config.vdf: saved JWT != current refresh token, forcing rewrite")
-                            shouldWriteConfig = true
-                        } else if (JWT(dToken).isExpired(TOKEN_EXPIRE_TIME)) {
-                            Timber.tag("SteamFix").i("config.vdf: saved JWT expired, rewriting")
-                            shouldWriteConfig = true
-                        } else {
-                            Timber.tag("SteamFix").d("config.vdf: saved JWT matches + valid, keeping")
-                            shouldWriteConfig = false
-                        }
+                        // If the stored token diverges from the current refresh token
+                        // (different account, or corrupted value), force a rewrite.
+                        shouldWriteConfig = dToken != token || JWT(dToken).isExpired(TOKEN_EXPIRE_TIME)
                     } catch (_: Exception) {
-                        Timber.tag("SteamFix").w("config.vdf: saved JWT unparseable, forcing rewrite")
                         shouldWriteConfig = true
                     }
                 } else {

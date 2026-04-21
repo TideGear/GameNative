@@ -2266,8 +2266,6 @@ class SteamService : Service(), IChallengeUrlChanged {
             isLaunchRealSteam: Boolean = false,
             onProgress: ((message: String, progress: Float) -> Unit)? = null,
         ): Deferred<PostSyncInfo> = parentScope.async {
-            Timber.tag("SteamFix").i("beginLaunchApp: appId=%d mode=%s offline=%s", appId, if (isLaunchRealSteam) "REAL" else "EMU", isOffline)
-            SteamUtils.logAppDirInventory(appId, "beginLaunchApp")
             if (isOffline || !isConnected) {
                 return@async PostSyncInfo(SyncResult.UpToDate)
             }
@@ -2276,8 +2274,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                 return@async PostSyncInfo(SyncResult.InProgress)
             }
 
-            // SteamFix #11: only migrate GSE -> userdata when we'll actually boot
-            // real Steam. Reverse direction is handled in ensureSteamSettings.
+            // Only migrate GSE -> userdata when booting real Steam; reverse direction lives in ensureSteamSettings.
             SteamUtils.migrateGSESavesToSteamUserdata(instance?.applicationContext!!, appId, isLaunchRealSteam)
 
             try {
@@ -2373,7 +2370,6 @@ class SteamService : Service(), IChallengeUrlChanged {
                 return@async PostSyncInfo(SyncResult.InProgress)
             }
 
-            // SteamFix #11: only migrate GSE -> userdata in real-Steam mode.
             SteamUtils.migrateGSESavesToSteamUserdata(instance?.applicationContext!!, appId, isLaunchRealSteam)
 
             try {
@@ -2428,7 +2424,6 @@ class SteamService : Service(), IChallengeUrlChanged {
 
         suspend fun closeApp(context: Context, appId: Int, isOffline: Boolean, prefixToPath: (String) -> String, isLaunchRealSteam: Boolean = false) = withContext(Dispatchers.IO) {
             async {
-                Timber.tag("SteamFix").i("closeApp: appId=%d mode=%s offline=%s", appId, if (isLaunchRealSteam) "REAL" else "EMU", isOffline)
                 if (isOffline || !isConnected) {
                     return@async
                 }
@@ -2439,18 +2434,14 @@ class SteamService : Service(), IChallengeUrlChanged {
                 }
 
                 try {
-                    // SteamFix #18: in real-Steam mode, achievements are written by
-                    // real Steam (via the Wine-hosted client) rather than Goldberg.
-                    // Reading the Goldberg dir then is at best a no-op and at worst
-                    // clobbers achievements we don't own.
+                    // Real-Steam mode writes achievements via the Wine-hosted client,
+                    // so skip Goldberg sync to avoid clobbering them.
                     if (!isLaunchRealSteam) {
                         try {
                             syncAchievementsFromGoldberg(context, appId)
                         } catch (e: Exception) {
                             Timber.e(e, "Achievement sync failed for appId=$appId, continuing with cloud save sync")
                         }
-                    } else {
-                        Timber.tag("SteamFix").i("closeApp: skipping Goldberg achievement sync (real-Steam mode)")
                     }
 
                     val maxAttempts = 3
