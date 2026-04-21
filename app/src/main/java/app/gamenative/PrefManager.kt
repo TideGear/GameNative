@@ -463,7 +463,7 @@ object PrefManager {
 
     private val DISABLE_STEAM_OVERLAY = booleanPreferencesKey("disable_steam_overlay")
     var disableSteamOverlay: Boolean
-        get() = getPref(DISABLE_STEAM_OVERLAY, false)
+        get() = getPref(DISABLE_STEAM_OVERLAY, true)
         set(value) {
             setPref(DISABLE_STEAM_OVERLAY, value)
         }
