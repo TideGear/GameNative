@@ -900,8 +900,7 @@ object SteamAutoCloud {
                             }
                     }
 
-                    val rehydrateCacheSilently: suspend (String) -> Unit = { reason ->
-                        Timber.tag("SteamFix").i("Cloud sync: $reason — rehydrating cache silently")
+                    val rehydrateCacheSilently: suspend () -> Unit = {
                         with(steamInstance) {
                             db.withTransaction {
                                 fileChangeListsDao.insert(appInfo.id, allLocalUserFiles)
@@ -919,7 +918,7 @@ object SteamAutoCloud {
                         // the "cache-wiped by destructive migration, nothing actually
                         // changed" case and should be silent.
                         if (localMatchesRemote()) {
-                            rehydrateCacheSilently("cache absent but local matches remote")
+                            rehydrateCacheSilently()
                         } else {
                             hasLocalChanges = true
                             conflictUfsVersion = CURRENT_UFS_PARSE_VERSION
@@ -927,13 +926,10 @@ object SteamAutoCloud {
                             localTimestamp = allLocalUserFiles.map { it.timestamp }.maxOrNull() ?: 0L
                         }
                     } else if (hasLocalChanges && localMatchesRemote()) {
-                        // SteamFix: cache present but stale (diff-from-cache says
-                        // local changed) yet local is byte-identical to remote.
-                        // Happens after the Steam DLL swap / any path that touches
-                        // userdata without going through the cache writer. Without
-                        // this branch, the user gets a conflict prompt for a save
-                        // that didn't actually change.
-                        rehydrateCacheSilently("cache stale but local matches remote")
+                        // Cache flagged local-changed but bytes match remote (e.g. after
+                        // the DLL swap touched userdata outside the cache writer). Rehydrate
+                        // silently instead of showing a bogus conflict prompt.
+                        rehydrateCacheSilently()
                     }
 
                     if (rehydratedSilently) {

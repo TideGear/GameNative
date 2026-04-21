@@ -85,7 +85,7 @@ public class Container {
     private String wineVersion = WineInfo.MAIN_WINE_VERSION.identifier();
     private boolean showFPS;
     private boolean launchRealSteam;
-    private boolean disableSteamOverlay;
+    private boolean disableSteamOverlay = true;
     private boolean allowSteamUpdates;
     private boolean wow64Mode = true;
     private boolean needsUnpacking = true;

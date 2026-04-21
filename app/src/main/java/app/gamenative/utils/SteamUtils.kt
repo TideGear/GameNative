@@ -42,53 +42,6 @@ import java.nio.file.attribute.FileTime
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.setLastModifiedTime
 
-/**
- * Shared SteamFix diagnostics. Written from onWindowMapped so the stall
- * watchdog (and any other late-firing diagnostic) can name *what* was on
- * screen at the moment it gave up. A null value means "nothing mapped yet."
- */
-object SteamFixDiagnostics {
-    @Volatile var lastMappedWindowClass: String? = null
-    @Volatile var lastUnmatchedWindowClass: String? = null
-    @Volatile var unmatchedWindowCount: Int = 0
-
-    /**
-     * The window class of the last mapped window that matched a known launch
-     * config (i.e. the game window itself). Survives later noise from helper
-     * windows, so the stall watchdog can distinguish "game never appeared"
-     * from "game appeared, then something else grabbed focus."
-     */
-    @Volatile var gameWindowMapped: Boolean = false
-    @Volatile var gameWindowClass: String? = null
-
-    fun reset() {
-        lastMappedWindowClass = null
-        lastUnmatchedWindowClass = null
-        unmatchedWindowCount = 0
-        gameWindowMapped = false
-        gameWindowClass = null
-    }
-}
-
-/**
- * Window classes we know are Steam's own bootstrapper/helper windows.
- * Seeing these mapped is normal and does not indicate a modal; log at debug.
- * Anything else in real-Steam mode is more suspicious (login prompt, cloud
- * conflict, update-required dialog) and is worth warning about.
- */
-val STEAM_HELPER_WINDOW_CLASSES: Set<String> = setOf(
-    "",
-    "explorer.exe",
-    "steam.exe",
-    "steamwebhelper.exe",
-    "conhost.exe",
-    "winhandler.exe",
-    "gameoverlayui.exe",
-    "steamerrorreporter.exe",
-    "steamerrorreporter64.exe",
-    "steamservice.exe",
-)
-
 object SteamUtils {
 
     fun getDownloadBytes(manifest: ManifestInfo?): Long {
@@ -197,132 +150,17 @@ object SteamUtils {
     }
 
     /**
-     * SteamFix #7: hash-verify that the steam_api DLL currently on disk matches
-     * the pipe DLL shipped in assets. An interrupted launch can desync the marker
-     * (marker says "replaced" but DLLs are actually original, or vice versa).
-     */
-    private fun verifyReplacedState(context: Context, appDirPath: String): Boolean {
-        return try {
-            val assetHashes = mutableMapOf<String, String>()
-            listOf("steam_api.dll", "steam_api64.dll").forEach { name ->
-                runCatching {
-                    context.assets.open("steampipe/$name").use { ins ->
-                        assetHashes[name.lowercase()] = sha256OfStream(ins)
-                    }
-                }
-            }
-            var found = false
-            Paths.get(appDirPath).toFile().walkTopDown().maxDepth(10).forEach { file ->
-                if (!file.isFile) return@forEach
-                val n = file.name.lowercase()
-                if (n == "steam_api.dll" || n == "steam_api64.dll") {
-                    found = true
-                    val expected = assetHashes[n] ?: return@forEach
-                    val actual = sha256OfFile(file)
-                    if (actual != expected) {
-                        Timber.tag("SteamFix").w("DLL marker desync: %s hash mismatch (marker says REPLACED)", file.absolutePath)
-                        return false
-                    }
-                }
-            }
-            if (!found) {
-                Timber.tag("SteamFix").w("DLL marker desync: no steam_api DLL found at $appDirPath but REPLACED marker present")
-                return false
-            }
-            true
-        } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "verifyReplacedState failed, treating as desync")
-            false
-        }
-    }
-
-    /**
-     * SteamFix #7: verify RESTORED marker. A restored DLL is defined as "NOT our
-     * pipe DLL" — we compare each on-disk `steam_api*.dll` against the pipe DLL
-     * shipped in assets. If the hash matches the pipe, the DLL is still replaced
-     * and the marker is lying. If the hash differs, the DLL is either the game's
-     * original (never replaced) or successfully put back from .orig; either way
-     * RESTORED is a truthful state. The .orig sibling is optional — games whose
-     * emu-mode path never called replaceSteamApi (e.g. non-legacy-DRM games like
-     * Shiren) never have a .orig, and that is fine.
-     */
-    private fun verifyRestoredState(context: Context, appDirPath: String): Boolean {
-        return try {
-            val assetHashes = mutableMapOf<String, String>()
-            listOf("steam_api.dll", "steam_api64.dll").forEach { name ->
-                runCatching {
-                    context.assets.open("steampipe/$name").use { ins ->
-                        assetHashes[name.lowercase()] = sha256OfStream(ins)
-                    }
-                }
-            }
-            Paths.get(appDirPath).toFile().walkTopDown().maxDepth(10).forEach { file ->
-                if (!file.isFile) return@forEach
-                val n = file.name.lowercase()
-                if (n == "steam_api.dll" || n == "steam_api64.dll") {
-                    val pipeHash = assetHashes[n] ?: return@forEach
-                    if (sha256OfFile(file) == pipeHash) {
-                        Timber.tag("SteamFix").w(
-                            "DLL marker desync: %s is still the pipe DLL (marker says RESTORED)",
-                            file.absolutePath,
-                        )
-                        return false
-                    }
-                }
-            }
-            true
-        } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "verifyRestoredState failed, treating as desync")
-            false
-        }
-    }
-
-    private fun sha256OfFile(file: File): String {
-        file.inputStream().use { return sha256OfStream(it) }
-    }
-
-    private fun sha256OfStream(input: java.io.InputStream): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        val buf = ByteArray(64 * 1024)
-        while (true) {
-            val n = input.read(buf)
-            if (n <= 0) break
-            md.update(buf, 0, n)
-        }
-        return md.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    /**
-     * SteamFix: tell the Wine-hosted Steam client that the Steamworks Common
-     * Redistributables (228980) plus each canonical child depot's install
-     * script has already executed, so `steam.exe -applaunch` does not
-     * re-launch the bundled `vc_redist.x86.exe` / `vc_redist.x64.exe` /
-     * `DXSETUP.exe` installers on every boot. Those installers race the
-     * Unity MSVC runtime (we've seen the resulting crash on Shiren, appId
-     * 2178480) and also grab focus away from the game window.
-     *
-     * Steam checks these registry paths before running an InstallScript:
-     *   - HKLM\Software\Valve\Steam\Apps\<appid>                    (app registry)
-     *   - HKLM\Software\Wow6432Node\Valve\Steam\Apps\<appid>        (32-bit view)
-     *   - HKLM\Software\Valve\Steam\Apps\<appid>\Depots\<depotid>   (per-depot)
-     *   - HKLM\Software\Valve\Steam\InstallScripts\<depotid>        (script tracker)
-     *
-     * We set `Installed=1` and `Run=1` across all of them. Writes go to
-     * `system.reg` (HKLM) via WineRegistryEditor. Idempotent: if a key
-     * already has the value, the editor short-circuits. Safe to fail — the
-     * worst outcome is that Steam runs the installer again (status quo).
+     * Mark the Steamworks Common Redistributables (228980) install scripts as
+     * already executed, so `steam.exe -applaunch` does not re-launch the bundled
+     * vcredist / DXSETUP installers on every boot (which can race the game's
+     * MSVC loader and steal window focus). Writes Installed=1/Run=1 under the
+     * HKLM keys Steam consults before invoking an InstallScript.
      */
     fun applySteamInstallScriptShim(context: Context, steamAppId: Int) {
         try {
             val imageFs = ImageFs.find(context)
             val systemRegFile = File(imageFs.wineprefix, "system.reg")
-            if (!systemRegFile.isFile) {
-                Timber.tag("SteamFix").w(
-                    "applySteamInstallScriptShim: system.reg missing at %s — skipping",
-                    systemRegFile.absolutePath,
-                )
-                return
-            }
+            if (!systemRegFile.isFile) return
 
             val appKeys = listOf(
                 "Software\\Valve\\Steam\\Apps\\228980",
@@ -330,8 +168,7 @@ object SteamUtils {
                 "Software\\Valve\\Steam\\Apps\\$steamAppId",
                 "Software\\Wow6432Node\\Valve\\Steam\\Apps\\$steamAppId",
             )
-            val depotIds = canonical228980Depots.map { it.id }
-            var writes = 0
+            val depotIds = sharedDepotInstallScripts.keys
 
             WineRegistryEditor(systemRegFile).use { reg ->
                 reg.setCreateKeyIfNotExist(true)
@@ -339,7 +176,6 @@ object SteamUtils {
                     reg.setDwordValue(key, "Installed", 1)
                     reg.setDwordValue(key, "Updating", 0)
                     reg.setDwordValue(key, "Running", 0)
-                    writes += 3
                 }
                 depotIds.forEach { depotId ->
                     val perDepotKeys = listOf(
@@ -353,18 +189,89 @@ object SteamUtils {
                     perDepotKeys.forEach { key ->
                         reg.setDwordValue(key, "Installed", 1)
                         reg.setDwordValue(key, "Run", 1)
-                        writes += 2
                     }
                 }
             }
-
-            Timber.tag("SteamFix").i(
-                "applySteamInstallScriptShim: wrote %d reg entries for appId=%d + 228980 (%d canonical depots)",
-                writes, steamAppId, depotIds.size,
-            )
         } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "applySteamInstallScriptShim failed for appId=%d", steamAppId)
+            Timber.w(e, "applySteamInstallScriptShim failed for appId=%d", steamAppId)
         }
+    }
+
+    // Hash-verify the steam_api DLL on disk against the pipe DLL shipped in assets.
+    // An interrupted launch can desync markers from reality (marker says REPLACED but
+    // the DLL is the game's original, or vice versa). Returns true if the marker's
+    // claim matches disk. Any IO/hash failure is treated as desync so we reheal.
+    private fun pipeDllHashes(context: Context): Map<String, String> {
+        val out = mutableMapOf<String, String>()
+        listOf("steam_api.dll", "steam_api64.dll").forEach { name ->
+            runCatching {
+                context.assets.open("steampipe/$name").use { ins ->
+                    out[name.lowercase()] = sha256OfStream(ins)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun verifyReplacedState(context: Context, appDirPath: String): Boolean {
+        return try {
+            val assetHashes = pipeDllHashes(context)
+            var found = false
+            Paths.get(appDirPath).toFile().walkTopDown().maxDepth(10).forEach { file ->
+                if (!file.isFile) return@forEach
+                val n = file.name.lowercase()
+                if (n == "steam_api.dll" || n == "steam_api64.dll") {
+                    found = true
+                    val expected = assetHashes[n] ?: return@forEach
+                    if (sha256OfFile(file) != expected) {
+                        Timber.w("DLL marker desync: %s hash mismatch (marker says REPLACED)", file.absolutePath)
+                        return false
+                    }
+                }
+            }
+            if (!found) {
+                Timber.w("DLL marker desync: no steam_api DLL found under %s but REPLACED marker present", appDirPath)
+                return false
+            }
+            true
+        } catch (e: Exception) {
+            Timber.w(e, "verifyReplacedState failed, treating as desync")
+            false
+        }
+    }
+
+    private fun verifyRestoredState(context: Context, appDirPath: String): Boolean {
+        return try {
+            val assetHashes = pipeDllHashes(context)
+            Paths.get(appDirPath).toFile().walkTopDown().maxDepth(10).forEach { file ->
+                if (!file.isFile) return@forEach
+                val n = file.name.lowercase()
+                if (n == "steam_api.dll" || n == "steam_api64.dll") {
+                    val pipeHash = assetHashes[n] ?: return@forEach
+                    if (sha256OfFile(file) == pipeHash) {
+                        Timber.w("DLL marker desync: %s is still the pipe DLL (marker says RESTORED)", file.absolutePath)
+                        return false
+                    }
+                }
+            }
+            true
+        } catch (e: Exception) {
+            Timber.w(e, "verifyRestoredState failed, treating as desync")
+            false
+        }
+    }
+
+    private fun sha256OfFile(file: File): String = file.inputStream().use { sha256OfStream(it) }
+
+    private fun sha256OfStream(input: java.io.InputStream): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(64 * 1024)
+        while (true) {
+            val n = input.read(buf)
+            if (n <= 0) break
+            md.update(buf, 0, n)
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
     }
 
     /**
@@ -374,13 +281,10 @@ object SteamUtils {
     suspend fun replaceSteamApi(context: Context, appId: String, isOffline: Boolean = false) {
         val steamAppId = ContainerUtils.extractGameIdFromContainerId(appId)
         val appDirPath = SteamService.getAppDirPath(steamAppId)
-        Timber.tag("SteamFix").i("replaceSteamApi: appId=%s dir=%s", appId, appDirPath)
         if (MarkerUtils.hasMarker(appDirPath, Marker.STEAM_DLL_REPLACED)) {
             if (verifyReplacedState(context, appDirPath)) {
-                Timber.tag("SteamFix").i("replaceSteamApi: marker + hash ok, skipping")
                 return
             }
-            Timber.tag("SteamFix").w("replaceSteamApi: clearing stale REPLACED marker and re-running swap")
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
         }
         MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
@@ -459,7 +363,6 @@ object SteamUtils {
         generateAchievementsFile(rootPath.resolve("steam_settings"), appId)
 
         MarkerUtils.addMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
-        logAppDirInventory(ContainerUtils.extractGameIdFromContainerId(appId), "replaceSteamApi.done")
     }
 
     /**
@@ -505,10 +408,9 @@ object SteamUtils {
         // Game-specific Handling
         ensureSaveLocationsForGames(context, steamAppId)
 
-        applySteamOverlayPref(context, container)
+        restoreLegacyStashedOverlayFiles(container)
 
         MarkerUtils.addMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED)
-        logAppDirInventory(steamAppId, "replaceSteamclientDll.done")
     }
 
     fun steamClientFiles() : Array<String> {
@@ -541,74 +443,28 @@ object SteamUtils {
         Timber.i("Finished backupSteamclientFiles for appId: $steamAppId. Backed up $backupCount file(s)")
     }
 
-    // Every Steam-overlay file a running game can pick up. Rename only the
-    // binaries — leave the Vulkan layer JSON manifests in place so Wine's
-    // Vulkan loader can parse them, discover the referenced DLL is missing,
-    // log a warning, and skip the layer cleanly. Renaming the JSONs instead
-    // can race with loader init and stall early Vulkan startup.
-    // GameOverlayUI.exe is the in-game UI host (inventory popup, shift-tab
-    // overlay) and is safe to stash.
-    private val steamOverlayFiles = arrayOf(
+    // Upgrade helper: a prior build disabled the Steam overlay by renaming
+    // overlay binaries (and Vulkan layer JSONs) to `.disabled`. The overlay
+    // disable is now done through Khronos env vars at launch time, so any
+    // leftover `.disabled` stashes need to be restored or the overlay stays
+    // broken even with the toggle off. Runs once per launch; a no-op once
+    // clean. Safe to delete after a release or two.
+    private val legacyStashedOverlayFiles = arrayOf(
         "GameOverlayRenderer.dll",
         "GameOverlayRenderer64.dll",
         "SteamOverlayVulkanLayer.dll",
         "SteamOverlayVulkanLayer64.dll",
         "GameOverlayUI.exe",
-    )
-
-    /**
-     * Apply the container's disableSteamOverlay setting. Rename-based: when
-     * enabled, stash overlay files with a `.disabled` suffix; when disabled,
-     * un-stash. Idempotent on both sides, and survives Steam's re-extraction
-     * of client files (a fresh client install won't touch the stashed copies).
-     * Stashes the D3D renderer DLLs, the Vulkan overlay layer DLLs, and the
-     * overlay UI process. Also restores any Vulkan layer manifest JSONs an
-     * older build had stashed (see legacyStashedFiles).
-     */
-    // Files an older build stashed that we no longer want to keep hidden.
-    // Always restore these if a `.disabled` copy exists — covers upgrade from
-    // the previous overlay-disable logic that renamed the Vulkan layer JSONs.
-    private val legacyStashedFiles = arrayOf(
         "SteamOverlayVulkanLayer.json",
         "SteamOverlayVulkanLayer64.json",
     )
 
-    fun applySteamOverlayPref(context: Context, container: com.winlator.container.Container) {
+    private fun restoreLegacyStashedOverlayFiles(container: com.winlator.container.Container) {
         val steamDir = File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam")
-
-        var legacyRestored = 0
-        legacyStashedFiles.forEach { name ->
+        legacyStashedOverlayFiles.forEach { name ->
             val live = File(steamDir, name)
-            val stashedFile = File(steamDir, "$name.disabled")
-            if (stashedFile.exists() && !live.exists()) {
-                if (stashedFile.renameTo(live)) legacyRestored++
-            }
-        }
-        if (legacyRestored > 0) {
-            Timber.tag("SteamFix").i("applySteamOverlayPref: restored %d legacy-stashed file(s)", legacyRestored)
-        }
-
-        if (container.isDisableSteamOverlay) {
-            var stashed = 0
-            steamOverlayFiles.forEach { name ->
-                val live = File(steamDir, name)
-                val stashedFile = File(steamDir, "$name.disabled")
-                if (live.exists()) {
-                    if (stashedFile.exists()) stashedFile.delete()
-                    if (live.renameTo(stashedFile)) stashed++
-                }
-            }
-            Timber.tag("SteamFix").i("applySteamOverlayPref: disabled, stashed %d overlay file(s)", stashed)
-        } else {
-            var restored = 0
-            steamOverlayFiles.forEach { name ->
-                val live = File(steamDir, name)
-                val stashedFile = File(steamDir, "$name.disabled")
-                if (stashedFile.exists() && !live.exists()) {
-                    if (stashedFile.renameTo(live)) restored++
-                }
-            }
-            if (restored > 0) Timber.tag("SteamFix").i("applySteamOverlayPref: enabled, restored %d overlay file(s)", restored)
+            val stashed = File(steamDir, "$name.disabled")
+            if (stashed.exists() && !live.exists()) stashed.renameTo(live)
         }
     }
 
@@ -679,95 +535,15 @@ object SteamUtils {
             """.trimIndent()
     }
 
-    /**
-     * Resolve the ColdClient-style path "steamapps\common\<gameName>\<exe>"
-     * case-insensitively against the on-disk Linux filesystem. Inner files may
-     * have been installed with different casing (Steam → on-disk) and Linux
-     * case-sensitivity turns what Windows treats as a match into a
-     * "file not found" error from ColdClientLoader.
-     *
-     * Returns the actual-casing relative path (using forward slashes) when all
-     * components exist on disk. Returns null when a component is missing,
-     * which is the "install is actually broken" case rather than a casing
-     * mismatch. Logs at SteamFix level when casing differs so the logcat shows
-     * exactly which component was wrong.
-     */
-    internal fun resolveOnDiskCasing(
-        steamDir: File,
-        gameName: String,
-        executablePath: String,
-    ): String? {
-        val relComponents = buildList {
-            add("steamapps")
-            add("common")
-            add(gameName)
-            executablePath.replace("\\", "/").split("/").filter { it.isNotEmpty() }.forEach { add(it) }
-        }
-        var cursor: File = steamDir
-        val resolved = mutableListOf<String>()
-        for ((idx, requested) in relComponents.withIndex()) {
-            val exact = File(cursor, requested)
-            val child: File? = if (exact.exists()) {
-                exact
-            } else {
-                cursor.listFiles()?.firstOrNull { it.name.equals(requested, ignoreCase = true) }
-            }
-            if (child == null) {
-                Timber.tag("SteamFix").w(
-                    "ColdClient exe resolve MISS: component %d (%s) not found under %s. siblings=%s",
-                    idx, requested, cursor.absolutePath,
-                    cursor.listFiles()?.joinToString(", ") { it.name } ?: "<unreadable>",
-                )
-                return null
-            }
-            if (child.name != requested) {
-                Timber.tag("SteamFix").w(
-                    "ColdClient exe resolve CASE MISMATCH: requested '%s' on-disk '%s' at depth %d (%s)",
-                    requested, child.name, idx, cursor.absolutePath,
-                )
-            }
-            resolved += child.name
-            cursor = child
-        }
-        return resolved.joinToString("/")
-    }
-
     internal fun writeColdClientIni(steamAppId: Int, container: Container, launchInfo: LaunchInfo? = null) {
         val gameName = getAppDirName(getAppInfoOf(steamAppId))
         val workingDir = launchInfo?.workingDir
         val iniFile = File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam/ColdClientLoader.ini")
         iniFile.parentFile?.mkdirs()
-
-        // SteamFix: resolve the "steamapps\common\<gameName>\<exe>" path against
-        // the actual on-disk filesystem before we bake it into the INI. If any
-        // component's casing differs we log it; if the exe is genuinely missing
-        // we still write the INI (so ColdClient's own error surfaces as before)
-        // but the logcat now shows exactly which path component went wrong.
-        val steamDir = File(container.getRootDir(), ".wine/drive_c/Program Files (x86)/Steam")
-        val resolved = resolveOnDiskCasing(steamDir, gameName, container.executablePath)
-        val (effectiveGameName, effectiveExe) = if (resolved != null) {
-            val parts = resolved.split("/")
-            // Components 0,1 are steamapps/common; 2 is gameName; rest is exe path.
-            val diskGameName = parts.getOrNull(2) ?: gameName
-            val diskExe = parts.drop(3).joinToString("/")
-            if (diskGameName != gameName || diskExe.replace("/", "\\") != container.executablePath.replace("/", "\\")) {
-                Timber.tag("SteamFix").i(
-                    "ColdClient INI using on-disk casing: gameName='%s' (requested '%s'), exe='%s' (requested '%s')",
-                    diskGameName, gameName, diskExe, container.executablePath,
-                )
-            }
-            diskGameName to diskExe
-        } else {
-            Timber.tag("SteamFix").w(
-                "ColdClient INI: falling back to requested casing because resolve failed. ColdClientLoader will likely report 'couldn't find the requested exe file'.",
-            )
-            gameName to container.executablePath
-        }
-
         iniFile.writeText(
             generateColdClientIni(
-                gameName = effectiveGameName,
-                executablePath = effectiveExe,
+                gameName = gameName,
+                executablePath = container.executablePath,
                 exeCommandLine = container.execArgs,
                 steamAppId = steamAppId,
                 workingDir = workingDir,
@@ -934,10 +710,9 @@ object SteamUtils {
      */
     private fun createAppManifest(context: Context, steamAppId: Int) {
         try {
-            Timber.tag("SteamFix").i("createAppManifest: begin for appId=$steamAppId")
             val appInfo = SteamService.getAppInfoOf(steamAppId)
             if (appInfo == null) {
-                Timber.tag("SteamFix").w("createAppManifest ABORT: no SteamApp info for appId=$steamAppId. Steam will treat the game as not installed and gray out Play.")
+                Timber.w("createAppManifest: no SteamApp info for appId=$steamAppId — Steam will gray Play")
                 return
             }
 
@@ -964,12 +739,6 @@ object SteamUtils {
             // the game up via steamapps/common/<installdir>, NOT the on-disk folder
             // name, so the primary symlink must match the manifest's installdir.
             val actualInstallDir = appInfo.config.installDir.ifEmpty { gameName }
-            Timber.tag("SteamFix").i(
-                "createAppManifest: installDir pre-check appId=%d appInfo.installDir='%s' gameDir.name='%s' actualInstallDir='%s' match=%s",
-                steamAppId, appInfo.config.installDir, gameName, actualInstallDir,
-                appInfo.config.installDir.equals(gameName, ignoreCase = false),
-            )
-
             val primaryLink = File(commonDir, actualInstallDir)
             createSteamCommonLink(primaryLink, gameDir)
             // Keep a fallback alias under the on-disk folder name for code paths
@@ -977,23 +746,11 @@ object SteamUtils {
             if (actualInstallDir != gameName) {
                 createSteamCommonLink(File(commonDir, gameName), gameDir)
             }
-            try {
-                val linkPath = primaryLink.toPath()
-                val isSymlink = java.nio.file.Files.isSymbolicLink(linkPath)
-                val targetReadback = if (isSymlink) java.nio.file.Files.readSymbolicLink(linkPath).toString() else "(not a symlink)"
-                val targetExists = primaryLink.exists()
-                Timber.tag("SteamFix").i(
-                    "createAppManifest: symlink readback appId=%d link=%s isSymlink=%s target=%s resolvedExists=%s",
-                    steamAppId, primaryLink.absolutePath, isSymlink, targetReadback, targetExists,
-                )
-            } catch (e: Exception) {
-                Timber.tag("SteamFix").w(e, "createAppManifest: symlink readback failed for %s", primaryLink.absolutePath)
-            }
 
             val installedBranch = SteamService.getInstalledApp(steamAppId)?.branch ?: "public"
             val buildId = (appInfo.branches[installedBranch] ?: appInfo.branches["public"])?.buildId ?: 0L
             if (buildId == 0L) {
-                Timber.tag("SteamFix").w("createAppManifest ABORT: appId=$steamAppId buildid unresolvable (branch=$installedBranch, known branches=${appInfo.branches.keys}). Zero buildid makes Steam force an update and gray out Play.")
+                Timber.w("createAppManifest: unresolvable buildid for appId=$steamAppId branch=$installedBranch")
                 return
             }
             val downloadableDepots = SteamService.getDownloadableDepots(steamAppId)
@@ -1020,7 +777,7 @@ object SteamUtils {
             // non-existent user, which is one of the stalls that leaves Play disabled.
             val lastOwner = SteamService.userSteamId?.convertToUInt64()?.toString() ?: "0"
             if (lastOwner == "0") {
-                Timber.tag("SteamFix").w("createAppManifest WARN: appId=$steamAppId LastOwner=0 — no signed-in SteamID. Cloud sync and ownership checks may stall.")
+                Timber.w("createAppManifest: appId=$steamAppId LastOwner=0 (no signed-in SteamID) — cloud/ownership checks may stall")
             }
 
             // Pre-resolve depot manifests so we can bail before writing a broken ACF.
@@ -1031,49 +788,27 @@ object SteamUtils {
             }
             val brokenDepotIds = regularDepotManifests.filter { (_, m) -> m == null || m.gid == 0L }.keys
             if (brokenDepotIds.isNotEmpty()) {
-                Timber.tag("SteamFix").w("createAppManifest ABORT: appId=$steamAppId depot(s) $brokenDepotIds have no resolvable manifest GID for branch=$installedBranch. Zero depot GID triggers Steam's 'Update Required' loop and disables Play.")
+                Timber.w("createAppManifest: appId=$steamAppId depot(s) $brokenDepotIds have no resolvable manifest GID for branch=$installedBranch — skipping (would trigger Update Required)")
                 return
             }
 
-            // SteamFix #28: if PICS gave us depots but none resolved with a GID, every
-            // game-declared depot landed in `sharedDepots` and our ACF would be written
-            // with an empty InstalledDepots block — Steam then flips Update Required
-            // on the game itself. Bail out instead of overwriting a previously-good acf.
+            // If PICS returned no resolvable regular depots, don't overwrite a previously-good
+            // acf with an empty InstalledDepots block (Steam would flip Update Required on it).
             if (regularDepots.isEmpty()) {
                 val existing = File(steamappsDir, "appmanifest_$steamAppId.acf")
                 val existingBuildId = if (existing.isFile) parseAcfBuildId(existing) else 0L
                 val existingDepotCount = if (existing.isFile) parseAcfInstalledDepotIds(existing).size else 0
                 val hasValidExisting = existing.isFile && existingBuildId > 0L && existingDepotCount > 0
-                if (hasValidExisting) {
-                    // Transient PICS flake (partial depot list). The existing acf is
-                    // structurally sound and will continue to serve Steam — quiet info,
-                    // not a scary warn.
-                    Timber.tag("SteamFix").i(
-                        "createAppManifest: PICS returned empty regularDepots for appId=%d (downloadable=%s shared=%s). Existing acf is valid (buildid=%d, %d depots); keeping.",
-                        steamAppId, downloadableDepots.keys, sharedDepots.keys, existingBuildId, existingDepotCount,
-                    )
-                } else {
-                    Timber.tag("SteamFix").w(
-                        "createAppManifest ABORT: appId=%d regularDepots empty (downloadableDepots=%s sharedDepots=%s branch=%s) and no valid existing acf=%s (exists=%s). Steam will likely gray Play until PICS returns full data.",
+                if (!hasValidExisting) {
+                    Timber.w(
+                        "createAppManifest: appId=%d has no regular depots and no valid existing acf — Steam will likely gray Play until PICS returns full data",
                         steamAppId,
-                        downloadableDepots.keys,
-                        sharedDepots.keys,
-                        installedBranch,
-                        existing.absolutePath,
-                        existing.exists(),
                     )
                 }
-                // Still write 228980's manifest — it's independent of the child's
-                // state and we just resolved fresh GIDs for it.
-                writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner)
+                // Still refresh 228980's manifest — it's independent of the child's state.
+                writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
                 return
             }
-
-            Timber.tag("SteamFix").i(
-                "createAppManifest: appId=%d branch=%s downloadableDepots=%s regular=%s shared=%s buildid=%d",
-                steamAppId, installedBranch,
-                downloadableDepots.keys, regularDepots.keys, sharedDepots.keys, buildId,
-            )
 
             // Create ACF content
             val acfContent = buildString {
@@ -1082,21 +817,16 @@ object SteamUtils {
                 appendLine("\t\"appid\"\t\t\"$steamAppId\"")
                 appendLine("\t\"Universe\"\t\t\"1\"")
                 appendLine("\t\"name\"\t\t\"${escapeString(appInfo.name)}\"")
-                // StateFlags = 4 = fully installed. SteamFix: we intentionally do not
-                // set 2 (update required) / 8 (update pending) / 16 (validating) — if
-                // Steam thinks an update is needed, it will flip these bits itself on
-                // next launch; we just don't claim authority over them.
+                // StateFlags = 4 (fully installed). Deliberately omit 2/8/16 — Steam
+                // flips those itself if it decides an update is needed.
                 appendLine("\t\"StateFlags\"\t\t\"4\"")
                 appendLine("\t\"LastUpdated\"\t\t\"${System.currentTimeMillis() / 1000}\"")
                 appendLine("\t\"SizeOnDisk\"\t\t\"$sizeOnDisk\"")
                 appendLine("\t\"buildid\"\t\t\"$buildId\"")
-                // SteamFix #14: TargetBuildID matches buildid so Steam doesn't think
-                // it's mid-update. UpdateResult "0" = last update succeeded.
+                // TargetBuildID = buildId and UpdateResult=0 so Steam doesn't think it's mid-update.
                 appendLine("\t\"TargetBuildID\"\t\t\"$buildId\"")
                 appendLine("\t\"UpdateResult\"\t\t\"0\"")
                 appendLine("\t\"AppType\"\t\t\"Game\"")
-                // SteamFix #26: write branch so invalidate-on-branch-change is
-                // observable in logcat and so Steam reflects the selected branch.
                 appendLine("\t\"betakey\"\t\t\"${if (installedBranch == "public") "" else escapeString(installedBranch)}\"")
 
                 appendLine("\t\"installdir\"\t\t\"${escapeString(actualInstallDir)}\"")
@@ -1141,13 +871,9 @@ object SteamUtils {
                     appendLine("\t}")
                 }
 
-                // SteamFix #13: cloud_enabled="0" is a deliberate choice (Option B).
-                // GameNative already runs SteamAutoCloud.syncUserFiles around every
-                // launch with a signed JWT, so letting the Wine-hosted Steam client
-                // also sync would race and occasionally blow away saves. Leaving it
-                // disabled here is what keeps the ON toggle from corrupting data.
-                // If we ever expose a user-facing "let real Steam manage cloud"
-                // setting, this line becomes the toggle point.
+                // cloud_enabled="0" deliberately: GameNative already runs SteamAutoCloud.syncUserFiles
+                // around every launch, and letting the Wine-hosted Steam client also sync races it
+                // and occasionally blows away saves.
                 appendLine("\t\"UserConfig\"")
                 appendLine("\t{")
                 appendLine("\t\t\"language\"\t\t\"english\"")
@@ -1163,148 +889,153 @@ object SteamUtils {
             val acfFile = File(steamappsDir, "appmanifest_$steamAppId.acf")
             acfFile.writeText(acfContent)
 
-            Timber.tag("SteamFix").i("createAppManifest OK: appId=$steamAppId name=${appInfo.name} installdir=$actualInstallDir buildid=$buildId branch=$installedBranch depots=${regularDepots.keys}")
-
-            // SteamFix #27: always write a real appmanifest_228980.acf for Steamworks
-            // Common Redistributables. The dependency is declared server-side in
-            // Steam's PICS metadata, not in the child game's own depot list, so
-            // `sharedDepots` on the child is empty for affected games (e.g. Shiren).
-            // Without a valid 228980 manifest, Steam flips "Update Required" on the
-            // shared dep, queues a download it can't complete, and leaves the child
-            // stuck in "Update Queued" — which presents as a gray Play button.
+            // Always write a real appmanifest_228980.acf for Steamworks Common
+            // Redistributables — Steam's PICS metadata declares this dependency
+            // server-side (not in the child's depot list), and without a valid
+            // 228980 manifest the child gets stuck in Update Queued / gray Play.
             // writeSteamworksCommonManifest is a no-op if PICS has no AppInfo for 228980.
-            writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner)
+            writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
+
+            // Self-check: assert the acfs we just wrote are in the shape that
+            // avoids gray Play. Catches silent regressions in the writers + any
+            // case where Steam immediately rewrites the file between our write
+            // and the next launch.
+            validateAcfShape(acfFile, expectDepotCount = regularDepots.size, label = "child $steamAppId")
+            if (sharedDepots.isNotEmpty()) {
+                validateAcfShape(
+                    File(steamappsDir, "appmanifest_228980.acf"),
+                    expectDepotCount = -1,
+                    label = "shared 228980",
+                )
+            }
 
         } catch (e: Exception) {
             Timber.e(e, "Failed to create ACF manifest for appId $steamAppId")
         }
     }
 
-    private data class CanonicalDepot(
+    private data class ResolvedSharedDepot(
         val id: Int,
         val manifestGid: Long,
         val size: Long,
         val installScript: String,
     )
 
-    // Buildid + depot GIDs sourced verbatim from a canonical PC install of 228980.
-    // Steam treats a manifest with this exact shape as "nothing to do" — no
-    // reconfigure, no "config changed : removed depots", no scheduler backoff.
-    private val canonical228980Depots: List<CanonicalDepot> = listOf(
-        CanonicalDepot(228981, 7613356809904826842L, 5884085L,   "_CommonRedist\\\\vcredist\\\\2005\\\\installscript.vdf"),
-        CanonicalDepot(228982, 6413394087650432851L, 9688647L,   "_CommonRedist\\\\vcredist\\\\2008\\\\installscript.vdf"),
-        CanonicalDepot(228983, 8124929965194586177L, 19265607L,  "_CommonRedist\\\\vcredist\\\\2010\\\\installscript.vdf"),
-        CanonicalDepot(228984, 2547553897526095397L, 13742505L,  "_CommonRedist\\\\vcredist\\\\2012\\\\installscript.vdf"),
-        CanonicalDepot(228985, 3966345552745568756L, 13699237L,  "_CommonRedist\\\\vcredist\\\\2013\\\\installscript.vdf"),
-        CanonicalDepot(228986, 8782296191957114623L, 29759921L,  "_CommonRedist\\\\vcredist\\\\2015\\\\installscript.vdf"),
-        CanonicalDepot(228987, 4302102680580581867L, 29664201L,  "_CommonRedist\\\\vcredist\\\\2017\\\\installscript.vdf"),
-        CanonicalDepot(228988, 6645201662696499616L, 29212173L,  "_CommonRedist\\\\vcredist\\\\2019\\\\installscript.vdf"),
-        CanonicalDepot(228989, 3514306556860204959L, 39590283L,  "_CommonRedist\\\\vcredist\\\\2022\\\\installscript.vdf"),
-        CanonicalDepot(228990, 1829726630299308803L, 102931551L, "_CommonRedist\\\\DirectX\\\\Jun2010\\\\installscript.vdf"),
-        CanonicalDepot(229000, 4622705914179893434L, 242743889L, "_CommonRedist\\\\DotNet\\\\3.5\\\\installscript.vdf"),
-        CanonicalDepot(229001, 4049573910112143457L, 267964564L, "_CommonRedist\\\\DotNet\\\\3.5 Client Profile\\\\installscript.vdf"),
-        CanonicalDepot(229002, 7260605429366465749L, 50450161L,  "_CommonRedist\\\\DotNet\\\\4.0\\\\installscript.vdf"),
-        CanonicalDepot(229003, 8740933542064151477L, 43001447L,  "_CommonRedist\\\\DotNet\\\\4.0 Client Profile\\\\installscript.vdf"),
-        CanonicalDepot(229004, 5220958916987797232L, 70000464L,  "_CommonRedist\\\\DotNet\\\\4.5.2\\\\installscript.vdf"),
-        CanonicalDepot(229005, 7992454656023763365L, 62009092L,  "_CommonRedist\\\\DotNet\\\\4.6\\\\installscript.vdf"),
-        CanonicalDepot(229006, 1784011429307107530L, 83944258L,  "_CommonRedist\\\\DotNet\\\\4.7\\\\installscript.vdf"),
-        CanonicalDepot(229007, 4477590687906973371L, 117381405L, "_CommonRedist\\\\DotNet\\\\4.8\\\\installscript.vdf"),
-        CanonicalDepot(229011, 392351049714934122L,  7672416L,   "_CommonRedist\\\\XNA\\\\3.1\\\\installscript.vdf"),
-        CanonicalDepot(229012, 4353723233161159493L, 7061608L,   "_CommonRedist\\\\XNA\\\\4.0\\\\installscript.vdf"),
-        CanonicalDepot(229020, 5799761707845834510L, 810085L,    "_CommonRedist\\\\OpenAL\\\\2.0.7.0\\\\installscript.vdf"),
-        CanonicalDepot(229030, 1043465440436835055L, 51790718L,  "_CommonRedist\\\\PhysX\\\\8.09.04\\\\installscript.vdf"),
-        CanonicalDepot(229031, 7746630274301172884L, 26729083L,  "_CommonRedist\\\\PhysX\\\\9.12.1031\\\\installscript.vdf"),
-        CanonicalDepot(229032, 3616495131483866412L, 41178235L,  "_CommonRedist\\\\PhysX\\\\9.13.1220\\\\installscript.vdf"),
+    // Static installscript paths by depot id — Steam convention, stable across
+    // PICS churn. Only used to populate the acf's InstallScripts block; manifest
+    // GID / size are always pulled from PICS at runtime. Missing entries here
+    // just mean the depot is included in InstalledDepots without an
+    // InstallScripts mapping, which is fine because applySteamInstallScriptShim
+    // writes HKLM registry keys that mark every installscript Run=1 anyway.
+    private val sharedDepotInstallScripts: Map<Int, String> = mapOf(
+        228981 to "_CommonRedist\\\\vcredist\\\\2005\\\\installscript.vdf",
+        228982 to "_CommonRedist\\\\vcredist\\\\2008\\\\installscript.vdf",
+        228983 to "_CommonRedist\\\\vcredist\\\\2010\\\\installscript.vdf",
+        228984 to "_CommonRedist\\\\vcredist\\\\2012\\\\installscript.vdf",
+        228985 to "_CommonRedist\\\\vcredist\\\\2013\\\\installscript.vdf",
+        228986 to "_CommonRedist\\\\vcredist\\\\2015\\\\installscript.vdf",
+        228987 to "_CommonRedist\\\\vcredist\\\\2017\\\\installscript.vdf",
+        228988 to "_CommonRedist\\\\vcredist\\\\2019\\\\installscript.vdf",
+        228989 to "_CommonRedist\\\\vcredist\\\\2022\\\\installscript.vdf",
+        228990 to "_CommonRedist\\\\DirectX\\\\Jun2010\\\\installscript.vdf",
+        229000 to "_CommonRedist\\\\DotNet\\\\3.5\\\\installscript.vdf",
+        229001 to "_CommonRedist\\\\DotNet\\\\3.5 Client Profile\\\\installscript.vdf",
+        229002 to "_CommonRedist\\\\DotNet\\\\4.0\\\\installscript.vdf",
+        229003 to "_CommonRedist\\\\DotNet\\\\4.0 Client Profile\\\\installscript.vdf",
+        229004 to "_CommonRedist\\\\DotNet\\\\4.5.2\\\\installscript.vdf",
+        229005 to "_CommonRedist\\\\DotNet\\\\4.6\\\\installscript.vdf",
+        229006 to "_CommonRedist\\\\DotNet\\\\4.7\\\\installscript.vdf",
+        229007 to "_CommonRedist\\\\DotNet\\\\4.8\\\\installscript.vdf",
+        229011 to "_CommonRedist\\\\XNA\\\\3.1\\\\installscript.vdf",
+        229012 to "_CommonRedist\\\\XNA\\\\4.0\\\\installscript.vdf",
+        229020 to "_CommonRedist\\\\OpenAL\\\\2.0.7.0\\\\installscript.vdf",
+        229030 to "_CommonRedist\\\\PhysX\\\\8.09.04\\\\installscript.vdf",
+        229031 to "_CommonRedist\\\\PhysX\\\\9.12.1031\\\\installscript.vdf",
+        229032 to "_CommonRedist\\\\PhysX\\\\9.13.1220\\\\installscript.vdf",
     )
 
-    private val canonical228980BuildId = 19222509L
+    // Resolve the depots that 228980 owns for this child by intersecting the
+    // child's PICS-declared SharedDepots with 228980's own PICS depot list,
+    // pulling manifest GID + size from PICS. This replaces the old approach of
+    // hardcoding a depot table and filtering by installscript.vdf presence —
+    // that broke for games (DD, others) that ship a half-empty _CommonRedist.
+    private fun resolveSharedDepotsForChild(
+        sharedAppId: Int,
+        childSharedDepotIds: Set<Int>,
+    ): List<ResolvedSharedDepot> {
+        val sharedAppInfo = SteamService.getAppInfoOf(sharedAppId) ?: return emptyList()
+        return childSharedDepotIds.mapNotNull { depotId ->
+            val depot = sharedAppInfo.depots[depotId] ?: return@mapNotNull null
+            val manifest = depot.manifests["public"]
+                ?: depot.manifests.values.firstOrNull()
+                ?: return@mapNotNull null
+            if (manifest.gid == 0L) return@mapNotNull null
+            ResolvedSharedDepot(
+                id = depotId,
+                manifestGid = manifest.gid,
+                size = manifest.size,
+                installScript = sharedDepotInstallScripts[depotId] ?: "",
+            )
+        }
+    }
 
     /**
-     * SteamFix #35: write a canonical appmanifest_228980.acf that mirrors the
-     * exact shape Steam writes on a real PC after a clean commit — all 24
-     * Steamworks-Common-Redist depots, matching InstallScripts block, PC-
-     * matching byte counters. Steam treats this as "nothing to do" on every
-     * launch regardless of which child game is launching, breaking the
-     * per-launch "Updating…" loop we saw with per-game filtered subsets.
-     *
-     * Background: earlier approaches (SteamFix #31/33/34) wrote only the
-     * depot subset the currently-launching game declared via
-     * `DepotInfo.depotFromApp == 228980`. Steam's in-memory mount state
-     * tracks what it last satisfied; since we SIGKILL the wine prefix on
-     * Exit Game (GuestProgramLauncherComponent.java:74), Steam never flushes
-     * its post-reconfigure view to disk. Next boot: disk ≠ memory →
-     * reconfigure → "Updating Steamworks Common…" window → gray Play.
-     * The canonical baseline removes the mismatch surface entirely.
+     * Write appmanifest_228980.acf for Steamworks Common Redistributables
+     * declaring exactly the depots whose installscript.vdf is present on disk.
+     * This "0 bytes to download" shape makes Steam's reconcile a ~1s no-op; an
+     * empty or mismatched manifest otherwise leaves 228980 stuck in Update
+     * Queued and cascades gray Play onto the child game.
      */
     private fun writeSteamworksCommonManifest(
         steamappsDir: File,
         commonDir: File,
         lastOwner: String,
+        childSharedDepotIds: Set<Int> = emptySet(),
     ) {
         val sharedAppId = 228980
         val staleAcf = File(steamappsDir, "appmanifest_$sharedAppId.acf")
         val sharedAppInfo = SteamService.getAppInfoOf(sharedAppId)
         if (sharedAppInfo == null) {
-            if (staleAcf.exists() && staleAcf.delete()) {
-                Timber.tag("SteamFix").i(
-                    "writeSteamworksCommonManifest: removed stale %s (no PICS info for 228980)",
-                    staleAcf.absolutePath,
-                )
-            }
-            Timber.tag("SteamFix").w(
-                "writeSteamworksCommonManifest ABORT: PICS has no AppInfo for 228980 — " +
-                    "Steam will queue 228980 for update and gray out Play for the child game."
-            )
+            if (staleAcf.exists()) staleAcf.delete()
+            Timber.w("writeSteamworksCommonManifest: PICS has no AppInfo for 228980 — Steam will gray Play")
             return
         }
 
         val sharedBuildId = sharedAppInfo.branches["public"]?.buildId
             ?: sharedAppInfo.branches.values.firstOrNull()?.buildId
-            ?: canonical228980BuildId
+            ?: 0L
+        if (sharedBuildId == 0L) {
+            Timber.w("writeSteamworksCommonManifest: 228980 PICS has no buildid — skipping")
+            return
+        }
 
-        // Declare only the depots whose `installscript.vdf` is present on
-        // disk. An empty manifest made Steam say
-        // `update prefetch finished : 52086224 bytes to download` and try to
-        // download the missing content — the download gets suspended mid-run
-        // and leaves 228980 `Suspended`, which cascades `Update Queued` onto
-        // the child indefinitely. The 2-depot present-only shape has
-        // `0 bytes to download`, so Steam's reconcile is a ~1-second no-op.
-        // Matches the shape Steam itself writes after its first successful
-        // reconcile.
-        val sharedRedistDirForSkip = File(commonDir, "Steamworks Shared")
-        val presentDepots = canonical228980Depots.filter { d ->
-            File(sharedRedistDirForSkip, d.installScript.replace("\\\\", "/").replace("\\", "/")).isFile
+        // Source-of-truth: PICS. Resolve exactly the depots this child declared
+        // as owned by 228980, pulling manifest GIDs + sizes from PICS itself.
+        // No dependency on installscript.vdf files on disk — that's what
+        // trapped us in the empty-InstalledDepots → gray Play state for games
+        // like DD that ship a half-empty _CommonRedist skeleton.
+        val presentDepots = resolveSharedDepotsForChild(sharedAppId, childSharedDepotIds)
+        if (presentDepots.isEmpty()) {
+            if (staleAcf.exists()) staleAcf.delete()
+            Timber.w(
+                "writeSteamworksCommonManifest: no 228980 depots resolvable from PICS for child shared=%s — deleting stale acf",
+                childSharedDepotIds,
+            )
+            return
         }
         val presentDepotIds = presentDepots.map { it.id }.toSet()
+        val presentScriptDepotIds = presentDepots.filter { it.installScript.isNotEmpty() }.map { it.id }.toSet()
         if (staleAcf.isFile) {
             val existingBuildId = parseAcfBuildId(staleAcf)
             val existingDepots = parseAcfInstalledDepotIds(staleAcf)
             val existingScripts = parseAcfInstallScriptDepotIds(staleAcf)
             val depotsMatch = existingDepots == presentDepotIds
             val buildIdMatch = existingBuildId == sharedBuildId
-            val scriptsMatch = existingScripts == presentDepotIds
+            val scriptsMatch = existingScripts == presentScriptDepotIds
             if (depotsMatch && buildIdMatch && scriptsMatch) {
                 val updateResult = parseAcfUpdateResult(staleAcf)
-                if (updateResult == 0L) {
-                    Timber.tag("SteamFix").i(
-                        "writeSteamworksCommonManifest SKIP: %s matches present-depot baseline (buildid=%d, %d depots, UpdateResult=0)",
-                        staleAcf.absolutePath, sharedBuildId, presentDepotIds.size,
-                    )
-                    return
-                }
-                if (staleAcf.delete()) {
-                    Timber.tag("SteamFix").w(
-                        "writeSteamworksCommonManifest: deleted present-shaped %s with UpdateResult=%d; rewriting",
-                        staleAcf.absolutePath, updateResult,
-                    )
-                }
-            } else {
-                Timber.tag("SteamFix").i(
-                    "writeSteamworksCommonManifest: existing %s differs from present baseline (buildid=%d vs %d, %d vs %d depots, %d vs %d scripts); rewriting",
-                    staleAcf.absolutePath, existingBuildId, sharedBuildId,
-                    existingDepots.size, presentDepotIds.size,
-                    existingScripts.size, presentDepotIds.size,
-                )
+                if (updateResult == 0L) return
+                staleAcf.delete()
             }
         }
 
@@ -1356,7 +1087,7 @@ object SteamUtils {
 
             appendLine("\t\"InstallScripts\"")
             appendLine("\t{")
-            presentDepots.forEach { d ->
+            presentDepots.filter { it.installScript.isNotEmpty() }.forEach { d ->
                 appendLine("\t\t\"${d.id}\"\t\t\"${d.installScript}\"")
             }
             appendLine("\t}")
@@ -1373,11 +1104,6 @@ object SteamUtils {
         }
 
         staleAcf.writeText(acfContent)
-
-        Timber.tag("SteamFix").i(
-            "writeSteamworksCommonManifest OK: wrote present-depot %s buildid=%d (%d depots) lastOwner=%s",
-            staleAcf.absolutePath, sharedBuildId, presentDepots.size, lastOwner,
-        )
     }
 
     private fun escapeString(input: String?): String {
@@ -1472,38 +1198,48 @@ object SteamUtils {
         }
     }
 
-    /**
-     * SteamFix #12: Create a link for `steamapps/common/<installdir>`. Try
-     * NIO `createSymbolicLink` first, then fall back to a junction-style
-     * directory with a sentinel (if the underlying filesystem rejects
-     * symlinks — some Android external storage mounts do). We log loudly
-     * so this shows up as a breadcrumb rather than a silent launch failure.
-     */
+    private val acfStateFlagsRegex = Regex("\"StateFlags\"\\s*\"(\\d+)\"")
+    private val acfBytesToDownloadRegex = Regex("\"BytesToDownload\"\\s*\"(\\d+)\"")
+
+    // Post-write self-check. Flags the known-bad shapes that cause gray Play:
+    //  - missing file
+    //  - StateFlags has Update Required (bit 2) set
+    //  - BytesToDownload > 0 (Steam thinks it needs to fetch something)
+    //  - InstalledDepots block empty (unless the caller explicitly expects 0)
+    // Logs ERROR instead of throwing so a regression is visible in logcat
+    // without breaking the launch flow — the launch was already going to fail
+    // at the gray Play step anyway, and a loud ERROR beats a silent hang.
+    private fun validateAcfShape(acf: File, expectDepotCount: Int, label: String) {
+        if (!acf.isFile) {
+            Timber.e("ACF self-check FAIL [%s]: %s missing after write", label, acf.absolutePath)
+            return
+        }
+        val text = runCatching { acf.readText() }.getOrNull()
+        if (text == null) {
+            Timber.e("ACF self-check FAIL [%s]: %s unreadable", label, acf.absolutePath)
+            return
+        }
+        val stateFlags = acfStateFlagsRegex.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: -1L
+        val bytesToDownload = acfBytesToDownloadRegex.find(text)?.groupValues?.get(1)?.toLongOrNull() ?: -1L
+        val installedDepots = parseAcfInstalledDepotIds(acf)
+        val problems = mutableListOf<String>()
+        if (stateFlags < 0) problems += "StateFlags missing"
+        else if (stateFlags and 0x2L != 0L) problems += "StateFlags=$stateFlags has Update Required bit"
+        if (bytesToDownload > 0L) problems += "BytesToDownload=$bytesToDownload"
+        if (expectDepotCount >= 0 && installedDepots.size != expectDepotCount) {
+            problems += "InstalledDepots count=${installedDepots.size} expected=$expectDepotCount"
+        } else if (expectDepotCount < 0 && installedDepots.isEmpty()) {
+            problems += "InstalledDepots empty"
+        }
+        if (problems.isNotEmpty()) {
+            Timber.e("ACF self-check FAIL [%s] %s: %s", label, acf.name, problems.joinToString("; "))
+        }
+    }
+
     private fun createSteamCommonLink(link: File, target: File) {
-        if (link.exists()) {
-            Timber.tag("SteamFix").d("common link already present: %s", link.absolutePath)
-            return
-        }
-        val parent = link.parentFile
-        if (parent != null && !parent.exists()) parent.mkdirs()
-        try {
-            Files.createSymbolicLink(link.toPath(), target.toPath())
-            Timber.tag("SteamFix").i("created symlink %s -> %s", link.absolutePath, target.absolutePath)
-            return
-        } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "createSymbolicLink failed for %s, falling back to directory + redirect file", link.absolutePath)
-        }
-        // Fallback: create a real directory containing a sentinel file so Steam at least
-        // sees the folder exist. This won't let Steam find the EXE, but it prevents a
-        // null-dir crash and gives us a diagnostic marker to search for in logcat.
-        try {
-            if (link.mkdirs()) {
-                File(link, ".steamfix_symlink_failed").writeText(target.absolutePath)
-                Timber.tag("SteamFix").w("wrote fallback dir+sentinel at %s (pointing to %s)", link.absolutePath, target.absolutePath)
-            }
-        } catch (e2: Exception) {
-            Timber.tag("SteamFix").e(e2, "fallback directory creation failed for %s", link.absolutePath)
-        }
+        if (link.exists()) return
+        link.parentFile?.mkdirs()
+        Files.createSymbolicLink(link.toPath(), target.toPath())
     }
 
     private fun calculateDirectorySize(directory: File): Long {
@@ -1530,8 +1266,6 @@ object SteamUtils {
      * if they exist. Does not error if backup files are not found.
      */
     fun restoreSteamApi(context: Context, appId: String) {
-
-        Timber.tag("SteamFix").i("restoreSteamApi starting for appId=%s", appId)
         val steamAppId = ContainerUtils.extractGameIdFromContainerId(appId)
         val imageFs = ImageFs.find(context)
         val container = ContainerUtils.getOrCreateContainer(context, appId)
@@ -1548,83 +1282,35 @@ object SteamUtils {
         skipFirstTimeSteamSetup(imageFs.rootDir)
         val appDirPath = SteamService.getAppDirPath(steamAppId)
 
-        val needsDllRestore = if (MarkerUtils.hasMarker(appDirPath, Marker.STEAM_DLL_RESTORED)) {
-            if (verifyRestoredState(context, appDirPath)) {
-                Timber.tag("SteamFix").i("restoreSteamApi: DLL marker + hash ok, skipping DLL copy")
-                false
-            } else {
-                Timber.tag("SteamFix").w("restoreSteamApi: clearing stale RESTORED marker and re-running restore")
-                MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
-                true
-            }
-        } else true
-
-        if (needsDllRestore) {
+        val restoredMarkerPresent = MarkerUtils.hasMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
+        val needsRestore = !restoredMarkerPresent || !verifyRestoredState(context, appDirPath)
+        if (needsRestore) {
+            MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED)
-            Timber.tag("SteamFix").i("restoreSteamApi: running DLL restore in %s", appDirPath)
 
             autoLoginUserChanges(imageFs)
             setupLightweightSteamConfig(imageFs, SteamService.userSteamId!!.accountID.toString())
 
             putBackSteamDlls(appDirPath)
-
-            // Restore original executable if it exists (for real Steam mode)
             restoreOriginalExecutable(context, steamAppId)
-
-            // Restore original steamclient.dll files if they exist
             restoreSteamclientFiles(context, steamAppId)
 
             MarkerUtils.addMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
         }
 
-        applySteamOverlayPref(context, container)
+        restoreLegacyStashedOverlayFiles(container)
 
-        // SteamFix #25/#26: always refresh manifest + symlinks on every real-Steam
-        // launch. Multi-account contamination and branch changes otherwise leave
-        // stale LastOwner / buildid / installdir until the DLL marker is cleared.
+        // Always refresh the manifest + symlinks: multi-account switches and branch
+        // changes otherwise leave stale LastOwner/buildid/installdir behind.
         createAppManifest(context, steamAppId)
 
-        // SteamFix #36: suppress per-launch vcredist/DirectX installer invocations
-        // by claiming all 228980 install scripts have already run. See doc on
-        // applySteamInstallScriptShim — fixes the Unity crash on Shiren where
-        // Steam was racing VC_redist.x64.exe against the game's MSVC loader.
+        // Mark 228980 install scripts as already run so Steam doesn't re-launch
+        // vcredist/DirectX installers on every boot (they race the game's MSVC loader).
         applySteamInstallScriptShim(context, steamAppId)
 
         // Game-specific Handling
         ensureSaveLocationsForGames(context, steamAppId)
-
-        // SteamFix: sanity check the install. If the dir has only dot-prefixed
-        // metadata sidecars and _CommonRedist (no actual game .exe anywhere),
-        // Steam will happily "launch" the game but ColdClientLoader or
-        // steam.exe -applaunch will fail because the exe isn't on disk. Make
-        // that obvious in logcat instead of surfacing as a silent black screen.
-        try {
-            val appDir = File(SteamService.getAppDirPath(steamAppId))
-            if (appDir.isDirectory) {
-                val topLevel = appDir.listFiles()?.map { it.name } ?: emptyList()
-                val hasAnyExe = appDir.walkTopDown()
-                    .maxDepth(4)
-                    .any { it.isFile && it.name.endsWith(".exe", ignoreCase = true) }
-                if (!hasAnyExe) {
-                    Timber.tag("SteamFix").w(
-                        "Install INCOMPLETE for appId=%s: no .exe found under %s within 4 levels. topLevel=%s. " +
-                            "GameNative's download_complete marker is present but the real game files aren't. Re-verify / re-download from library.",
-                        appId, appDir.absolutePath, topLevel,
-                    )
-                }
-            } else {
-                Timber.tag("SteamFix").w(
-                    "Install MISSING for appId=%s: %s is not a directory.",
-                    appId, appDir.absolutePath,
-                )
-            }
-        } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "install sanity check failed for appId=%s", appId)
-        }
-
-        Timber.tag("SteamFix").i("restoreSteamApi finished for appId=%s", appId)
-        logAppDirInventory(ContainerUtils.extractGameIdFromContainerId(appId), "restoreSteamApi.done")
     }
 
     fun findSteamApiDllRootFile(file: File, depth: Int): File? {
@@ -1726,15 +1412,11 @@ object SteamUtils {
     }
 
     /**
-     * SteamFix #11: Only copy GSE saves into Steam userdata when the next launch
-     * is actually real Steam. Running this in OFF mode moved GSE's own saves out
-     * from under Goldberg. Caller threads `isLaunchRealSteam` through.
+     * Copy GSE saves into Steam userdata only when the next launch is real Steam.
+     * Running this in OFF mode would move GSE's own saves out from under Goldberg.
      */
     fun migrateGSESavesToSteamUserdata(context: Context, appId: Int, isLaunchRealSteam: Boolean = true) {
-        if (!isLaunchRealSteam) {
-            Timber.tag("SteamFix").d("migrateGSESavesToSteamUserdata: skipping for appId=%d (not real-Steam mode)", appId)
-            return
-        }
+        if (!isLaunchRealSteam) return
         val imageFs = ImageFs.find(context)
         val accountId = SteamService.userSteamId?.accountID?.toInt()
             ?: PrefManager.steamUserAccountId.takeIf { it != 0 }
@@ -1819,23 +1501,18 @@ object SteamUtils {
     }
 
     /**
-     * SteamFix #10: reverse migration. When a user toggles Launch Steam Client
-     * OFF after an ON session, saves that were copied into Steam/userdata need
-     * to move back so Goldberg (which reads from GSE Saves) can find them.
-     * Only runs when entering OFF mode, since the opposite direction is
-     * handled by [migrateGSESavesToSteamUserdata].
+     * Reverse of [migrateGSESavesToSteamUserdata]: when a user toggles Launch
+     * Steam Client OFF, move saves from Steam/userdata back to GSE Saves so
+     * Goldberg can find them.
      */
     fun migrateSteamUserdataToGSESaves(context: Context, appId: Int, isLaunchRealSteam: Boolean = false) {
-        if (isLaunchRealSteam) {
-            Timber.tag("SteamFix").d("migrateSteamUserdataToGSESaves: skipping for appId=%d (real-Steam mode)", appId)
-            return
-        }
+        if (isLaunchRealSteam) return
         val imageFs = ImageFs.find(context)
         val accountId = SteamService.userSteamId?.accountID?.toInt()
             ?: PrefManager.steamUserAccountId.takeIf { it != 0 }
 
         if (accountId == null) {
-            Timber.tag("SteamFix").w("migrateSteamUserdataToGSESaves: no Steam account ID available")
+            Timber.w("migrateSteamUserdataToGSESaves: no Steam account ID available")
             return
         }
 
@@ -1857,17 +1534,14 @@ object SteamUtils {
             !steamUserdataDir.isDirectory ||
             isDirectoryEmpty(steamUserdataDir)
         ) {
-            Timber.tag("SteamFix").d("migrateSteamUserdataToGSESaves: no userdata to migrate for appId=%d", appId)
             return
         }
-
-        Timber.tag("SteamFix").i("migrateSteamUserdataToGSESaves: starting migration for appId=%d", appId)
 
         if (!gseDir.exists()) {
             try {
                 Files.createDirectories(gseDir.toPath())
             } catch (e: IOException) {
-                Timber.tag("SteamFix").e(e, "migrateSteamUserdataToGSESaves: failed to create GSE Saves dir")
+                Timber.e(e, "migrateSteamUserdataToGSESaves: failed to create GSE Saves dir")
                 return
             }
         }
@@ -1893,22 +1567,15 @@ object SteamUtils {
                     migratedCount++
                 } catch (e: Exception) {
                     migrationFailed = true
-                    Timber.tag("SteamFix").w(e, "migrateSteamUserdataToGSESaves: failed to migrate %s", file.name)
+                    Timber.w(e, "migrateSteamUserdataToGSESaves: failed to migrate %s", file.name)
                 }
             }
 
         if (!migrationFailed) {
             steamUserdataDir.deleteRecursively()
         }
-
-        Timber.tag("SteamFix").i("migrateSteamUserdataToGSESaves: completed appId=%d, files=%d", appId, migratedCount)
     }
 
-    /**
-     * SteamFix #20: one-shot cleanup of the ~200 MB extracted Steam binaries
-     * when we're confident no real-Steam launch is pending. Caller owns the
-     * "is this safe right now" decision (e.g. after confirming OFF toggle).
-     */
     /**
      * Symlink-safe recursive delete. Kotlin's `File.deleteRecursively()` follows
      * symbolic links to directories and deletes the files on the *other* side,
@@ -1921,52 +1588,6 @@ object SteamUtils {
      * want: tear down the extracted Steam prefix but leave the actual game
      * content the symlinks point to alone.
      */
-    /**
-     * Emit a one-line inventory of a Steam game's install directory so we can
-     * correlate "where did my game go?" reports against launch / mode-switch /
-     * variant-reset events. Tagged `SteamFix` so it shows up in the same
-     * logcat filter as the rest of the diagnostics.
-     */
-    fun logAppDirInventory(appId: Int, phase: String) {
-        try {
-            val path = SteamService.getAppDirPath(appId)
-            val dir = File(path)
-            if (!dir.exists()) {
-                Timber.tag("SteamFix").w("inventory[%s] appId=%d path=%s MISSING", phase, appId, path)
-                return
-            }
-            var fileCount = 0
-            var exeCount = 0
-            var totalBytes = 0L
-            val exeList = mutableListOf<String>()
-            try {
-                dir.walkTopDown().maxDepth(4).forEach { f ->
-                    if (f.isFile) {
-                        fileCount++
-                        totalBytes += f.length()
-                        if (f.name.endsWith(".exe", ignoreCase = true)) {
-                            exeCount++
-                            if (exeList.size < 8) exeList += f.relativeTo(dir).path
-                        }
-                    }
-                }
-            } catch (_: Exception) { /* best-effort walk */ }
-            val appInfo = SteamService.getAppInfoOf(appId)
-            val configuredExe = appInfo?.config?.launch
-                ?.firstOrNull { it.executable.isNotBlank() }?.executable.orEmpty()
-            val expectedExeRel = configuredExe.replace("\\", "/").trimStart('/')
-            val expectedExeFile = if (expectedExeRel.isNotBlank()) File(dir, expectedExeRel) else null
-            val expectedExePresent = expectedExeFile?.exists() == true
-            Timber.tag("SteamFix").i(
-                "inventory[%s] appId=%d path=%s files=%d exes=%d bytes=%d expectedExe=%s present=%s exes=%s",
-                phase, appId, path, fileCount, exeCount, totalBytes,
-                expectedExeRel.ifBlank { "(unset)" }, expectedExePresent, exeList,
-            )
-        } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "inventory[%s] appId=%d FAILED", phase, appId)
-        }
-    }
-
     internal fun deleteTreeNoFollowSymlinks(root: File) {
         if (!root.exists() && !java.nio.file.Files.isSymbolicLink(root.toPath())) return
         val rootPath = root.toPath()
@@ -1996,13 +1617,9 @@ object SteamUtils {
             if (!steamDir.exists()) return
             val steamExe = File(steamDir, "steam.exe")
             if (!steamExe.exists()) return
-            Timber.tag("SteamFix").i(
-                "cleanupExtractedSteamFiles: removing %s (symlink-safe walk)",
-                steamDir.absolutePath,
-            )
             deleteTreeNoFollowSymlinks(steamDir)
         } catch (e: Exception) {
-            Timber.tag("SteamFix").w(e, "cleanupExtractedSteamFiles failed")
+            Timber.w(e, "cleanupExtractedSteamFiles failed")
         }
     }
 
@@ -2064,10 +1681,8 @@ object SteamUtils {
                 appendLine("ticket=$ticketBase64")
             }
 
-            // SteamFix #10/#11: in OFF mode (ensureSteamSettings only runs in the
-            // emulated-Steam launch path) we must not move GSE saves into Steam's
-            // userdata — that's the ON-mode direction. Instead, pull any leftover
-            // userdata back into GSE Saves so Goldberg can find it.
+            // ensureSteamSettings only runs in the emulated-Steam launch path, so
+            // pull any leftover userdata back into GSE Saves for Goldberg.
             migrateSteamUserdataToGSESaves(context, steamAppId, isLaunchRealSteam = false)
 
             // Add [user::saves] section

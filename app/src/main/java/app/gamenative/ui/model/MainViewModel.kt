@@ -24,8 +24,6 @@ import app.gamenative.ui.enums.ConnectionState
 import app.gamenative.ui.screen.PluviaScreen
 import app.gamenative.utils.ContainerUtils
 import app.gamenative.utils.IntentLaunchManager
-import app.gamenative.utils.STEAM_HELPER_WINDOW_CLASSES
-import app.gamenative.utils.SteamFixDiagnostics
 import app.gamenative.utils.SteamUtils
 import app.gamenative.utils.UpdateInfo
 import com.materialkolor.PaletteStyle
@@ -456,27 +454,22 @@ class MainViewModel @Inject constructor(
                 val container = ContainerUtils.getOrCreateContainer(context, appId)
                 val gameSource = ContainerUtils.extractGameSourceFromContainerId(appId)
                 if (gameSource == GameSource.STEAM) {
-                    // SteamFix #19: record the mode this launch is using so we can
-                    // detect mode flips between launches and run #20 cleanup.
+                    // On real->emu transition, GC the ~200 MB extracted Steam client
+                    // we won't need until the next real-Steam launch. Re-extraction
+                    // on the next transition is fast.
                     val previousMode = container.getExtra("lastSteamMode", "")
                     val currentMode = if (container.isLaunchRealSteam()) "real" else "emu"
                     if (previousMode != currentMode) {
-                        Timber.tag("SteamFix").i("launchApp: Steam mode change %s -> %s for appId=%s", previousMode, currentMode, appId)
                         container.putExtra("lastSteamMode", currentMode)
                         container.saveData()
-                        // SteamFix #20: on real->emu transitions, GC the ~200 MB
-                        // extracted Steam client we won't need until the next ON
-                        // launch. Extraction is fast on re-entry.
                         if (previousMode == "real" && currentMode == "emu") {
                             SteamUtils.cleanupExtractedSteamFiles(context)
                         }
                     }
                     if (container.isLaunchRealSteam()) {
-                        Timber.tag("SteamFix").i("launchApp: real-Steam mode, running restoreSteamApi")
                         SteamUtils.restoreSteamApi(context, appId)
                     } else {
                         val offline = _offline.value
-                        Timber.tag("SteamFix").i("launchApp: emulated mode, useLegacyDRM=%s offline=%s", container.isUseLegacyDRM, offline)
                         if (container.isUseLegacyDRM) {
                             SteamUtils.replaceSteamApi(context, appId, offline)
                         } else {
@@ -642,17 +635,7 @@ class MainViewModel @Inject constructor(
                     gameExe == windowExe
                 }
 
-                // SteamFix: remember the class of every mapped window so if the
-                // stall watchdog fires later, it can name what was on screen at
-                // that moment instead of saying "no window mapped" vaguely.
-                SteamFixDiagnostics.lastMappedWindowClass = window.className
-
                 if (launchConfig != null) {
-                    // SteamFix: record that the *game* window mapped (not just
-                    // any window) so the stall watchdog can tell "game actually
-                    // launched" apart from "stuck in Steam bootstrapper."
-                    SteamFixDiagnostics.gameWindowMapped = true
-                    SteamFixDiagnostics.gameWindowClass = window.className
                     val steamProcessId = Process.myPid()
                     val processes = mutableListOf<AppProcessInfo>()
                     var currentWindow: Window = window
@@ -673,16 +656,6 @@ class MainViewModel @Inject constructor(
                     } while (parentWindow != null)
 
                     val installedBranch = SteamService.getInstalledApp(gameId)?.branch ?: "public"
-                    // SteamFix #22/#23: log the process-tree walk we just did so a
-                    // black-screen report includes which window class was chosen as
-                    // the game and what its parent chain looked like. Under real
-                    // Steam the chain terminates at steam.exe rather than explorer.
-                    val topWindowClass = window.className
-                    val parentClass = window.parent?.className
-                    Timber.tag("SteamFix").i(
-                        "onWindowMapped: appId=%d exe=%s window=%s parent=%s chainDepth=%d",
-                        gameId, launchConfig.executable, topWindowClass, parentClass, processes.size,
-                    )
                     GameProcessInfo(appId = gameId, branch = installedBranch, processes = processes).let {
                         // Only notify Steam if we're not using real Steam
                         // When launchRealSteam is true, let the real Steam client handle the "game is running" notification
@@ -697,33 +670,8 @@ class MainViewModel @Inject constructor(
                         if (!shouldLaunchRealSteam) {
                             SteamService.notifyRunningProcesses(it)
                         } else {
-                            Timber.tag("SteamFix").i("onWindowMapped: skipping process notification (real Steam owns this)")
+                            Timber.tag("MainViewModel").i("Skipping Steam process notification - real Steam will handle this")
                         }
-                    }
-                } else {
-                    // SteamFix #22: we mapped a window but no known launch exe
-                    // matched. Two flavors here:
-                    //   (1) it's one of Steam's own helper windows (explorer,
-                    //       steam.exe, conhost, overlay, winhandler…). These fire
-                    //       constantly during bootstrapping — log at debug.
-                    //   (2) it's *something else*. That's the signal we care
-                    //       about: login prompt, cloud-conflict dialog, update-
-                    //       required modal. Warn, and remember it for the
-                    //       stall watchdog.
-                    val cls = window.className
-                    val isHelper = cls in STEAM_HELPER_WINDOW_CLASSES
-                    if (isHelper) {
-                        Timber.tag("SteamFix").d(
-                            "onWindowMapped: Steam helper window mapped class=%s (appId=%d)",
-                            cls, gameId,
-                        )
-                    } else {
-                        SteamFixDiagnostics.lastUnmatchedWindowClass = cls
-                        SteamFixDiagnostics.unmatchedWindowCount += 1
-                        Timber.tag("SteamFix").w(
-                            "onWindowMapped: unmatched non-helper window class=%s (appId=%d). Likely a Steam modal (login, cloud conflict, update-required).",
-                            cls, gameId,
-                        )
                     }
                 }
             }
