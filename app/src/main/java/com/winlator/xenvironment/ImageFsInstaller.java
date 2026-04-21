@@ -207,11 +207,6 @@ public abstract class ImageFsInstaller {
         String currentVariant = imageFs.getVariant();
         String requestedVariant = container.getContainerVariant();
         if (!valid || version < LATEST_VERSION || !currentVariant.equals(requestedVariant)) {
-            android.util.Log.i("SteamFix",
-                "ImageFsInstaller.installIfNeeded: REINSTALL valid=" + valid
-                    + " version=" + version + "/" + LATEST_VERSION
-                    + " variant=" + currentVariant + "->" + requestedVariant
-                    + " (this will unlink steamapps/common/<game> symlinks)");
             Log.d("ImageFsInstaller", "Installing image from assets");
             return installFromAssetsFuture(context, assetManager, container.getContainerVariant(), onProgress);
         } else {
@@ -265,14 +260,6 @@ public abstract class ImageFsInstaller {
     }
 
     private static void clearRootDir(Context context, File rootDir) {
-        // SteamFix diag: this runs when imagefs is invalid/out-of-date OR when the
-        // user toggles container variant (glibc <-> bionic). It wipes everything
-        // under rootDir except home/ and opt/, which means any symlinks placed by
-        // createAppManifest (steamapps/common/<game> -> /data/.../Steam/...) get
-        // unlinked. Real on-disk game content is NOT followed (FileUtils.delete
-        // is symlink-safe), but the manifest/link pair is gone. Tag this so the
-        // same logcat filter catches it.
-        android.util.Log.i("SteamFix", "ImageFsInstaller.clearRootDir: wiping " + rootDir.getAbsolutePath() + " (variant/imgVersion reset — symlinks under wineprefix will be unlinked)");
         if (rootDir.isDirectory()) {
             File[] files = rootDir.listFiles();
             if (files != null) {
@@ -294,7 +281,6 @@ public abstract class ImageFsInstaller {
             }
         }
         else rootDir.mkdirs();
-        android.util.Log.i("SteamFix", "ImageFsInstaller.clearRootDir: done");
     }
 
     public static void generateCompactContainerPattern(final Context context, AssetManager assetManager) {
