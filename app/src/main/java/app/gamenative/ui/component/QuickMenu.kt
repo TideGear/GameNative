@@ -290,6 +290,7 @@ fun QuickMenu(
     val effectsScrollState = rememberScrollState()
     val effectsTabFocusRequester = remember { FocusRequester() }
     val controllerScrollState = rememberScrollState()
+    val railTabsScrollState = rememberScrollState()
     val hudTabFocusRequester = remember { FocusRequester() }
     val controllerTabFocusRequester = remember { FocusRequester() }
     val toolsTabFocusRequester = remember { FocusRequester() }
@@ -386,7 +387,12 @@ fun QuickMenu(
                                 .focusGroup(),
                             horizontalAlignment = Alignment.CenterHorizontally,
                         ) {
+                            // Tabs take remaining space and scroll if the rail is too short
+                            // (e.g. phones in landscape) so the exit button below stays visible.
                             Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .verticalScroll(railTabsScrollState),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
                             ) {
@@ -427,8 +433,6 @@ fun QuickMenu(
                                     focusRequester = toolsTabFocusRequester,
                                 )
                             }
-
-                            Spacer(modifier = Modifier.weight(1f))
 
                             Box(
                                 modifier = Modifier
