@@ -2364,6 +2364,19 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                 uploadsCompleted = postSyncInfo?.uploadsCompleted == true,
                                                 uploadsRequired = postSyncInfo?.uploadsRequired == true,
                                             )
+
+                                            // In real-Steam mode the Wine-hosted Steam client registered its
+                                            // own AppSessionActive under machineName="localhost". With
+                                            // cloud_enabled=0 it never signals upload state, so Steam's
+                                            // server parks that session in UploadPending forever and
+                                            // desktop Steam shows a "Cloud Out of Date" / "played on
+                                            // localhost, upload not started" dialog on next launch. Game
+                                            // is already exited here, so kick any lingering session to
+                                            // clear the server-side state.
+                                            if (isLaunchRealSteam) {
+                                                runCatching { steamInstance._steamUser?.kickPlayingSession() }
+                                                    .onFailure { Timber.w(it, "kickPlayingSession after real-Steam exit failed") }
+                                            }
                                         }
                                     }
                                 }
