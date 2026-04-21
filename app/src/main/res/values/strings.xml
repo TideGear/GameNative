@@ -216,6 +216,7 @@
     <string name="logs">Logs</string>
     <string name="exit_game">Exit</string>
     <string name="exit">Exit Game</string>
+    <string name="exit_graceful_toast">Closing game… tap Exit again to force quit</string>
     <string name="keyboard">Keyboard</string>
     <string name="resume_game">Resume Game</string>
     <string name="extra">Extra</string>
