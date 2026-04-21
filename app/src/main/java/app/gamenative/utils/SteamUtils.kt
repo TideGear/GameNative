@@ -2012,6 +2012,12 @@ object SteamUtils {
                     app.children.add(KeyValue("LaunchOptions", exeCommandLine))
                 }
 
+                // Suppress the Wine-hosted Steam client's per-app cloud sync. GameNative owns
+                // cloud via its own SteamKit connection around every launch; letting the client
+                // sync in parallel races us and produces spurious Save Conflict popups.
+                setOrReplaceKey(app, "cloud_enabled", "0")
+                setOrReplaceKey(app, "cce", "0")
+
                 vdfData.saveToFile(localConfigFile, false)
             } else {
                 val vdfData = KeyValue(name = "UserLocalConfigStore")
@@ -2023,6 +2029,8 @@ object SteamUtils {
                 val app = KeyValue(appId)
 
                 app.children.add(option)
+                app.children.add(KeyValue("cloud_enabled", "0"))
+                app.children.add(KeyValue("cce", "0"))
                 apps.children.add(app)
                 steam.children.add(apps)
                 valve.children.add(steam)
@@ -2073,6 +2081,15 @@ object SteamUtils {
             }
         } catch (e: Exception) {
             Timber.e(e, "Failed to update or modify local config")
+        }
+    }
+
+    private fun setOrReplaceKey(parent: KeyValue, name: String, value: String) {
+        val existing = parent.children.firstOrNull { it.name == name }
+        if (existing != null) {
+            existing.value = value
+        } else {
+            parent.children.add(KeyValue(name, value))
         }
     }
 

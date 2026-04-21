@@ -2204,13 +2204,24 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                     EOSType.AndroidUnknown,
                                                 )
 
-                                                val pendingRemoteOperations = steamCloud.signalAppLaunchIntent(
+                                                val rawPending = steamCloud.signalAppLaunchIntent(
                                                     appId = appId,
                                                     clientId = clientId,
                                                     machineName = SteamUtils.getMachineName(steamInstance),
                                                     ignorePendingOperations = ignorePendingOperations,
                                                     osType = EOSType.AndroidUnknown,
                                                 ).await()
+
+                                                // The Wine-hosted Steam client registers with Steam's cloud
+                                                // service as "localhost" and leaves stale pending/session
+                                                // markers. Filter those out in real-Steam mode so we don't
+                                                // surface spurious dialogs or kick our own launch — genuine
+                                                // entries from other devices still flow through.
+                                                val pendingRemoteOperations = if (isLaunchRealSteam) {
+                                                    rawPending.filterNot { it.machineName.equals("localhost", ignoreCase = true) }
+                                                } else {
+                                                    rawPending
+                                                }
 
                                                 if (pendingRemoteOperations.isNotEmpty() && !ignorePendingOperations) {
                                                     syncResult = PostSyncInfo(
@@ -2351,7 +2362,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                 appId = appId,
                                                 clientId = clientId,
                                                 uploadsCompleted = postSyncInfo?.uploadsCompleted == true,
-                                                uploadsRequired = postSyncInfo?.uploadsRequired == false,
+                                                uploadsRequired = postSyncInfo?.uploadsRequired == true,
                                             )
                                         }
                                     }

@@ -196,6 +196,12 @@ private const val EXIT_PROCESS_POLL_INTERVAL_MS = 1_000L
 private const val EXIT_PROCESS_RESPONSE_TIMEOUT_MS = 2_000L
 private const val QUICK_MENU_PROCESS_POLL_INTERVAL_MS = 2_000L
 
+// Red-exit grace window: we first ask the game (and Steam, if real-Steam mode)
+// to shut down cleanly via WM_CLOSE, then tear down Wine. Games that flush saves
+// on clean exit need this to avoid data loss. Second tap on the exit button
+// bypasses the grace and force-quits.
+private const val GRACEFUL_EXIT_GRACE_MS = 5_000L
+
 // Flags passed to steam.exe in real-Steam launch mode.
 // -silent: start without main window; -vgui: classic UI renderer (more compatible under Wine);
 // -tcp: avoid named-pipe handshake wait; -nobigpicture/-nofriendsui/-nochatui/-nointro: suppress optional UIs.
@@ -399,6 +405,7 @@ fun XServerScreen(
     var win32AppWorkarounds: Win32AppWorkarounds? by remember { mutableStateOf(null) }
     var physicalControllerHandler: PhysicalControllerHandler? by remember { mutableStateOf(null) }
     var exitWatchJob: Job? by remember { mutableStateOf(null) }
+    var gracefulExitJob: Job? by remember { mutableStateOf(null) }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -1022,17 +1029,37 @@ fun XServerScreen(
             }
 
             QuickMenuAction.EXIT_GAME -> {
-                PostHog.capture(
-                    event = "game_closed",
-                    properties = mapOf(
-                        "game_name" to ContainerUtils.resolveGameName(appId),
-                        "game_store" to ContainerUtils.extractGameSourceFromContainerId(appId).name,
-                    ),
-                )
-                imeInputReceiver?.hideKeyboard()
-                // Resume processes before exiting so they can receive SIGTERM cleanly.
-                forceResumeIfSuspended()
-                exit(xServerView!!.getxServer().winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
+                val winHandler = xServerView!!.getxServer().winHandler
+                val activeJob = gracefulExitJob
+                if (activeJob?.isActive == true) {
+                    Timber.i("EXIT_GAME: second tap during grace window — force quitting")
+                    activeJob.cancel()
+                    gracefulExitJob = null
+                    exit(winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
+                } else {
+                    PostHog.capture(
+                        event = "game_closed",
+                        properties = mapOf(
+                            "game_name" to ContainerUtils.resolveGameName(appId),
+                            "game_store" to ContainerUtils.extractGameSourceFromContainerId(appId).name,
+                        ),
+                    )
+                    imeInputReceiver?.hideKeyboard()
+                    // Resume processes before exiting so they can receive SIGTERM cleanly.
+                    forceResumeIfSuspended()
+                    val gameExe = extractExecutableBasename(container.executablePath)
+                    val shutdownSteam = container.isLaunchRealSteam
+                    gracefulExitJob = CoroutineScope(Dispatchers.Main).launch {
+                        try {
+                            if (gameExe.isNotEmpty()) winHandler.killProcess(gameExe)
+                            if (shutdownSteam) winHandler.killProcess("steam.exe")
+                            delay(GRACEFUL_EXIT_GRACE_MS)
+                            exit(winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
+                        } catch (_: kotlinx.coroutines.CancellationException) {
+                            // Force-quit path already called exit().
+                        }
+                    }
+                }
                 true
             }
 
