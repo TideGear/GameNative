@@ -413,6 +413,8 @@ fun XServerScreen(
             physicalControllerHandler = null
             exitWatchJob?.cancel()
             exitWatchJob = null
+            gracefulExitJob?.cancel()
+            gracefulExitJob = null
         }
     }
     var isKeyboardVisible = false
@@ -1047,6 +1049,7 @@ fun XServerScreen(
                     imeInputReceiver?.hideKeyboard()
                     // Resume processes before exiting so they can receive SIGTERM cleanly.
                     forceResumeIfSuspended()
+                    SnackbarManager.show(context.getString(R.string.exit_graceful_toast))
                     val gameExe = extractExecutableBasename(container.executablePath)
                     val shutdownSteam = container.isLaunchRealSteam
                     gracefulExitJob = CoroutineScope(Dispatchers.Main).launch {
