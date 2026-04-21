@@ -192,8 +192,10 @@ object SteamUtils {
                     }
                 }
             }
-        } catch (e: Exception) {
-            Timber.w(e, "applySteamInstallScriptShim failed for appId=%d", steamAppId)
+        } catch (e: IOException) {
+            Timber.w(e, "applySteamInstallScriptShim: registry IO failed for appId=%d", steamAppId)
+        } catch (e: SecurityException) {
+            Timber.w(e, "applySteamInstallScriptShim: registry access denied for appId=%d", steamAppId)
         }
     }
 
@@ -862,13 +864,25 @@ object SteamUtils {
                 // the gray-Play state. Declaring the ownership explicitly tells
                 // Steam the link is already satisfied, so no recategorization /
                 // queue flip happens.
-                if (sharedDepots.isNotEmpty()) {
+                // Only depots with a real owning app (depotFromApp != 0) belong in SharedDepots.
+                // Writing "<depotId>"  "0" tells Steam the depot is owned by app 0, which
+                // makes PICS reconcile on every boot and can re-trigger the gray-Play cascade.
+                val ownedSharedDepots = sharedDepots.filterValues { it.depotFromApp != 0 }
+                if (ownedSharedDepots.isNotEmpty()) {
                     appendLine("\t\"SharedDepots\"")
                     appendLine("\t{")
-                    sharedDepots.forEach { (depotId, info) ->
+                    ownedSharedDepots.forEach { (depotId, info) ->
                         appendLine("\t\t\"$depotId\"\t\t\"${info.depotFromApp}\"")
                     }
                     appendLine("\t}")
+                }
+                val unownedShared = sharedDepots.keys - ownedSharedDepots.keys
+                if (unownedShared.isNotEmpty()) {
+                    Timber.w(
+                        "createAppManifest: appId=%d shared depots %s have no owner (depotFromApp=0) — omitting from SharedDepots",
+                        steamAppId,
+                        unownedShared,
+                    )
                 }
 
                 // cloud_enabled="0" deliberately: GameNative already runs SteamAutoCloud.syncUserFiles
