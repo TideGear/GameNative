@@ -2277,13 +2277,19 @@ class SteamService : Service(), IChallengeUrlChanged {
             // Only migrate GSE -> userdata when booting real Steam; reverse direction lives in ensureSteamSettings.
             SteamUtils.migrateGSESavesToSteamUserdata(instance?.applicationContext!!, appId, isLaunchRealSteam)
 
+            var syncResult = PostSyncInfo(SyncResult.UnknownFail)
+            var launchIntentRegistered = false
+
+            // Wine-hosted Steam establishes its own session via BYieldingAppLaunchIntent,
+            // so clearing server-side state here wipes orphan phantoms from prior aborted
+            // launches (emulation crash, killed mid-sync) without disrupting anything we're
+            // about to do — we don't signal an intent in real-Steam mode anyway.
+            if (isLaunchRealSteam) {
+                runCatching { instance?._steamUser?.kickPlayingSession() }
+                    .onFailure { Timber.w(it, "Proactive kickPlayingSession before real-Steam launch failed") }
+            }
+
             try {
-                val context = instance?.applicationContext ?: return@async PostSyncInfo(SyncResult.UnknownFail)
-                // Migrate GSE Saves to Steam userdata
-                SteamUtils.migrateGSESavesToSteamUserdata(context, appId)
-
-                var syncResult = PostSyncInfo(SyncResult.UnknownFail)
-
                 val maxAttempts = 3
                 for (attempt in 1..maxAttempts) {
                     try {
@@ -2331,7 +2337,7 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                         machineName = SteamUtils.getMachineName(steamInstance),
                                                         ignorePendingOperations = ignorePendingOperations,
                                                         osType = EOSType.AndroidUnknown,
-                                                    ).await()
+                                                    ).await().also { launchIntentRegistered = true }
                                                 }
 
                                                 // Defence in depth: even when the RPC above fires in emulation
@@ -2377,6 +2383,18 @@ class SteamService : Service(), IChallengeUrlChanged {
 
                 return@async syncResult
             } finally {
+                // Emulation-mode cleanup: if we registered a launch intent but didn't end
+                // in a clean sync-ready state (pending ops returned, exception partway
+                // through, caller dismissed the dialog), the server-side pending op would
+                // otherwise linger and block future launches in either mode. Kick to clean
+                // up; the existing closeApp path handles the successful-launch-then-exit case.
+                if (launchIntentRegistered &&
+                    syncResult.syncResult != SyncResult.Success &&
+                    syncResult.syncResult != SyncResult.UpToDate
+                ) {
+                    runCatching { instance?._steamUser?.kickPlayingSession() }
+                        .onFailure { Timber.w(it, "kickPlayingSession cleanup after aborted launch failed") }
+                }
                 releaseSync(appId)
             }
         }
