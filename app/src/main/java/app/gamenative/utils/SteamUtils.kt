@@ -1275,6 +1275,34 @@ object SteamUtils {
         return size
     }
 
+    /** Writes steam.cfg with update-inhibit keys if missing. Both real-Steam and emu paths need it present. */
+    fun ensureSteamCfg(imageFs: ImageFs) {
+        val cfgFile = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steam.cfg")
+        if (cfgFile.exists()) return
+        try {
+            cfgFile.parentFile?.mkdirs()
+            Files.createFile(cfgFile.toPath())
+            cfgFile.writeText("BootStrapperInhibitAll=Enable\nBootStrapperForceSelfUpdate=False")
+        } catch (e: Exception) {
+            Timber.w(e, "ensureSteamCfg: failed to write steam.cfg")
+        }
+    }
+
+    /** Logs size + mtime of the Steam binaries whose unexpected change breaks launches. Diagnostic-only. */
+    fun logSteamBinaryFingerprint(imageFs: ImageFs, tag: String) {
+        try {
+            val steamDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
+            val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply { timeZone = TimeZone.getDefault() }
+            val parts = listOf("steam.exe", "steamclient.dll", "steamclient64.dll").map { name ->
+                val f = File(steamDir, name)
+                if (f.exists()) "$name=${f.length()}@${fmt.format(f.lastModified())}" else "$name=MISSING"
+            }
+            Timber.i("SteamBinaryFingerprint[$tag] ${parts.joinToString(" ")}")
+        } catch (e: Exception) {
+            Timber.w(e, "logSteamBinaryFingerprint[$tag] failed")
+        }
+    }
+
     /**
      * Restores the original steam_api.dll and steam_api64.dll files from their .orig backups
      * if they exist. Does not error if backup files are not found.
@@ -1283,12 +1311,8 @@ object SteamUtils {
         val steamAppId = ContainerUtils.extractGameIdFromContainerId(appId)
         val imageFs = ImageFs.find(context)
         val container = ContainerUtils.getOrCreateContainer(context, appId)
-        val cfgFile = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steam.cfg")
-        if (!cfgFile.exists()){
-            cfgFile.parentFile?.mkdirs()
-            Files.createFile(cfgFile.toPath())
-            cfgFile.writeText("BootStrapperInhibitAll=Enable\nBootStrapperForceSelfUpdate=False")
-        }
+        ensureSteamCfg(imageFs)
+        logSteamBinaryFingerprint(imageFs, "restoreSteamApi:emu:$steamAppId")
 
         // Update or modify localconfig.vdf
         updateOrModifyLocalConfig(imageFs, container, steamAppId.toString(), SteamService.userSteamId!!.accountID.toString())
