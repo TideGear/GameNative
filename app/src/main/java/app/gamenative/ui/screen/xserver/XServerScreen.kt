@@ -3940,6 +3940,8 @@ private fun setupWineSystemFiles(
             SteamUtils.deleteTreeNoFollowSymlinks(steamDir)
         }
         extractSteamFiles(context, container, onExtractFileListener)
+        SteamUtils.ensureSteamCfg(ImageFs.find(context))
+        SteamUtils.logSteamBinaryFingerprint(ImageFs.find(context), "prepareContainer:realSteam")
         container.putExtra("steamExtractedForWine", steamExtractedKey)
         containerDataChanged = true
     }
