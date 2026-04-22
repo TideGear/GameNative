@@ -2198,25 +2198,38 @@ class SteamService : Service(), IChallengeUrlChanged {
 
                                             if (info.syncResult == SyncResult.Success || info.syncResult == SyncResult.UpToDate) {
                                                 Timber.i(
-                                                    "Signaling app launch:\n\tappId: %d\n\tclientId: %s\n\tosType: %s",
+                                                    "Signaling app launch:\n\tappId: %d\n\tclientId: %s\n\tosType: %s\n\tisLaunchRealSteam: %s",
                                                     appId,
                                                     PrefManager.clientId,
                                                     EOSType.AndroidUnknown,
+                                                    isLaunchRealSteam,
                                                 )
 
-                                                val rawPending = steamCloud.signalAppLaunchIntent(
-                                                    appId = appId,
-                                                    clientId = clientId,
-                                                    machineName = SteamUtils.getMachineName(steamInstance),
-                                                    ignorePendingOperations = ignorePendingOperations,
-                                                    osType = EOSType.AndroidUnknown,
-                                                ).await()
+                                                // In real-Steam mode, the Wine-hosted Steam client (running as
+                                                // machineName="localhost") performs its own BYieldingAppLaunchIntent
+                                                // once it starts. If we also signal launch intent from our SteamKit
+                                                // client here, the server records a pending operation from machine
+                                                // "localhost" that the Wine-hosted client then observes as a
+                                                // conflicting session and refuses to launch the game. Skip the RPC
+                                                // entirely on the real-Steam path so the server never sees a
+                                                // localhost launch intent from us.
+                                                val rawPending = if (isLaunchRealSteam) {
+                                                    emptyList()
+                                                } else {
+                                                    steamCloud.signalAppLaunchIntent(
+                                                        appId = appId,
+                                                        clientId = clientId,
+                                                        machineName = SteamUtils.getMachineName(steamInstance),
+                                                        ignorePendingOperations = ignorePendingOperations,
+                                                        osType = EOSType.AndroidUnknown,
+                                                    ).await()
+                                                }
 
-                                                // The Wine-hosted Steam client registers with Steam's cloud
-                                                // service as "localhost" and leaves stale pending/session
-                                                // markers. Filter those out in real-Steam mode so we don't
-                                                // surface spurious dialogs or kick our own launch — genuine
-                                                // entries from other devices still flow through.
+                                                // Defence in depth: even when the RPC above fires in emulation
+                                                // mode, a stale localhost entry from a prior real-Steam session
+                                                // could still surface here. Strip those so we never surface
+                                                // spurious dialogs or kick our own launch — genuine entries
+                                                // from other devices still flow through.
                                                 val pendingRemoteOperations = if (isLaunchRealSteam) {
                                                     rawPending.filterNot { it.machineName.equals("localhost", ignoreCase = true) }
                                                 } else {
