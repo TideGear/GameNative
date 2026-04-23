@@ -179,9 +179,15 @@ public class WinHandler {
         String[] cmdList = command2.split(" ", 2);
         final String filename = cmdList[0];
         final String parameters = cmdList.length > 1 ? cmdList[1] : "";
+        exec(filename, parameters);
+    }
+
+    public void exec(final String filename, final String parameters) {
+        if (filename == null || filename.isEmpty()) return;
+        final String params = parameters == null ? "" : parameters;
         addAction(() -> {
             byte[] filenameBytes = filename.getBytes();
-            byte[] parametersBytes = parameters.getBytes();
+            byte[] parametersBytes = params.getBytes();
             this.sendData.rewind();
             this.sendData.put(RequestCodes.EXEC);
             this.sendData.putInt(filenameBytes.length + parametersBytes.length + 8);

@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -202,6 +203,13 @@ private const val QUICK_MENU_PROCESS_POLL_INTERVAL_MS = 2_000L
 // bypasses the grace and force-quits.
 private const val GRACEFUL_EXIT_GRACE_MS = 5_000L
 
+// Real-Steam mode: after issuing `steam.exe -shutdown`, wait this long for
+// Steam to exit cleanly before escalating to a user prompt. Steam flushes
+// config/install markers during shutdown and sends its own graceful quit IPC
+// to the running game, so a hard kill before this completes causes next-launch
+// redist-reinstall and lost config/cloud state.
+private const val STEAM_SHUTDOWN_WAIT_MS = 15_000L
+
 // Flags passed to steam.exe in real-Steam launch mode.
 // -vgui: classic UI renderer (more compatible under Wine);
 // -tcp: avoid named-pipe handshake wait; -nobigpicture/-nofriendsui/-nochatui/-nointro: suppress optional UIs.
@@ -294,6 +302,35 @@ private suspend fun requestWineProcessSnapshot(winHandler: WinHandler): List<Pro
         }
     } finally {
         winHandler.setOnGetProcessInfoListener(previousListener)
+    }
+}
+
+private fun isSteamExeAlive(snapshot: List<ProcessInfo>?): Boolean {
+    if (snapshot == null) return true // snapshot failed — assume alive so we keep waiting
+    return snapshot.any { normalizeProcessName(it.name) == "steam" }
+}
+
+private suspend fun awaitSteamShutdown(
+    winHandler: WinHandler,
+    showEscalationDialog: () -> CompletableDeferred<Boolean>,
+    onEscalationResolved: () -> Unit,
+) {
+    while (true) {
+        val deadline = System.currentTimeMillis() + STEAM_SHUTDOWN_WAIT_MS
+        while (System.currentTimeMillis() < deadline) {
+            delay(EXIT_PROCESS_POLL_INTERVAL_MS)
+            if (!isSteamExeAlive(requestWineProcessSnapshot(winHandler))) return
+        }
+        val resolver = showEscalationDialog()
+        val keepWaiting = try {
+            resolver.await()
+        } finally {
+            onEscalationResolved()
+        }
+        if (!keepWaiting) {
+            winHandler.killProcess("steam.exe")
+            return
+        }
     }
 }
 
@@ -408,6 +445,7 @@ fun XServerScreen(
     var physicalControllerHandler: PhysicalControllerHandler? by remember { mutableStateOf(null) }
     var exitWatchJob: Job? by remember { mutableStateOf(null) }
     var gracefulExitJob: Job? by remember { mutableStateOf(null) }
+    var steamShutdownDialogResolver by remember { mutableStateOf<CompletableDeferred<Boolean>?>(null) }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -417,6 +455,8 @@ fun XServerScreen(
             exitWatchJob = null
             gracefulExitJob?.cancel()
             gracefulExitJob = null
+            steamShutdownDialogResolver?.let { if (!it.isCompleted) it.cancel() }
+            steamShutdownDialogResolver = null
         }
     }
     var isKeyboardVisible = false
@@ -1051,17 +1091,43 @@ fun XServerScreen(
                     imeInputReceiver?.hideKeyboard()
                     // Resume processes before exiting so they can receive SIGTERM cleanly.
                     forceResumeIfSuspended()
-                    SnackbarManager.show(context.getString(R.string.exit_graceful_toast))
                     val gameExe = extractExecutableBasename(container.executablePath)
                     val shutdownSteam = container.isLaunchRealSteam
+                    SnackbarManager.show(
+                        context.getString(
+                            if (shutdownSteam) R.string.exit_steam_shutdown_toast
+                            else R.string.exit_graceful_toast,
+                        ),
+                    )
                     gracefulExitJob = CoroutineScope(Dispatchers.Main).launch {
                         try {
-                            if (gameExe.isNotEmpty()) winHandler.killProcess(gameExe)
-                            if (shutdownSteam) winHandler.killProcess("steam.exe")
-                            delay(GRACEFUL_EXIT_GRACE_MS)
+                            if (shutdownSteam) {
+                                // Let Steam shut the game down via its own IPC (gives
+                                // the game's Steam API a clean quit signal, then Steam
+                                // flushes config/install markers).
+                                winHandler.exec(
+                                    "C:\\Program Files (x86)\\Steam\\steam.exe",
+                                    "-shutdown",
+                                )
+                                awaitSteamShutdown(
+                                    winHandler,
+                                    showEscalationDialog = {
+                                        val resolver = CompletableDeferred<Boolean>()
+                                        steamShutdownDialogResolver = resolver
+                                        resolver
+                                    },
+                                    onEscalationResolved = { steamShutdownDialogResolver = null },
+                                )
+                            } else {
+                                if (gameExe.isNotEmpty()) winHandler.killProcess(gameExe)
+                                delay(GRACEFUL_EXIT_GRACE_MS)
+                            }
                             exit(winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
                         } catch (_: kotlinx.coroutines.CancellationException) {
                             // Force-quit path already called exit().
+                        } finally {
+                            steamShutdownDialogResolver?.let { if (!it.isCompleted) it.cancel() }
+                            steamShutdownDialogResolver = null
                         }
                     }
                 }
@@ -2179,6 +2245,28 @@ fun XServerScreen(
                 }
             }
         }
+    }
+
+    steamShutdownDialogResolver?.let { resolver ->
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text(stringResource(R.string.exit_steam_still_running_title)) },
+            text = { Text(stringResource(R.string.exit_steam_still_running_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (!resolver.isCompleted) resolver.complete(true)
+                }) {
+                    Text(stringResource(R.string.exit_keep_waiting))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    if (!resolver.isCompleted) resolver.complete(false)
+                }) {
+                    Text(stringResource(R.string.exit_force_quit))
+                }
+            },
+        )
     }
 
     // Element Editor Dialog
