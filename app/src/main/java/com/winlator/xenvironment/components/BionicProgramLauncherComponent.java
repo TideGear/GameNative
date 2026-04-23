@@ -36,6 +36,7 @@ import com.winlator.fexcore.FEXCorePresetManager;
 import com.winlator.sysvshm.SysVSHMConnectionHandler;
 import com.winlator.sysvshm.SysVSHMRequestHandler;
 import com.winlator.sysvshm.SysVSharedMemory;
+import com.winlator.winhandler.WinHandler;
 import com.winlator.xconnector.UnixSocketConfig;
 import com.winlator.xconnector.XConnectorEpoll;
 import com.winlator.xenvironment.ImageFs;
@@ -178,11 +179,21 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
     private int execGuestProgram() {
 
-        final int MAX_PLAYERS = 1; // old static method
-
-        // Get the number of enabled players directly from ControllerManager.
-        final int enabledPlayerCount = MAX_PLAYERS;
-        for (int i = 0; i < enabledPlayerCount; i++) {
+        // Pre-create all 4 mem files so controllers can be hot-plugged during gameplay.
+        // Only tell evshim to create virtual joysticks for currently connected controllers.
+        int connectedControllers = 0;
+        for (int id : android.view.InputDevice.getDeviceIds()) {
+            android.view.InputDevice dev = android.view.InputDevice.getDevice(id);
+            boolean isController = dev != null && !dev.isVirtual() &&
+                (dev.supportsSource(android.view.InputDevice.SOURCE_GAMEPAD) ||
+                 dev.supportsSource(android.view.InputDevice.SOURCE_JOYSTICK));
+            if (isController) {
+                connectedControllers++;
+            }
+        }
+        final int enabledPlayerCount = Math.max(1, Math.min(connectedControllers, WinHandler.MAX_PLAYERS));
+        Log.i("EvshimDeploy", "Connected controllers: " + connectedControllers + ", evshim players: " + enabledPlayerCount);
+        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
             String memPath;
             if (i == 0) {
                 // Player 1 uses the original, non-numbered path that is known to work.
@@ -292,22 +303,29 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         String evshimPath = imageFs.getLibDir() + "/libevshim.so";
         String replacePath = imageFs.getLibDir() + "/libredirect-bionic.so";
 
+        File apkEvshim = new File(context.getApplicationInfo().nativeLibraryDir, "libevshim.so");
+        File ifsEvshim = new File(evshimPath);
+        if (apkEvshim.exists()) {
+            if (FileUtils.copy(apkEvshim, ifsEvshim)) {
+                FileUtils.chmod(ifsEvshim, 0755);
+                Log.i("EvshimDeploy", "Copied APK evshim -> " + evshimPath);
+            } else {
+                Log.e("EvshimDeploy", "Failed to copy APK evshim to " + evshimPath);
+            }
+        }
+
         if (new File(sysvPath).exists()) ld_preload += sysvPath;
 
-
-        ld_preload += ":" + evshimPath;
-        ld_preload += ":" + replacePath;
+        if (ifsEvshim.exists()) {
+            ld_preload += (ld_preload.isEmpty() ? "" : ":") + evshimPath;
+        } else {
+            Log.w("EvshimDeploy", "evshim not present at " + evshimPath + "; skipping LD_PRELOAD entry");
+        }
+        ld_preload += (ld_preload.isEmpty() ? "" : ":") + replacePath;
 
         envVars.put("LD_PRELOAD", ld_preload);
 
         envVars.put("EVSHIM_SHM_NAME", "controller-shm0");
-
-        // Check for specific shared memory libraries
-//        if ((new File(imageFs.getLibDir(), "libandroid-sysvshm.so")).exists()){
-//            ld_preload = imageFs.getLibDir() + "/libandroid-sysvshm.so";
-//        }
-
-        //String nativeDir = context.getApplicationInfo().nativeLibraryDir; // e.g. /data/app/…/lib/arm64
 
         // Merge any additional environment variables from external sources
         if (this.envVars != null) {

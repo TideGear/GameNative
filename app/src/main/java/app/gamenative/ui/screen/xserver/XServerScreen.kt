@@ -408,7 +408,21 @@ fun XServerScreen(
     var gracefulExitJob: Job? by remember { mutableStateOf(null) }
 
     DisposableEffect(Unit) {
+        // Forward controller-removed events so PhysicalControllerHandler can
+        // release stale axis state and d-pad suppression for the lost device
+        // before Android potentially recycles its deviceId for a new controller.
+        val inputManager = context.getSystemService(Context.INPUT_SERVICE) as InputManager
+        val deviceListener = object : InputManager.InputDeviceListener {
+            override fun onInputDeviceAdded(deviceId: Int) = Unit
+            override fun onInputDeviceChanged(deviceId: Int) = Unit
+            override fun onInputDeviceRemoved(deviceId: Int) {
+                physicalControllerHandler?.onDeviceDisconnected(deviceId)
+            }
+        }
+        inputManager.registerInputDeviceListener(deviceListener, null)
+
         onDispose {
+            inputManager.unregisterInputDeviceListener(deviceListener)
             physicalControllerHandler?.cleanup()
             physicalControllerHandler = null
             exitWatchJob?.cancel()
@@ -1174,8 +1188,6 @@ fun XServerScreen(
                     PluviaApp.isOverlayPaused &&
                     !showQuickMenu &&
                     !keepPausedForEditor
-            // logD("onKeyEvent(${it.event.device.sources})\n\tisGamepad: $isGamepad\n\tisKeyboard: $isKeyboard\n\t${it.event}")
-
             if (waitingForManualResume) {
                 when (it.event.keyCode) {
                     KeyEvent.KEYCODE_ENTER,
@@ -1204,7 +1216,6 @@ fun XServerScreen(
                 if (isGamepad) {
                     handled = physicalControllerHandler?.onKeyEvent(it.event) == true
                     if (!handled) handled = PluviaApp.inputControlsView?.onKeyEvent(it.event) == true
-                    // Final fallback to WinHandler passthrough
                     if (!handled) handled = xServerView!!.getxServer().winHandler.onKeyEvent(it.event)
                 }
                 if (!handled && isKeyboard) {
@@ -1642,6 +1653,12 @@ fun XServerScreen(
                             }
                             handler.setPreferredInputApi(PreferredInputApi.values()[container.inputType])
                             handler.setDInputMapperType(container.dinputMapperType)
+                            handler.setVibrationMode(
+                                PrefManager.normalizeVibrationModeInput(
+                                    container.getExtra("vibrationMode", "controller"),
+                                ),
+                            )
+                            handler.setVibrationIntensity(container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100)
                             if (container.isDisableMouseInput()) {
                                 PluviaApp.touchpadView?.setTouchscreenMouseDisabled(true)
                             } else if (container.isTouchscreenMode()) {

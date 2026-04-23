@@ -17,3 +17,8 @@ target_link_libraries(extras
         GLESv2
         GLESv3
         adrenotools)
+
+add_library(evshim SHARED evshim.c)
+target_include_directories(evshim PRIVATE sdl2_stub)
+target_link_libraries(evshim dl)
+set_target_properties(evshim PROPERTIES LINK_FLAGS "-Wl,--as-needed")
