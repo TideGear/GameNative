@@ -2240,10 +2240,48 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                 // could still surface here. Strip those so we never surface
                                                 // spurious dialogs or kick our own launch — genuine entries
                                                 // from other devices still flow through.
-                                                val pendingRemoteOperations = if (isLaunchRealSteam) {
+                                                var pendingRemoteOperations = if (isLaunchRealSteam) {
                                                     rawPending.filterNot { it.machineName.equals("localhost", ignoreCase = true) }
                                                 } else {
                                                     rawPending
+                                                }
+
+                                                // Self-phantom auto-clear: when every pending op is from our own
+                                                // machine name (device was killed mid-session / mid-upload and the
+                                                // server-side markers never got released), kick any stale
+                                                // AppSessionActive and re-signal with ignorePendingOperations=true.
+                                                // This is what the user's emulation-mode workaround does manually;
+                                                // automating it avoids the spurious "Pending Upload" dialog that
+                                                // blocks the next launch. Cross-device conflicts (different machine
+                                                // name) still surface the dialog for genuine review.
+                                                val ourMachineName = SteamUtils.getMachineName(steamInstance)
+                                                val allSelfPhantoms = pendingRemoteOperations.isNotEmpty() &&
+                                                    pendingRemoteOperations.all {
+                                                        it.machineName.equals(ourMachineName, ignoreCase = true)
+                                                    }
+                                                if (allSelfPhantoms && !ignorePendingOperations) {
+                                                    Timber.i(
+                                                        "All ${pendingRemoteOperations.size} pending op(s) are self-phantoms from \"$ourMachineName\" (${pendingRemoteOperations.joinToString { it.operation.name }}); kicking and retrying silently",
+                                                    )
+                                                    if (pendingRemoteOperations.any {
+                                                            it.operation == ECloudPendingRemoteOperation.k_ECloudPendingRemoteOperationAppSessionActive
+                                                        }
+                                                    ) {
+                                                        runCatching { steamInstance._steamUser?.kickPlayingSession() }
+                                                            .onFailure { Timber.w(it, "Self-phantom AppSessionActive kick failed") }
+                                                    }
+                                                    pendingRemoteOperations = runCatching {
+                                                        steamCloud.signalAppLaunchIntent(
+                                                            appId = appId,
+                                                            clientId = clientId,
+                                                            machineName = ourMachineName,
+                                                            ignorePendingOperations = true,
+                                                            osType = EOSType.AndroidUnknown,
+                                                        ).await().also { launchIntentRegistered = true }
+                                                    }.getOrElse {
+                                                        Timber.w(it, "Self-phantom retry signalAppLaunchIntent failed; falling back to original list")
+                                                        pendingRemoteOperations
+                                                    }
                                                 }
 
                                                 if (pendingRemoteOperations.isNotEmpty() && !ignorePendingOperations) {
