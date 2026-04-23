@@ -203,9 +203,11 @@ private const val QUICK_MENU_PROCESS_POLL_INTERVAL_MS = 2_000L
 private const val GRACEFUL_EXIT_GRACE_MS = 5_000L
 
 // Flags passed to steam.exe in real-Steam launch mode.
-// -silent: start without main window; -vgui: classic UI renderer (more compatible under Wine);
+// -vgui: classic UI renderer (more compatible under Wine);
 // -tcp: avoid named-pipe handshake wait; -nobigpicture/-nofriendsui/-nochatui/-nointro: suppress optional UIs.
-private const val STEAM_LAUNCH_FLAGS = "-silent -vgui -tcp -nobigpicture -nofriendsui -nochatui -nointro"
+// -silent was dropped intentionally: it suppressed Steam's cloud-conflict resolution dialog,
+// causing silent launch hangs on save-sync conflicts. The Steam main window shows briefly at launch.
+private const val STEAM_LAUNCH_FLAGS = "-vgui -tcp -nobigpicture -nofriendsui -nochatui -nointro"
 
 private data class XServerViewReleaseBinding(
     val xServerView: XServerView,

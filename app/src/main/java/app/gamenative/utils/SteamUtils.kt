@@ -807,8 +807,8 @@ object SteamUtils {
                         steamAppId,
                     )
                 }
-                // Still refresh 228980's manifest — it's independent of the child's state.
-                writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
+                // Still refresh shared helper manifests (228980, 241100) — they're independent of the child's state.
+                writeAllSharedAppManifests(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
                 return
             }
 
@@ -903,24 +903,28 @@ object SteamUtils {
             val acfFile = File(steamappsDir, "appmanifest_$steamAppId.acf")
             acfFile.writeText(acfContent)
 
-            // Always write a real appmanifest_228980.acf for Steamworks Common
-            // Redistributables — Steam's PICS metadata declares this dependency
-            // server-side (not in the child's depot list), and without a valid
-            // 228980 manifest the child gets stuck in Update Queued / gray Play.
-            // writeSteamworksCommonManifest is a no-op if PICS has no AppInfo for 228980.
-            writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
+            // Always refresh shared helper manifests: 228980 (Steamworks Common
+            // Redistributables — referenced via child's SharedDepots) and 241100
+            // (Steam Controller Configs — auto-installed by Steam for any game
+            // using Steam Input, regardless of child declaration). Without valid
+            // manifests for these, the child gets stuck in Update Queued / gray
+            // Play. The writers are no-ops when PICS has no AppInfo for a helper.
+            writeAllSharedAppManifests(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
 
             // Self-check: assert the acfs we just wrote are in the shape that
             // avoids gray Play. Catches silent regressions in the writers + any
             // case where Steam immediately rewrites the file between our write
             // and the next launch.
             validateAcfShape(acfFile, expectDepotCount = regularDepots.size, label = "child $steamAppId")
-            if (sharedDepots.isNotEmpty()) {
-                validateAcfShape(
-                    File(steamappsDir, "appmanifest_228980.acf"),
-                    expectDepotCount = -1,
-                    label = "shared 228980",
-                )
+            sharedHelperApps.forEach { helper ->
+                val helperAcf = File(steamappsDir, "appmanifest_${helper.appId}.acf")
+                if (helperAcf.isFile) {
+                    validateAcfShape(
+                        helperAcf,
+                        expectDepotCount = -1,
+                        label = "shared ${helper.appId}",
+                    )
+                }
             }
 
         } catch (e: Exception) {
@@ -968,17 +972,19 @@ object SteamUtils {
         229032 to "_CommonRedist\\\\PhysX\\\\9.13.1220\\\\installscript.vdf",
     )
 
-    // Resolve the depots that 228980 owns for this child by intersecting the
-    // child's PICS-declared SharedDepots with 228980's own PICS depot list,
-    // pulling manifest GID + size from PICS. This replaces the old approach of
-    // hardcoding a depot table and filtering by installscript.vdf presence —
-    // that broke for games (DD, others) that ship a half-empty _CommonRedist.
-    private fun resolveSharedDepotsForChild(
+    // Resolve depots for a shared parent app (228980, 241100, etc.) by pulling
+    // manifest GID + size from the parent's own PICS entry. If depotFilter is
+    // non-null, only those depot IDs are kept (used when a child game declares
+    // its own SharedDepots list, e.g. 228980's 228985/228989). If null, every
+    // depot PICS lists for the parent is included (used for apps Steam
+    // auto-installs regardless of child declaration, e.g. 241100 Steam Input).
+    private fun resolveSharedAppDepots(
         sharedAppId: Int,
-        childSharedDepotIds: Set<Int>,
+        depotFilter: Set<Int>?,
     ): List<ResolvedSharedDepot> {
         val sharedAppInfo = SteamService.getAppInfoOf(sharedAppId) ?: return emptyList()
-        return childSharedDepotIds.mapNotNull { depotId ->
+        val depotIds = depotFilter ?: sharedAppInfo.depots.keys
+        return depotIds.mapNotNull { depotId ->
             val depot = sharedAppInfo.depots[depotId] ?: return@mapNotNull null
             val manifest = depot.manifests["public"]
                 ?: depot.manifests.values.firstOrNull()
@@ -993,25 +999,50 @@ object SteamUtils {
         }
     }
 
+    // Shared helper apps that Steam will try to update before launching any
+    // game unless we pre-declare them as installed. 228980 (Steamworks Common
+    // Redistributables) is referenced via the child's PICS SharedDepots block
+    // (228985/228989 for VC++ redist). Without a valid acf for it, Steam
+    // cascades Update Queued onto the child and grays out Play.
+    //
+    // 241100 (Steam Input configs) was tried here too but caused a worse bug:
+    // Steam's scheduler re-runs `Reconfiguring → Staging → Committing (0 files)`
+    // every 20s indefinitely while the game is running, because its content
+    // lives at workshop/content/241100 (not under common/) and our synthetic
+    // acf makes Steam think it should exist. Left pre-fix behavior alone: 241100
+    // reconciles once and stops.
+    private data class SharedHelperApp(
+        val appId: Int,
+        val installDir: String,
+        // If null: include all depots PICS lists for this app.
+        // If set: only include depots that appear in both PICS and the
+        // provided set (currently only 228980 uses the child-declared set).
+        val useChildDeclaredDepots: Boolean,
+    )
+
+    private val sharedHelperApps = listOf(
+        SharedHelperApp(appId = 228980, installDir = "Steamworks Shared", useChildDeclaredDepots = true),
+    )
+
     /**
-     * Write appmanifest_228980.acf for Steamworks Common Redistributables
-     * declaring exactly the depots whose installscript.vdf is present on disk.
-     * This "0 bytes to download" shape makes Steam's reconcile a ~1s no-op; an
-     * empty or mismatched manifest otherwise leaves 228980 stuck in Update
-     * Queued and cascades gray Play onto the child game.
+     * Write appmanifest_<sharedAppId>.acf for a shared helper app. The
+     * "0 bytes to download" shape makes Steam's reconcile a ~1s no-op; an
+     * empty or mismatched manifest otherwise leaves the helper stuck in
+     * Update Queued and cascades gray Play onto the child game.
      */
-    private fun writeSteamworksCommonManifest(
+    private fun writeSharedAppManifest(
         steamappsDir: File,
         commonDir: File,
         lastOwner: String,
-        childSharedDepotIds: Set<Int> = emptySet(),
+        helper: SharedHelperApp,
+        childSharedDepotIds: Set<Int>,
     ) {
-        val sharedAppId = 228980
+        val sharedAppId = helper.appId
         val staleAcf = File(steamappsDir, "appmanifest_$sharedAppId.acf")
         val sharedAppInfo = SteamService.getAppInfoOf(sharedAppId)
         if (sharedAppInfo == null) {
             if (staleAcf.exists()) staleAcf.delete()
-            Timber.w("writeSteamworksCommonManifest: PICS has no AppInfo for 228980 — Steam will gray Play")
+            Timber.w("writeSharedAppManifest: PICS has no AppInfo for $sharedAppId — Steam may gray Play")
             return
         }
 
@@ -1019,21 +1050,17 @@ object SteamUtils {
             ?: sharedAppInfo.branches.values.firstOrNull()?.buildId
             ?: 0L
         if (sharedBuildId == 0L) {
-            Timber.w("writeSteamworksCommonManifest: 228980 PICS has no buildid — skipping")
+            Timber.w("writeSharedAppManifest: $sharedAppId PICS has no buildid — skipping")
             return
         }
 
-        // Source-of-truth: PICS. Resolve exactly the depots this child declared
-        // as owned by 228980, pulling manifest GIDs + sizes from PICS itself.
-        // No dependency on installscript.vdf files on disk — that's what
-        // trapped us in the empty-InstalledDepots → gray Play state for games
-        // like DD that ship a half-empty _CommonRedist skeleton.
-        val presentDepots = resolveSharedDepotsForChild(sharedAppId, childSharedDepotIds)
+        val depotFilter = if (helper.useChildDeclaredDepots) childSharedDepotIds else null
+        val presentDepots = resolveSharedAppDepots(sharedAppId, depotFilter)
         if (presentDepots.isEmpty()) {
             if (staleAcf.exists()) staleAcf.delete()
             Timber.w(
-                "writeSteamworksCommonManifest: no 228980 depots resolvable from PICS for child shared=%s — deleting stale acf",
-                childSharedDepotIds,
+                "writeSharedAppManifest: no $sharedAppId depots resolvable from PICS (filter=%s) — deleting stale acf",
+                depotFilter,
             )
             return
         }
@@ -1053,7 +1080,7 @@ object SteamUtils {
             }
         }
 
-        val sharedInstallDir = "Steamworks Shared"
+        val sharedInstallDir = helper.installDir
         val sharedCommonDir = File(commonDir, sharedInstallDir)
         if (!sharedCommonDir.exists()) {
             sharedCommonDir.mkdirs()
@@ -1067,9 +1094,9 @@ object SteamUtils {
             appendLine("\t\"appid\"\t\t\"$sharedAppId\"")
             appendLine("\t\"Universe\"\t\t\"1\"")
             appendLine("\t\"LauncherPath\"\t\t\"$launcherPath\"")
-            appendLine("\t\"name\"\t\t\"${escapeString(sharedAppInfo.name.ifBlank { "Steamworks Common Redistributables" })}\"")
+            appendLine("\t\"name\"\t\t\"${escapeString(sharedAppInfo.name.ifBlank { "App $sharedAppId" })}\"")
             appendLine("\t\"StateFlags\"\t\t\"4\"")
-            appendLine("\t\"installdir\"\t\t\"$sharedInstallDir\"")
+            appendLine("\t\"installdir\"\t\t\"${escapeString(sharedInstallDir)}\"")
             appendLine("\t\"LastUpdated\"\t\t\"${System.currentTimeMillis() / 1000}\"")
             appendLine("\t\"LastPlayed\"\t\t\"0\"")
             val presentSizeOnDisk = presentDepots.sumOf { it.size }
@@ -1099,12 +1126,15 @@ object SteamUtils {
             }
             appendLine("\t}")
 
-            appendLine("\t\"InstallScripts\"")
-            appendLine("\t{")
-            presentDepots.filter { it.installScript.isNotEmpty() }.forEach { d ->
-                appendLine("\t\t\"${d.id}\"\t\t\"${d.installScript}\"")
+            val scriptedDepots = presentDepots.filter { it.installScript.isNotEmpty() }
+            if (scriptedDepots.isNotEmpty()) {
+                appendLine("\t\"InstallScripts\"")
+                appendLine("\t{")
+                scriptedDepots.forEach { d ->
+                    appendLine("\t\t\"${d.id}\"\t\t\"${d.installScript}\"")
+                }
+                appendLine("\t}")
             }
-            appendLine("\t}")
 
             appendLine("\t\"UserConfig\"")
             appendLine("\t{")
@@ -1118,6 +1148,28 @@ object SteamUtils {
         }
 
         staleAcf.writeText(acfContent)
+    }
+
+    // AppIds that an older build of GameNative wrote synthetic manifests for,
+    // but which have since been removed from sharedHelperApps. Delete any
+    // leftover acfs so Steam doesn't keep reconciling phantom installs.
+    private val retiredSharedHelperAppIds = setOf(241100)
+
+    private fun writeAllSharedAppManifests(
+        steamappsDir: File,
+        commonDir: File,
+        lastOwner: String,
+        childSharedDepotIds: Set<Int>,
+    ) {
+        retiredSharedHelperAppIds.forEach { retiredId ->
+            val stale = File(steamappsDir, "appmanifest_$retiredId.acf")
+            if (stale.isFile && stale.delete()) {
+                Timber.i("writeAllSharedAppManifests: removed stale appmanifest_%d.acf from prior build", retiredId)
+            }
+        }
+        sharedHelperApps.forEach { helper ->
+            writeSharedAppManifest(steamappsDir, commonDir, lastOwner, helper, childSharedDepotIds)
+        }
     }
 
     private fun escapeString(input: String?): String {
