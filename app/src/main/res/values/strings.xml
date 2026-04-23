@@ -732,6 +732,14 @@
     <string name="shooter_mode_on">Enable Mouse</string>
     <string name="shooter_mode_off">Enable Sticks</string>
 
+    <!-- Vibration Settings -->
+    <string name="vibration_mode">Vibration Mode</string>
+    <string name="vibration_intensity">Vibration Intensity</string>
+    <string name="vibration_mode_option_off">Off</string>
+    <string name="vibration_mode_option_controller">Controller</string>
+    <string name="vibration_mode_option_device">Device</string>
+    <string name="vibration_mode_option_both">Both</string>
+
     <!-- Gesture Settings Dialog -->
     <string name="gesture_settings">Gesture Settings</string>
     <string name="gesture_settings_title">Touch Gesture Settings</string>
