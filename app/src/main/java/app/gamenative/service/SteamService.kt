@@ -2180,14 +2180,14 @@ class SteamService : Service(), IChallengeUrlChanged {
             // orphan phantoms from prior aborted launches without disrupting anything we're
             // about to do — we don't signal an intent in real-Steam mode anyway.
             //
-            // kickPlayingSession alone only clears AppSessionActive; UploadPending /
-            // UploadInProgress markers survive it and will be observed by Wine-Steam's
-            // subsequent BYieldingAppLaunchIntent, stalling the launch at a black screen
-            // (cloud-conflict dialog hidden behind suppressed UI). To also clear upload
-            // markers — including the "localhost" flavor left by a prior Wine-Steam
-            // session that was killed mid-cycle — open a launch intent with
-            // ignorePendingOperations=true (the server-side "Play Anyway" dismissal) and
-            // immediately exit cleanly so no GameNative-side session lingers.
+            // Probe first: a bare signalAppLaunchIntent with ignorePendingOperations=false
+            // returns the list of pending ops without dismissing them. Only run the full
+            // dismissal cycle if the server actually reports a phantom, so we don't
+            // advance the cloud ChangeNumber on clean launches. A prior iteration always
+            // ran signalAppExitSyncDone(uploadsCompleted=true) proactively, which lied to
+            // the server that we completed uploads and reset cloud ChangeNumber to 0 —
+            // Wine-Steam then "forgot" steam_autocloud.vdf and games with Steamworks
+            // cloud integration (e.g. 868-HACK) exited with code 1.
             if (isLaunchRealSteam) {
                 runCatching { instance?._steamUser?.kickPlayingSession() }
                     .onFailure { Timber.w(it, "Proactive kickPlayingSession before real-Steam launch failed") }
@@ -2196,23 +2196,45 @@ class SteamService : Service(), IChallengeUrlChanged {
                 val steamCloud = steamInstance?._steamCloud
                 val proactiveClientId = PrefManager.clientId
                 if (steamInstance != null && steamCloud != null && proactiveClientId != null) {
+                    val ourMachineName = SteamUtils.getMachineName(steamInstance)
                     runCatching {
-                        steamCloud.signalAppLaunchIntent(
+                        val probed = steamCloud.signalAppLaunchIntent(
                             appId = appId,
                             clientId = proactiveClientId,
-                            machineName = SteamUtils.getMachineName(steamInstance),
-                            ignorePendingOperations = true,
+                            machineName = ourMachineName,
+                            ignorePendingOperations = false,
                             osType = EOSType.AndroidUnknown,
                         ).await()
-                        steamCloud.signalAppExitSyncDone(
-                            appId = appId,
-                            clientId = proactiveClientId,
-                            uploadsCompleted = true,
-                            uploadsRequired = false,
-                        )
+
+                        if (probed.isNotEmpty()) {
+                            Timber.i(
+                                "Proactive real-Steam probe found %d pending op(s) (%s); dismissing phantom",
+                                probed.size,
+                                probed.joinToString { "${it.machineName}:${it.operation.name}" },
+                            )
+                            steamCloud.signalAppLaunchIntent(
+                                appId = appId,
+                                clientId = proactiveClientId,
+                                machineName = ourMachineName,
+                                ignorePendingOperations = true,
+                                osType = EOSType.AndroidUnknown,
+                            ).await()
+                            steamCloud.signalAppExitSyncDone(
+                                appId = appId,
+                                clientId = proactiveClientId,
+                                uploadsCompleted = false,
+                                uploadsRequired = false,
+                            )
+                        }
                     }.onFailure {
-                        Timber.w(it, "Proactive phantom-clearing cycle before real-Steam launch failed")
+                        Timber.w(it, "Proactive phantom-clearing probe before real-Steam launch failed")
                     }
+
+                    // Release the AppSessionActive the probe RPC registered under our
+                    // machineName so Wine-Steam's subsequent localhost intent doesn't see
+                    // a conflicting session from us.
+                    runCatching { steamInstance._steamUser?.kickPlayingSession() }
+                        .onFailure { Timber.w(it, "Probe-session kick after proactive launch intent failed") }
                 }
             }
 
