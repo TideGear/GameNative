@@ -159,8 +159,9 @@ public class DRI3Extension implements Extension {
         try {
             GPUImage gpuImage = new GPUImage(fd);
             Drawable drawable = client.xServer.drawableManager.createDrawable(pixmapId, gpuImage.getStride(), height, depth);
+            if (drawable == null) throw new BadIdChoice(pixmapId);
             drawable.setTexture(gpuImage);
-            client.xServer.pixmapManager.createPixmap(drawable);
+            if (client.xServer.pixmapManager.createPixmap(drawable) == null) throw new BadIdChoice(pixmapId);
         }
         finally {
             XConnectorEpoll.closeFd(fd);
@@ -174,10 +175,11 @@ public class DRI3Extension implements Extension {
 
             short totalWidth = (short)(stride / 4);
             Drawable drawable = client.xServer.drawableManager.createDrawable(pixmapId, totalWidth, height, depth);
+            if (drawable == null) throw new BadIdChoice(pixmapId);
             drawable.setData(buffer);
             drawable.setTexture(null);
             drawable.setOnDestroyListener(onDestroyDrawableListener);
-            client.xServer.pixmapManager.createPixmap(drawable);
+            if (client.xServer.pixmapManager.createPixmap(drawable) == null) throw new BadIdChoice(pixmapId);
         }
         finally {
             XConnectorEpoll.closeFd(fd);
