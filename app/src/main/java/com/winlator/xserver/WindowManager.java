@@ -1,5 +1,6 @@
 package com.winlator.xserver;
 
+import android.util.Log;
 import android.util.SparseArray;
 
 import com.winlator.xconnector.XInputStream;
@@ -183,7 +184,41 @@ public class WindowManager extends XResourceManager {
         windows.put(id, window);
         parent.addChild(window);
         triggerOnCreateResourceListener(window);
+        reapLeakedClientWindows(window);
         return window;
+    }
+
+    private static final int LEAK_CLIENT_CAP = 8;
+
+    private void reapLeakedClientWindows(Window created) {
+        if (created == rootWindow || !created.isInputOutput()) return;
+        if (!created.getClassName().isEmpty()) return;
+        XClient createdClient = created.originClient;
+        if (createdClient == null) return;
+        int w = created.getWidth();
+        int h = created.getHeight();
+
+        ArrayList<Window> matches = new ArrayList<>();
+        for (int i = 0; i < windows.size(); i++) {
+            Window cand = windows.valueAt(i);
+            if (cand == null || cand == created || cand == rootWindow) continue;
+            if (cand.originClient != createdClient) continue;
+            if (!cand.isInputOutput()) continue;
+            if (!cand.getClassName().isEmpty()) continue;
+            if (cand.getWidth() != w || cand.getHeight() != h) continue;
+            matches.add(cand);
+        }
+        if (matches.size() < LEAK_CLIENT_CAP) return;
+
+        matches.sort((a, b) -> Integer.compareUnsigned(a.id, b.id));
+        int toReap = matches.size() - (LEAK_CLIENT_CAP - 1);
+        for (int i = 0; i < toReap && i < matches.size(); i++) {
+            Window victim = matches.get(i);
+            Log.w("WindowManager", "reapLeakedClientWindow: wid=" + victim.id
+                    + " parent=" + (victim.getParent() == null ? "null" : Integer.toString(victim.getParent().id))
+                    + " (cap=" + LEAK_CLIENT_CAP + " matches=" + matches.size() + ")");
+            destroyWindow(victim.id);
+        }
     }
 
     private void changeWindowGeometry(Window window, short x, short y, short width, short height) {
