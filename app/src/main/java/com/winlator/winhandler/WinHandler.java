@@ -63,9 +63,7 @@ public class WinHandler {
 
     private static final String TAG = "WinHandler";
     private final ControllerManager controllerManager;
-    public static final int MAX_PLAYERS = 4;
-    private final MappedByteBuffer[] extraGamepadBuffers = new MappedByteBuffer[MAX_PLAYERS - 1];
-    private final ExternalController[] extraControllers = new ExternalController[MAX_PLAYERS - 1];
+    public static final int MAX_PLAYERS = 1;
     private MappedByteBuffer gamepadBuffer;
     private static final short SERVER_PORT = 7947;
     private static final short CLIENT_PORT = 7946;
@@ -191,13 +189,10 @@ public class WinHandler {
         }
     }
 
-    /** Re-scans connected devices and re-initializes per-slot ExternalController references. */
+    /** Re-scans connected devices and re-initializes the Player 1 ExternalController reference. */
     public void refreshControllerMappings() {
         Log.d(TAG, "Refreshing controller assignments from settings...");
         currentController = null;
-        for (int i = 0; i < extraControllers.length; i++) {
-            extraControllers[i] = null;
-        }
         controllerManager.scanForDevices();
         InputDevice p1Device = controllerManager.getAssignedDeviceForSlot(0);
         if (p1Device != null) {
@@ -207,51 +202,6 @@ public class WinHandler {
                 Log.i(TAG, "Initialized Player 1 with: " + p1Device.getName());
             }
         }
-        // Initialize Extra Players (2, 3, 4)
-        for (int i = 0; i < extraControllers.length; i++) {
-            // Player 2 is slot 1, which corresponds to extraControllers[0]
-            InputDevice extraDevice = controllerManager.getAssignedDeviceForSlot(i + 1);
-            if (extraDevice != null) {
-                extraControllers[i] = ExternalController.getController(extraDevice.getId());
-                Log.i(TAG, "Initialized Player " + (i + 2) + " with: " + extraDevice.getName());
-            }
-        }
-    }
-
-    /** Returns the shared-memory buffer for the given player slot (0-based), or null if unavailable. */
-    public MappedByteBuffer getBufferForSlot(int slot) {
-        if (slot == 0) return gamepadBuffer;
-        if (slot > 0 && slot <= extraGamepadBuffers.length) return extraGamepadBuffers[slot - 1];
-        return null;
-    }
-
-    /** Returns the ExternalController assigned to the given player slot, or null if none. */
-    public ExternalController getControllerForSlot(int slot) {
-        if (slot == 0) return currentController;
-        if (slot > 0 && slot <= extraControllers.length) return extraControllers[slot - 1];
-        return null;
-    }
-
-    /** Assigns a controller to a player slot, stopping any active vibration on the previous occupant. */
-    public void setControllerForSlot(int slot, ExternalController controller) {
-        if (slot < 0 || slot >= MAX_PLAYERS) return;
-        ExternalController old = getControllerForSlot(slot);
-        if (old != null && old != controller) {
-            stopVibrationForPlayer(slot);
-            lastLowFreqs[slot] = 0;
-            lastHighFreqs[slot] = 0;
-            lastDeviceRefreshMs[slot] = SystemClock.elapsedRealtime();
-            // Zero the shared-memory rumble bytes so the next poll doesn't see
-            // the old controller's stale rumble values and immediately vibrate
-            // the new controller.
-            MappedByteBuffer buf = getBufferForSlot(slot);
-            if (buf != null) {
-                buf.putShort(32, (short) 0);
-                buf.putShort(34, (short) 0);
-            }
-        }
-        if (slot == 0) { currentController = controller; return; }
-        if (slot > 0 && slot <= extraControllers.length) extraControllers[slot - 1] = controller;
     }
 
     private boolean sendPacket(int port) {
@@ -647,16 +597,6 @@ public class WinHandler {
                 gamepadBuffer.order(ByteOrder.LITTLE_ENDIAN);
                 Log.i(TAG, "Successfully created and mapped gamepad file for Player 1");
             }
-            for (int i = 0; i < extraGamepadBuffers.length; i++) {
-                String extra_mem_path = "/data/data/app.gamenative/files/imagefs/tmp/gamepad" + (i + 1) + ".mem";
-                File extra_memFile = new File(extra_mem_path);
-                try (RandomAccessFile raf = new RandomAccessFile(extra_memFile, "rw")) {
-                    raf.setLength(64);
-                    extraGamepadBuffers[i] = raf.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, 64);
-                    extraGamepadBuffers[i].order(ByteOrder.LITTLE_ENDIAN);
-                    Log.i(TAG, "Successfully created and mapped gamepad file for Player " + (i + 2));
-                }
-            }
         } catch (IOException e) {
             Log.e("EVSHIM_HOST", "FATAL: Failed to create memory-mapped file(s).", e);
             try {
@@ -700,30 +640,22 @@ public class WinHandler {
      */
     @SuppressWarnings("deprecation")  // FileObserver(String, int) deprecated API 29; File ctor not available below Q
     private void startRumblePoller() {
-        final String[] memPaths = {
-            "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem",
-            "/data/data/app.gamenative/files/imagefs/tmp/gamepad1.mem",
-            "/data/data/app.gamenative/files/imagefs/tmp/gamepad2.mem",
-            "/data/data/app.gamenative/files/imagefs/tmp/gamepad3.mem",
-        };
+        final String memPath = "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem";
 
-        for (int i = 0; i < MAX_PLAYERS; i++) {
-            final String path = memPaths[i];
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                gamepadFileObservers[i] = new FileObserver(new File(path), FileObserver.MODIFY) {
-                    @Override public void onEvent(int event, String filename) {
-                        synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
-                    }
-                };
-            } else {
-                gamepadFileObservers[i] = new FileObserver(path, FileObserver.MODIFY) {
-                    @Override public void onEvent(int event, String filename) {
-                        synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
-                    }
-                };
-            }
-            gamepadFileObservers[i].startWatching();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            gamepadFileObservers[0] = new FileObserver(new File(memPath), FileObserver.MODIFY) {
+                @Override public void onEvent(int event, String filename) {
+                    synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
+                }
+            };
+        } else {
+            gamepadFileObservers[0] = new FileObserver(memPath, FileObserver.MODIFY) {
+                @Override public void onEvent(int event, String filename) {
+                    synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
+                }
+            };
         }
+        gamepadFileObservers[0].startWatching();
 
         rumblePollerThread = new Thread(() -> {
             long now = SystemClock.elapsedRealtime();
@@ -737,7 +669,7 @@ public class WinHandler {
 
                 for (int p = 0; p < MAX_PLAYERS; p++) {
                     try {
-                        MappedByteBuffer buf = getBufferForSlot(p);
+                        MappedByteBuffer buf = gamepadBuffer;
                         if (buf == null) continue;
                         short lowFreq = buf.getShort(32);
                         short highFreq = buf.getShort(34);
@@ -893,7 +825,7 @@ public class WinHandler {
         InputDevice device = controllerManager.getAssignedDeviceForSlot(player);
         if (device != null) return device;
 
-        ExternalController ctrl = getControllerForSlot(player);
+        ExternalController ctrl = currentController;
         if (ctrl != null) {
             device = InputDevice.getDevice(ctrl.getDeviceId());
             if (device != null) return device;
@@ -1093,69 +1025,60 @@ public class WinHandler {
         }
     }
 
-    /**
-     * Resolves (or adopts) an ExternalController for the given device into the correct player slot.
-     * Returns the slot index (0-3) or -1 if the device is not a game controller.
-     */
-    private int resolveControllerSlot(int deviceId) {
-        int slot = controllerManager.autoAssignDevice(deviceId);
-        if (slot < 0) return -1;
-
-        ExternalController controller = getControllerForSlot(slot);
-        if (controller == null || controller.getDeviceId() != deviceId) {
-            ExternalController adopted = ExternalController.getController(deviceId);
-            if (adopted == null && inputControlsView != null) {
-                ControlsProfile profile = inputControlsView.getProfile();
-                if (profile != null) {
-                    adopted = profile.getController(deviceId);
-                }
-            }
-            if (adopted != null) {
-                setControllerForSlot(slot, adopted);
-                Timber.d("WinHandler: adopted controller %s(#%d) to slot %d", adopted.getName(), adopted.getDeviceId(), slot);
-            }
-        }
-        return slot;
-    }
-
-    /** Handles joystick/gamepad motion events, routing them to the correct player slot. */
+    /** Handles joystick/gamepad motion events for the Player 1 controller. */
     public boolean onGenericMotionEvent(MotionEvent event) {
-        if (!ExternalController.isJoystickDevice(event)) return false;
-
-        int slot = resolveControllerSlot(event.getDeviceId());
-        if (slot < 0) return false;
-
-        ExternalController controller = getControllerForSlot(slot);
-        if (controller != null && controller.updateStateFromMotionEvent(event)) {
-            MappedByteBuffer buffer = getBufferForSlot(slot);
-            if (buffer != null) sendMemoryFileState(controller, buffer);
-            if (slot == 0) sendGamepadState();
-            return true;
+        boolean handled = false;
+        ExternalController externalController = this.currentController;
+        if ((externalController == null || externalController.getDeviceId() != event.getDeviceId()) && ExternalController.isJoystickDevice(event)) {
+            ExternalController adopted = null;
+            if (inputControlsView != null) {
+                ControlsProfile profile = inputControlsView.getProfile();
+                if (profile != null) adopted = profile.getController(event.getDeviceId());
+            }
+            if (adopted == null) adopted = ExternalController.getController(event.getDeviceId());
+            if (adopted != null && "*".equals(adopted.getId())) {
+                this.currentController = adopted;
+                externalController = adopted;
+                Timber.d("WinHandler.onGenericMotionEvent: adopted controller %s(#%d)", adopted.getName(), adopted.getDeviceId());
+            }
         }
-        return false;
+        if (externalController != null && externalController.getDeviceId() == event.getDeviceId() && (handled = this.currentController.updateStateFromMotionEvent(event))) {
+            sendGamepadState();
+            sendMemoryFileState(this.currentController, gamepadBuffer);
+        }
+        return handled;
     }
 
-    /** Handles controller button press/release events, routing them to the correct player slot. */
+    /** Handles controller button press/release events for the Player 1 controller. */
     public boolean onKeyEvent(KeyEvent event) {
         InputDevice device = event.getDevice();
         if (device == null || !ExternalController.isGameController(device) || event.getRepeatCount() != 0) {
             return false;
         }
 
-        int slot = resolveControllerSlot(event.getDeviceId());
-        if (slot < 0) return false;
-
-        ExternalController controller = getControllerForSlot(slot);
-        if (controller == null) return false;
+        ExternalController controller = this.currentController;
+        if ((controller == null || controller.getDeviceId() != event.getDeviceId())) {
+            ExternalController adopted = null;
+            if (inputControlsView != null) {
+                ControlsProfile profile = inputControlsView.getProfile();
+                if (profile != null) adopted = profile.getController(event.getDeviceId());
+            }
+            if (adopted == null) adopted = ExternalController.getController(event.getDeviceId());
+            if (adopted != null && "*".equals(adopted.getId())) {
+                this.currentController = adopted;
+                controller = adopted;
+                Timber.d("WinHandler.onKeyEvent: adopted controller %s(#%d)", adopted.getName(), adopted.getDeviceId());
+            }
+        }
+        if (controller == null || controller.getDeviceId() != event.getDeviceId()) return false;
 
         boolean handled = false;
         int action = event.getAction();
         if (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) {
             handled = controller.updateStateFromKeyEvent(event);
         }
-        MappedByteBuffer buffer = getBufferForSlot(slot);
-        if (buffer != null) sendMemoryFileState(controller, buffer);
-        if (handled && slot == 0) sendGamepadState();
+        sendMemoryFileState(controller, gamepadBuffer);
+        if (handled) sendGamepadState();
         return handled;
     }
 
@@ -1256,23 +1179,13 @@ public class WinHandler {
         gamepadBuffer.put((byte)0); // Ignored HAT value
     }
 
-    /** Populates per-slot ExternalController references from the saved ControllerManager assignments. */
+    /** Populates the Player 1 ExternalController reference from the saved ControllerManager assignment. */
     private void initializeAssignedControllers() {
         Log.d(TAG, "Initializing controller assignments from saved settings...");
-        for (int i = 0; i < MAX_PLAYERS; i++) {
-            InputDevice device = controllerManager.getAssignedDeviceForSlot(i);
-            if (device != null) {
-                ExternalController controller = ExternalController.getController(device.getId());
-                if (i == 0) {
-                    currentController = controller;
-                    Log.d(TAG, "Assigned '" + device.getName() + "' to Player 1 at startup.");
-                } else {
-                    // Remember that extraControllers is 0-indexed for players 2-4
-                    // So Player 2 (slot index 1) goes into extraControllers[0]
-                    extraControllers[i - 1] = controller;
-                    Log.d(TAG, "Assigned '" + device.getName() + "' to Player " + (i + 1) + " at startup.");
-                }
-            }
+        InputDevice device = controllerManager.getAssignedDeviceForSlot(0);
+        if (device != null) {
+            currentController = ExternalController.getController(device.getId());
+            Log.d(TAG, "Assigned '" + device.getName() + "' to Player 1 at startup.");
         }
         // This ensures P1-specific settings (like trigger type) are applied from preferences.
         refreshControllerMappings();

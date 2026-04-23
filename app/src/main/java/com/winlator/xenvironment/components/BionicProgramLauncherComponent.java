@@ -36,7 +36,6 @@ import com.winlator.fexcore.FEXCorePresetManager;
 import com.winlator.sysvshm.SysVSHMConnectionHandler;
 import com.winlator.sysvshm.SysVSHMRequestHandler;
 import com.winlator.sysvshm.SysVSharedMemory;
-import com.winlator.winhandler.WinHandler;
 import com.winlator.xconnector.UnixSocketConfig;
 import com.winlator.xconnector.XConnectorEpoll;
 import com.winlator.xenvironment.ImageFs;
@@ -179,37 +178,14 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
     private int execGuestProgram() {
 
-        // Pre-create all 4 mem files so controllers can be hot-plugged during gameplay.
-        // Only tell evshim to create virtual joysticks for currently connected controllers.
-        int connectedControllers = 0;
-        for (int id : android.view.InputDevice.getDeviceIds()) {
-            android.view.InputDevice dev = android.view.InputDevice.getDevice(id);
-            boolean isController = dev != null && !dev.isVirtual() &&
-                (dev.supportsSource(android.view.InputDevice.SOURCE_GAMEPAD) ||
-                 dev.supportsSource(android.view.InputDevice.SOURCE_JOYSTICK));
-            if (isController) {
-                connectedControllers++;
-            }
-        }
-        final int enabledPlayerCount = Math.max(1, Math.min(connectedControllers, WinHandler.MAX_PLAYERS));
-        Log.i("EvshimDeploy", "Connected controllers: " + connectedControllers + ", evshim players: " + enabledPlayerCount);
-        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            String memPath;
-            if (i == 0) {
-                // Player 1 uses the original, non-numbered path that is known to work.
-                memPath = "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem";
-            } else {
-                // Players 2, 3, 4 use a 1-based index.
-                memPath = "/data/data/app.gamenative/files/imagefs/tmp/gamepad" + i + ".mem";
-            }
-
-            File memFile = new File(memPath);
-            memFile.getParentFile().mkdirs();
-            try (RandomAccessFile raf = new RandomAccessFile(memFile, "rw")) {
-                raf.setLength(64);
-            } catch (IOException e) {
-                Log.e("EVSHIM_HOST", "Failed to create mem file for player index "+i, e);
-            }
+        // Pre-create the Player 1 mem file so evshim can map it.
+        String memPath = "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem";
+        File memFile = new File(memPath);
+        memFile.getParentFile().mkdirs();
+        try (RandomAccessFile raf = new RandomAccessFile(memFile, "rw")) {
+            raf.setLength(64);
+        } catch (IOException e) {
+            Log.e("EVSHIM_HOST", "Failed to create mem file for Player 1", e);
         }
         Context context = environment.getContext();
         ImageFs imageFs = ImageFs.find(context);
@@ -234,8 +210,7 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
         EnvVars envVars = new EnvVars();
 
-        // Use the ControllerManager's dynamic count for the environment variable
-        envVars.put("EVSHIM_MAX_PLAYERS", String.valueOf(enabledPlayerCount));
+        envVars.put("EVSHIM_MAX_PLAYERS", "1");
         if (true) {
             envVars.put("EVSHIM_SHM_ID", 1);
         }
