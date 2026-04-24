@@ -18,6 +18,7 @@ import app.gamenative.utils.CURRENT_UFS_PARSE_VERSION
 import app.gamenative.utils.FileUtils
 import app.gamenative.utils.Net
 import app.gamenative.utils.SteamUtils
+import java.io.File
 import `in`.dragonbra.javasteam.enums.EResult
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileChangeList
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.AppFileInfo
@@ -122,6 +123,16 @@ object SteamAutoCloud {
             .filter { it.uploadRoot != it.root }
             .associate { "%${it.uploadRoot.name}%" to it.root.name }
 
+        // Auto-Cloud games declare saveFilePatterns rooted outside SteamUserData (usually
+        // GameInstall or WinAppData*). Their cloud payloads are sometimes surfaced without a
+        // prefix — either because the cloud entry was uploaded by an old Pluvia build under
+        // SteamUserData, or because Steam's getAppFileListChange returned an empty prefix list.
+        // Either way, naively writing those files to <SteamUserData>/<appid>/remote/ hides them
+        // from the game, which reads from the pattern's real location. Rebase to the matching
+        // saveFilePattern target so the game sees them.
+        val autoCloudPatterns: List<SaveFilePattern> = appInfo.ufs.saveFilePatterns
+            .filter { it.root.isWindows && it.root != PathType.SteamUserData }
+
         // Full-prefix remap for patterns where addPath shifts the local subfolder relative to
         // the cloud path. E.g. cloud "%GameInstall%saves" must land at "<WinAppDataRoaming>/MyGame/saves",
         // not "<WinAppDataRoaming>/saves" — root-only replacement can't express this.
@@ -201,6 +212,48 @@ object SteamAutoCloud {
             Paths.get(getFilePrefix(file, fileList), file.filename).pathString
         }
 
+        val steamUserDataBase = prefixToPath(PathType.SteamUserData.name)
+
+        // Build remotecache.vdf entries from the post-sync local scan so Wine-Steam's
+        // ISteamRemoteStorage indexes the files for SDK-cloud games. With cloudenabled=0
+        // Wine-Steam doesn't rescan remote/ on startup — it trusts this index.
+        val writeRemoteCache: (Map<String, List<UserFileInfo>>, Long) -> Unit = { localMap, changeNumber ->
+            val entries = localMap.values.flatten()
+                .filter { it.root == PathType.SteamUserData }
+                .mapNotNull { file ->
+                    val absPath = file.getAbsPath(prefixToPath)
+                    try {
+                        if (!Files.exists(absPath)) return@mapNotNull null
+                        SteamUtils.RemoteCacheFile(
+                            relativePath = file.filename,
+                            size = Files.size(absPath),
+                            timeSeconds = file.timestamp / 1000,
+                            shaHex = file.sha.joinToString("") { "%02x".format(it) },
+                        )
+                    } catch (e: Exception) {
+                        Timber.w(e, "Skipping remotecache entry for ${file.filename}")
+                        null
+                    }
+                }
+            if (entries.isNotEmpty()) {
+                SteamUtils.writeRemoteCacheVdf(
+                    remoteDir = File(steamUserDataBase),
+                    appId = appInfo.id,
+                    changeNumber = changeNumber,
+                    files = entries,
+                )
+            }
+        }
+
+        val rebaseToAutoCloud: (String) -> Path? = rebase@{ filename ->
+            if (autoCloudPatterns.isEmpty()) return@rebase null
+            val baseName = Paths.get(filename).fileName?.toString() ?: return@rebase null
+            val match = autoCloudPatterns.firstOrNull { p ->
+                FileUtils.matchesGlob(baseName, p.pattern)
+            } ?: return@rebase null
+            Paths.get(prefixToPath(match.root.name), match.substitutedPath, filename)
+        }
+
         val getFullFilePath: (AppFileInfo, AppFileChangeList) -> Path = getFullFilePath@{ file, fileList ->
             val gameInstallPrefix = "%${PathType.GameInstall.name}%"
             if (file.filename.startsWith(gameInstallPrefix)) {
@@ -213,12 +266,23 @@ object SteamAutoCloud {
 
             val convertedPrefixes = convertPrefixes(fileList)
 
-            if (file.pathPrefixIndex < fileList.pathPrefixes.size) {
+            val defaultPath = if (file.pathPrefixIndex < fileList.pathPrefixes.size) {
                 Paths.get(convertedPrefixes[file.pathPrefixIndex], file.filename)
             } else {
                 // if the file does not reference any prefix then we need to set it to the default path
                 Paths.get(prefixToPath(PathType.DEFAULT.name), file.filename)
             }
+
+            // If the download target landed under SteamUserData/<appid>/remote/ but this app
+            // uses Auto-Cloud at a non-SteamUserData root, redirect to the matching pattern
+            // location so the game actually reads the downloaded save.
+            if (defaultPath.toString().startsWith(steamUserDataBase)) {
+                rebaseToAutoCloud(file.filename)?.let { rebased ->
+                    Timber.i("Rebasing SteamUserData-rooted cloud file ${file.filename} to $rebased")
+                    return@getFullFilePath rebased
+                }
+            }
+            defaultPath
         }
 
         val getFilesDiff: (List<UserFileInfo>, List<UserFileInfo>) -> Pair<Boolean, FileChanges> = { currentFiles, oldFiles ->
@@ -315,42 +379,48 @@ object SteamAutoCloud {
                 }
             }
 
-            // Scan SteamUserData root recursively (depth 5)
-            val rootType = PathType.SteamUserData
-            val basePath = Paths.get(prefixToPath(rootType.toString()))
+            // SDK-cloud games (games that call ISteamRemoteStorage directly) keep their
+            // files in SteamUserData/<appid>/remote/. For those we need a catch-all scan
+            // since there's no saveFilePattern to drive it. Skip this scan for Auto-Cloud
+            // games — the files there are ghosts of misrooted uploads, and rescanning them
+            // would re-upload them under SteamUserData and perpetuate the bug.
+            if (autoCloudPatterns.isEmpty()) {
+                val rootType = PathType.SteamUserData
+                val basePath = Paths.get(prefixToPath(rootType.toString()))
 
-            Timber.i("Scanning $basePath recursively (depth 5) under ${rootType.name}")
+                Timber.i("Scanning $basePath recursively (depth 5) under ${rootType.name}")
 
-            val files = FileUtils.findFilesRecursive(
-                rootPath = basePath,
-                pattern = "*",
-                maxDepth = 5,
-            ).map {
-                val sha = streamingShaHash(it)
+                val files = FileUtils.findFilesRecursive(
+                    rootPath = basePath,
+                    pattern = "*",
+                    maxDepth = 5,
+                ).map {
+                    val sha = streamingShaHash(it)
 
-                val relativePath = basePath.relativize(it).pathString
+                    val relativePath = basePath.relativize(it).pathString
 
-                Timber.i("Found ${it.pathString}\n\tin %${rootType.name}%\n\twith sha [${sha.joinToString(", ")}]")
+                    Timber.i("Found ${it.pathString}\n\tin %${rootType.name}%\n\twith sha [${sha.joinToString(", ")}]")
 
-                // Store relative path in filename; empty path component
-                UserFileInfo(
-                    root = rootType,
-                    path = "",
-                    filename = relativePath,
-                    timestamp = Files.getLastModifiedTime(it).toMillis(),
-                    sha = sha,
-                    cloudRoot = rootType,
-                    cloudPath = ""
-                )
-            }.collect(Collectors.toList())
+                    // Store relative path in filename; empty path component
+                    UserFileInfo(
+                        root = rootType,
+                        path = "",
+                        filename = relativePath,
+                        timestamp = Files.getLastModifiedTime(it).toMillis(),
+                        sha = sha,
+                        cloudRoot = rootType,
+                        cloudPath = ""
+                    )
+                }.collect(Collectors.toList())
 
-            Timber.i("Found ${files.size} file(s) in $basePath")
+                Timber.i("Found ${files.size} file(s) in $basePath")
 
-            mapOf(Paths.get("%${rootType.name}%").pathString to files)
-
-            if (files.isNotEmpty()) {
-                val prefixKey = "%${rootType.name}%"
-                result.getOrPut(prefixKey) { mutableListOf() }.addAll(files)
+                if (files.isNotEmpty()) {
+                    val prefixKey = "%${rootType.name}%"
+                    result.getOrPut(prefixKey) { mutableListOf() }.addAll(files)
+                }
+            } else {
+                Timber.i("Skipping SteamUserData scan for Auto-Cloud app ${appInfo.id} (${autoCloudPatterns.size} pattern(s))")
             }
 
             result
@@ -777,6 +847,8 @@ object SteamAutoCloud {
                         }
                     }
 
+                    writeRemoteCache(updatedLocalFiles, cloudAppChangeNumber)
+
                     return@async null
                 }
             }
@@ -811,6 +883,10 @@ object SteamAutoCloud {
                                 changeNumbersDao.insert(appInfo.id, uploadResult.appChangeNumber)
                             }
                         }
+                        writeRemoteCache(
+                            allLocalUserFiles.groupBy { "%${it.root.name}%" },
+                            uploadResult.appChangeNumber,
+                        )
                     } else {
                         syncResult = SyncResult.UpdateFail
                     }
@@ -859,6 +935,10 @@ object SteamAutoCloud {
                                 changeNumbersDao.insert(appInfo.id, cloudAppChangeNumber)
                             }
                         }
+                        writeRemoteCache(
+                            allLocalUserFiles.groupBy { "%${it.root.name}%" },
+                            cloudAppChangeNumber,
+                        )
                         syncResult = SyncResult.UpToDate
                         filesManaged = allLocalUserFiles.size
                         rehydratedSilently = true
@@ -941,6 +1021,11 @@ object SteamAutoCloud {
                         Timber.i("No local changes and no new cloud user files, doing nothing...")
 
                         syncResult = SyncResult.UpToDate
+
+                        // Ensure Wine-Steam's remotecache.vdf is present even when the sync
+                        // is a no-op: on first run after this migration the file may be
+                        // missing for an SDK-cloud app whose cache was already in sync.
+                        writeRemoteCache(localUserFilesMap, cloudAppChangeNumber)
                     }
                 }.inWholeMicroseconds
             } else {

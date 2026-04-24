@@ -208,14 +208,18 @@ private const val GRACEFUL_EXIT_GRACE_MS = 5_000L
 // config/install markers during shutdown and sends its own graceful quit IPC
 // to the running game, so a hard kill before this completes causes next-launch
 // redist-reinstall and lost config/cloud state.
-private const val STEAM_SHUTDOWN_WAIT_MS = 15_000L
+private const val STEAM_SHUTDOWN_WAIT_MS = 20_000L
 
 // Flags passed to steam.exe in real-Steam launch mode.
 // -vgui: classic UI renderer (more compatible under Wine);
 // -tcp: avoid named-pipe handshake wait; -nobigpicture/-nofriendsui/-nochatui/-nointro: suppress optional UIs.
+// -no-browser: skip starting steamwebhelper.exe. Under Wine the webhelper is a
+// documented cause of indefinite `steam.exe -shutdown` hangs (WineHQ #29066,
+// ValveSoftware/steam-for-linux #9575) because it ignores WM_CLOSE and keeps the
+// client alive. We don't need the overlay or store UI for real-Steam launches.
 // -silent was dropped intentionally: it suppressed Steam's cloud-conflict resolution dialog,
 // causing silent launch hangs on save-sync conflicts. The Steam main window shows briefly at launch.
-private const val STEAM_LAUNCH_FLAGS = "-vgui -tcp -nobigpicture -nofriendsui -nochatui -nointro"
+private const val STEAM_LAUNCH_FLAGS = "-vgui -tcp -no-browser -nobigpicture -nofriendsui -nochatui -nointro"
 
 private data class XServerViewReleaseBinding(
     val xServerView: XServerView,
@@ -4031,6 +4035,7 @@ private fun setupWineSystemFiles(
         }
         extractSteamFiles(context, container, onExtractFileListener)
         SteamUtils.ensureSteamCfg(ImageFs.find(context))
+        SteamUtils.purgePhantomAppUserdata(ImageFs.find(context), "241100")
         SteamUtils.logSteamBinaryFingerprint(ImageFs.find(context), "prepareContainer:realSteam")
         container.putExtra("steamExtractedForWine", steamExtractedKey)
         containerDataChanged = true

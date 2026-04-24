@@ -9,6 +9,7 @@ import app.gamenative.data.LaunchInfo
 import app.gamenative.data.ManifestInfo
 import app.gamenative.data.SteamApp
 import app.gamenative.enums.Marker
+import app.gamenative.enums.PathType
 import app.gamenative.enums.SpecialGameSaveMapping
 import app.gamenative.service.SteamService
 import app.gamenative.service.SteamService.Companion.getAppDirName
@@ -885,9 +886,11 @@ object SteamUtils {
                     )
                 }
 
-                // cloud_enabled="0" deliberately: GameNative already runs SteamAutoCloud.syncUserFiles
-                // around every launch, and letting the Wine-hosted Steam client also sync races it
-                // and occasionally blows away saves.
+                // cloud_enabled="0" in both modes: Pluvia's SteamAutoCloud owns cloud sync
+                // (runs on app close + manual "Cloud Sync" button; skipped only on launch in
+                // real-Steam mode to avoid a launch-time conflict dialog). Letting Wine-Steam
+                // also sync in real-Steam mode re-introduced the Steam Input (241100) AutoCloud
+                // watcher and blocked graceful steam.exe -shutdown on cloud upload — hence 0.
                 appendLine("\t\"UserConfig\"")
                 appendLine("\t{")
                 appendLine("\t\t\"language\"\t\t\"english\"")
@@ -1714,6 +1717,31 @@ object SteamUtils {
     }
 
     /**
+     * Removes Steam userdata for a phantom AppID across every logged-in user. When a
+     * synthetic appmanifest_<id>.acf was written in a past session, Steam registers
+     * an AutoCloud watch for that app and on shutdown blocks exit until every
+     * watched file (78 Steam Controller configs for 241100) round-trips the cloud.
+     * Deleting userdata/<steamId>/<phantomAppId>/ breaks the association so
+     * shutdown completes promptly for subsequent real-Steam launches.
+     */
+    fun purgePhantomAppUserdata(imageFs: ImageFs, phantomAppId: String) {
+        try {
+            val userdataRoot = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/userdata")
+            if (!userdataRoot.isDirectory) return
+            val victims = userdataRoot.listFiles { f -> f.isDirectory }?.mapNotNull { userDir ->
+                File(userDir, phantomAppId).takeIf { it.exists() }
+            }.orEmpty()
+            if (victims.isEmpty()) return
+            victims.forEach { dir ->
+                deleteTreeNoFollowSymlinks(dir)
+                Timber.i("purgePhantomAppUserdata: removed ${dir.absolutePath}")
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "purgePhantomAppUserdata[$phantomAppId] failed")
+        }
+    }
+
+    /**
      * Sibling folder "steam_settings" + empty "offline.txt" file, no-ops if they already exist.
      */
     private fun ensureSteamSettings(context: Context, dllPath: Path, appId: String, ticketBase64: String? = null, isOffline: Boolean = false) {
@@ -2102,11 +2130,28 @@ object SteamUtils {
                     app.children.add(KeyValue("LaunchOptions", exeCommandLine))
                 }
 
-                // Suppress the Wine-hosted Steam client's per-app cloud sync. GameNative owns
-                // cloud via its own SteamKit connection around every launch; letting the client
-                // sync in parallel races us and produces spurious Save Conflict popups.
+                // Suppress Wine-Steam's per-app cloud sync. Pluvia's SteamAutoCloud handles
+                // cloud (runs on closeApp + manual sync); letting Wine-Steam also sync
+                // blocked graceful shutdown on cloud upload and resurrected the Steam Input
+                // (241100) AutoCloud watcher that purgePhantomAppUserdata works around.
+                //
+                // "cloudenabled" (no underscore) is the canonical per-app key documented in
+                // community reverse-engineering (l3laze/Steam-Data, l3laze/SteamConfig) and
+                // is what the Steam GUI writes when the user unchecks cloud for a game.
+                // "cloud_enabled" (with underscore) is retained as belt-and-suspenders in
+                // case a client build reads the underscored variant.
+                setOrReplaceKey(app, "cloudenabled", "0")
                 setOrReplaceKey(app, "cloud_enabled", "0")
                 setOrReplaceKey(app, "cce", "0")
+
+                // Wipe AutoCloud reconciliation state left over from a prior run where
+                // cloud_enabled was "1". Wine-Steam uses last_sync_state + autocloud
+                // lastlaunch/lastexit to decide whether to show "Synchronizing cloud
+                // saves" on startup and block shutdown on upload; flipping cloud_enabled
+                // to "0" alone doesn't clear those, so the client keeps reconciling
+                // ghosts on every launch. Pluvia's SteamAutoCloud owns cloud now, so
+                // Wine-Steam shouldn't retain any sync bookkeeping for this app.
+                app.children.removeAll { it.name == "last_sync_state" || it.name == "autocloud" }
 
                 vdfData.saveToFile(localConfigFile, false)
             } else {
@@ -2119,6 +2164,7 @@ object SteamUtils {
                 val app = KeyValue(appId)
 
                 app.children.add(option)
+                app.children.add(KeyValue("cloudenabled", "0"))
                 app.children.add(KeyValue("cloud_enabled", "0"))
                 app.children.add(KeyValue("cce", "0"))
                 apps.children.add(app)
@@ -2129,6 +2175,15 @@ object SteamUtils {
 
                 vdfData.saveToFile(localConfigFile, false)
             }
+
+            // Mirror the per-app cloud-off state into sharedconfig.vdf. Steam keeps
+            // two per-app cloud flags: one in localconfig.vdf (UserLocalConfigStore)
+            // and one in sharedconfig.vdf (UserRoamingConfigStore/Software/Valve/Steam/Apps/<id>).
+            // Different client versions read the roaming vs. local copy at different
+            // points in the login flow, so writing only to localconfig leaves a live
+            // "cloudenabled=1" (or absent=default-on) in sharedconfig that still drives
+            // the "Synchronizing cloud saves" dialog on startup.
+            writeSharedConfigCloudDisabled(steamPath, steamUserId64, appId)
 
             val userLanguage = container.language
             val steamappsDir = File(steamPath, "steamapps")
@@ -2172,6 +2227,91 @@ object SteamUtils {
         } catch (e: Exception) {
             Timber.e(e, "Failed to update or modify local config")
         }
+    }
+
+    private fun writeSharedConfigCloudDisabled(steamPath: File, steamUserId64: String, appId: String) {
+        try {
+            val sharedConfigFile = File(steamPath, "userdata/$steamUserId64/7/remote/sharedconfig.vdf")
+            sharedConfigFile.parentFile?.mkdirs()
+
+            val root = if (sharedConfigFile.exists()) {
+                val content = FileUtils.readFileAsString(sharedConfigFile.absolutePath)
+                KeyValue.loadFromString(content!!) ?: KeyValue(name = "UserRoamingConfigStore")
+            } else {
+                KeyValue(name = "UserRoamingConfigStore")
+            }
+
+            val software = getOrCreateChild(root, "Software")
+            val valve = getOrCreateChild(software, "Valve")
+            val steam = getOrCreateChild(valve, "Steam")
+            // Both casings appear in the wild ("Apps" vs. "apps"); prefer "Apps" per
+            // the documented UserRoamingConfigStore schema but don't duplicate if the
+            // lowercase variant already exists in the file Steam wrote.
+            val apps = steam.children.firstOrNull { it.name.equals("Apps", ignoreCase = true) }
+                ?: KeyValue("Apps").also { steam.children.add(it) }
+            val app = getOrCreateChild(apps, appId)
+            setOrReplaceKey(app, "cloudenabled", "0")
+
+            root.saveToFile(sharedConfigFile, false)
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to write cloudenabled=0 to sharedconfig.vdf for appId=$appId")
+        }
+    }
+
+    data class RemoteCacheFile(
+        val relativePath: String,
+        val size: Long,
+        val timeSeconds: Long,
+        val shaHex: String,
+    )
+
+    /**
+     * Writes <userdata>/<sid>/<appId>/remotecache.vdf so Wine-Steam's ISteamRemoteStorage
+     * reports the cloud files to the game. With cloudenabled=0, Wine-Steam does not
+     * rescan the remote/ directory on startup; it trusts remotecache.vdf. Without this
+     * write, SDK-cloud games (e.g. Dead Cells) see FileExists=false on their saves and
+     * load a blank state even though the files are on disk.
+     */
+    fun writeRemoteCacheVdf(
+        remoteDir: File,
+        appId: Int,
+        changeNumber: Long,
+        files: List<RemoteCacheFile>,
+    ) {
+        try {
+            val userAppDir = remoteDir.parentFile ?: return
+            if (!userAppDir.exists()) userAppDir.mkdirs()
+            val vdfFile = File(userAppDir, "remotecache.vdf")
+
+            val root = KeyValue(appId.toString())
+            root.children.add(KeyValue("ChangeNumber", changeNumber.toString()))
+            root.children.add(KeyValue("ostype", "0"))
+
+            for (entry in files) {
+                val key = entry.relativePath.replace('/', '\\')
+                val node = KeyValue(key)
+                node.children.add(KeyValue("root", "0"))
+                node.children.add(KeyValue("size", entry.size.toString()))
+                node.children.add(KeyValue("localtime", entry.timeSeconds.toString()))
+                node.children.add(KeyValue("time", entry.timeSeconds.toString()))
+                node.children.add(KeyValue("remotetime", entry.timeSeconds.toString()))
+                node.children.add(KeyValue("sha", entry.shaHex))
+                node.children.add(KeyValue("syncstate", "1"))
+                node.children.add(KeyValue("persiststate", "0"))
+                node.children.add(KeyValue("platformstosync2", "-1"))
+                root.children.add(node)
+            }
+
+            root.saveToFile(vdfFile, false)
+            Timber.i("Wrote remotecache.vdf for appId=$appId (${files.size} file(s), ChangeNumber=$changeNumber)")
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to write remotecache.vdf for appId=$appId")
+        }
+    }
+
+    private fun getOrCreateChild(parent: KeyValue, name: String): KeyValue {
+        return parent.children.firstOrNull { it.name == name }
+            ?: KeyValue(name).also { parent.children.add(it) }
     }
 
     private fun setOrReplaceKey(parent: KeyValue, name: String, value: String) {
@@ -2242,6 +2382,80 @@ object SteamUtils {
             Timber.i("[${mapping.description}] Created symlink: ${targetPath.absolutePath} -> ${sourcePath.absolutePath}")
         } catch (e: Exception) {
             Timber.e(e, "[${mapping.description}] Failed to create save location symlink")
+        }
+    }
+
+    /**
+     * SDK-cloud games whose on-disk save location differs from the SDK's
+     * <userdata>/<appid>/remote/ directory. Value = install-relative subdir
+     * the game reads/writes. Desktop Steam reconciles the two internally;
+     * with our cloudenabled=0 setup that path is dead, so we bridge it.
+     */
+    private val sdkCloudSaveMirrors: Map<Int, String> = mapOf(
+        588650 to "save", // Dead Cells
+    )
+
+    private fun sdkCloudRemoteDir(context: Context, appId: Int): File? {
+        val accountId = SteamService.userSteamId?.accountID?.toLong() ?: return null
+        return File(PathType.SteamUserData.toAbsPath(context, appId, accountId))
+    }
+
+    private fun sdkCloudGameSaveDir(context: Context, appId: Int): File? {
+        val sub = sdkCloudSaveMirrors[appId] ?: return null
+        return File(SteamService.getAppDirPath(appId), sub)
+    }
+
+    fun mirrorSdkCloudRemoteToSave(context: Context, appId: Int) {
+        val gameSaveDir = sdkCloudGameSaveDir(context, appId) ?: return
+        val remoteDir = sdkCloudRemoteDir(context, appId) ?: return
+
+        if (!remoteDir.exists()) {
+            Timber.i("mirrorSdkCloudRemoteToSave: remote/ missing for appId=$appId")
+            return
+        }
+        if (!gameSaveDir.exists()) gameSaveDir.mkdirs()
+
+        remoteDir.listFiles()?.forEach { src ->
+            if (!src.isFile) return@forEach
+            val dst = File(gameSaveDir, src.name)
+            try {
+                Files.copy(
+                    src.toPath(),
+                    dst.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES,
+                )
+                Timber.i("SDK cloud mirror remote->save appId=$appId: ${src.name} (${src.length()} bytes)")
+            } catch (e: Exception) {
+                Timber.w(e, "Failed to mirror ${src.name} remote->save appId=$appId")
+            }
+        }
+    }
+
+    fun mirrorSdkCloudSaveToRemote(context: Context, appId: Int) {
+        val gameSaveDir = sdkCloudGameSaveDir(context, appId) ?: return
+        val remoteDir = sdkCloudRemoteDir(context, appId) ?: return
+
+        if (!gameSaveDir.exists()) return
+        if (!remoteDir.exists()) remoteDir.mkdirs()
+
+        gameSaveDir.listFiles()?.forEach { src ->
+            if (!src.isFile) return@forEach
+            // Skip local-only artifacts (e.g. Dead Cells writes backup-YYYY-MM-DD-N.zip snapshots
+            // alongside saves; those aren't cloud-synced).
+            if (src.name.startsWith("backup-") && src.name.endsWith(".zip")) return@forEach
+            val dst = File(remoteDir, src.name)
+            try {
+                Files.copy(
+                    src.toPath(),
+                    dst.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES,
+                )
+                Timber.i("SDK cloud mirror save->remote appId=$appId: ${src.name} (${src.length()} bytes)")
+            } catch (e: Exception) {
+                Timber.w(e, "Failed to mirror ${src.name} save->remote appId=$appId")
+            }
         }
     }
 

@@ -2239,6 +2239,16 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             try {
+                // Pluvia is the sole cloud client in both modes: Wine-Steam has
+                // cloudenabled=0 written to localconfig.vdf AND sharedconfig.vdf and
+                // is launched with -no-browser so it performs no cloud I/O. Running
+                // Pluvia's AutoCloud on launch is required in real-Steam mode so users
+                // get fresh saves from other devices before the Wine-hosted game loads
+                // them — skipping this on launch caused Dead Cells to boot into an
+                // empty save. The original "save conflict" dialog that motivated a
+                // skip was driven by a ChangeNumber race between Wine-Steam and Pluvia
+                // both writing cloud state; with Wine-Steam's cloud fully suppressed
+                // there is no second writer to race with.
                 val maxAttempts = 3
                 for (attempt in 1..maxAttempts) {
                     try {
@@ -2261,6 +2271,15 @@ class SteamService : Service(), IChallengeUrlChanged {
                                             syncResult = info
 
                                             if (info.syncResult == SyncResult.Success || info.syncResult == SyncResult.UpToDate) {
+                                                // Bridge SDK-cloud games whose on-disk save dir differs
+                                                // from <userdata>/<appid>/remote/ (e.g. Dead Cells reads
+                                                // <install>/save/). Desktop Steam reconciles these via
+                                                // ISteamRemoteStorage internally; with cloudenabled=0 that
+                                                // path is dead, so mirror remote/ -> save/ ourselves.
+                                                steamInstance.applicationContext?.let { ctx ->
+                                                    SteamUtils.mirrorSdkCloudRemoteToSave(ctx, appId)
+                                                }
+
                                                 Timber.i(
                                                     "Signaling app launch:\n\tappId: %d\n\tclientId: %s\n\tosType: %s\n\tisLaunchRealSteam: %s",
                                                     appId,
@@ -2467,6 +2486,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                         } catch (e: Exception) {
                             Timber.e(e, "Achievement sync failed for appId=$appId, continuing with cloud save sync")
                         }
+                    }
+
+                    // Reverse of the pre-launch mirror: copy the game's on-disk save
+                    // files (e.g. Dead Cells's <install>/save/) back into
+                    // <userdata>/<appid>/remote/ so the subsequent SteamAutoCloud
+                    // upload sees the player's progress.
+                    try {
+                        SteamUtils.mirrorSdkCloudSaveToRemote(context, appId)
+                    } catch (e: Exception) {
+                        Timber.w(e, "SDK cloud save->remote mirror failed for appId=$appId")
                     }
 
                     val maxAttempts = 3
