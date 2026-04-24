@@ -279,6 +279,7 @@ object ContainerUtils {
             showFPS = false,
             launchRealSteam = container.isLaunchRealSteam,
             disableSteamOverlay = container.isDisableSteamOverlay,
+            sdkCloudSaveSubdir = container.sdkCloudSaveSubdir,
             allowSteamUpdates = container.isAllowSteamUpdates,
             steamType = container.getSteamType(),
             cpuList = container.cpuList,
@@ -455,6 +456,7 @@ object ContainerUtils {
         container.isShowFPS = false
         container.isLaunchRealSteam = containerData.launchRealSteam
         container.isDisableSteamOverlay = containerData.disableSteamOverlay
+        container.sdkCloudSaveSubdir = containerData.sdkCloudSaveSubdir
         container.isAllowSteamUpdates = containerData.allowSteamUpdates
         container.setSteamType(containerData.steamType)
         container.cpuList = containerData.cpuList

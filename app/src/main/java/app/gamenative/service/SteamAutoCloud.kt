@@ -125,7 +125,7 @@ object SteamAutoCloud {
 
         // Auto-Cloud games declare saveFilePatterns rooted outside SteamUserData (usually
         // GameInstall or WinAppData*). Their cloud payloads are sometimes surfaced without a
-        // prefix — either because the cloud entry was uploaded by an old Pluvia build under
+        // prefix — either because the cloud entry was uploaded by an old GameNative build under
         // SteamUserData, or because Steam's getAppFileListChange returned an empty prefix list.
         // Either way, naively writing those files to <SteamUserData>/<appid>/remote/ hides them
         // from the game, which reads from the pattern's real location. Rebase to the matching

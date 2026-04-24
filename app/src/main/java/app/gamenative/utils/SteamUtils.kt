@@ -886,7 +886,7 @@ object SteamUtils {
                     )
                 }
 
-                // cloud_enabled="0" in both modes: Pluvia's SteamAutoCloud owns cloud sync
+                // cloud_enabled="0" in both modes: GameNative's SteamAutoCloud owns cloud sync
                 // (runs on app close + manual "Cloud Sync" button; skipped only on launch in
                 // real-Steam mode to avoid a launch-time conflict dialog). Letting Wine-Steam
                 // also sync in real-Steam mode re-introduced the Steam Input (241100) AutoCloud
@@ -2130,7 +2130,7 @@ object SteamUtils {
                     app.children.add(KeyValue("LaunchOptions", exeCommandLine))
                 }
 
-                // Suppress Wine-Steam's per-app cloud sync. Pluvia's SteamAutoCloud handles
+                // Suppress Wine-Steam's per-app cloud sync. GameNative's SteamAutoCloud handles
                 // cloud (runs on closeApp + manual sync); letting Wine-Steam also sync
                 // blocked graceful shutdown on cloud upload and resurrected the Steam Input
                 // (241100) AutoCloud watcher that purgePhantomAppUserdata works around.
@@ -2149,7 +2149,7 @@ object SteamUtils {
                 // lastlaunch/lastexit to decide whether to show "Synchronizing cloud
                 // saves" on startup and block shutdown on upload; flipping cloud_enabled
                 // to "0" alone doesn't clear those, so the client keeps reconciling
-                // ghosts on every launch. Pluvia's SteamAutoCloud owns cloud now, so
+                // ghosts on every launch. GameNative's SteamAutoCloud owns cloud now, so
                 // Wine-Steam shouldn't retain any sync bookkeeping for this app.
                 app.children.removeAll { it.name == "last_sync_state" || it.name == "autocloud" }
 
@@ -2386,14 +2386,34 @@ object SteamUtils {
     }
 
     /**
-     * SDK-cloud games whose on-disk save location differs from the SDK's
-     * <userdata>/<appid>/remote/ directory. Value = install-relative subdir
-     * the game reads/writes. Desktop Steam reconciles the two internally;
-     * with our cloudenabled=0 setup that path is dead, so we bridge it.
+     * Recommended SDK-cloud save subdir for a known game. Sourced from the Ludusavi
+     * community manifest (fetched on demand, cached on disk by [LudusaviRegistry]).
      */
-    private val sdkCloudSaveMirrors: Map<Int, String> = mapOf(
-        588650 to "save", // Dead Cells
-    )
+    data class SdkCloudSaveRecommendation(val appId: Int, val subdir: String, val name: String, val notes: String)
+
+    /**
+     * Returns the recommended save subdir from the Ludusavi manifest (network-fetched
+     * and disk-cached by [LudusaviRegistry]). Returns null if Ludusavi has no entry
+     * or the manifest is unavailable (offline with no cache).
+     */
+    suspend fun getRecommendedSdkCloudSaveSubdirAsync(context: Context, appId: Int): SdkCloudSaveRecommendation? {
+        return LudusaviRegistry.lookup(context, appId)
+    }
+
+    /**
+     * Pattern B detection: returns a recommendation only when the game is
+     * (a) known to Ludusavi with an install-relative save path, AND
+     * (b) has NO saveFilePatterns declared in Steam's PICS UFS (which would mean
+     *     Auto-Cloud already covers it and the bridge isn't needed).
+     *
+     * Intersection-filtered lookup used by the launch-time prompt to avoid crying
+     * wolf on the thousands of Auto-Cloud games in Ludusavi that don't need our mirror.
+     */
+    suspend fun shouldSuggestSdkCloudBridge(context: Context, appId: Int): SdkCloudSaveRecommendation? {
+        val rec = getRecommendedSdkCloudSaveSubdirAsync(context, appId) ?: return null
+        val hasAutoCloud = SteamService.getAppInfoOf(appId)?.ufs?.saveFilePatterns?.isNotEmpty() == true
+        return rec.takeIf { !hasAutoCloud }
+    }
 
     private fun sdkCloudRemoteDir(context: Context, appId: Int): File? {
         val accountId = SteamService.userSteamId?.accountID?.toLong() ?: return null
@@ -2401,8 +2421,99 @@ object SteamUtils {
     }
 
     private fun sdkCloudGameSaveDir(context: Context, appId: Int): File? {
-        val sub = sdkCloudSaveMirrors[appId] ?: return null
+        // Mirror runs only when the user has explicitly enabled the bridge for this
+        // container (via the launch-time prompt or the Cloud Save Bridge UI). No
+        // implicit fallback — prevents silent REPLACE_EXISTING copies into a guessed
+        // subdir that might not be the game's actual save location.
+        val container = runCatching {
+            ContainerUtils.getContainer(context, "STEAM_$appId")
+        }.getOrNull() ?: return null
+        val sub = container.sdkCloudSaveSubdir.trim().takeIf {
+            it.isNotEmpty() && isValidSdkCloudSubdir(it)
+        } ?: return null
         return File(SteamService.getAppDirPath(appId), sub)
+    }
+
+    /**
+     * Validation for a user-supplied install-relative save subdir. Rejects anything
+     * that could escape the install dir or address files outside a single component:
+     * path separators (/ or \), .. traversal, absolute paths, Windows drive letters,
+     * and empty values after trimming.
+     */
+    fun isValidSdkCloudSubdir(raw: String): Boolean {
+        val v = raw.trim()
+        if (v.isEmpty()) return false
+        if (v.contains('/') || v.contains('\\')) return false
+        if (v == "." || v == "..") return false
+        if (v.contains(':')) return false
+        return true
+    }
+
+    /**
+     * Heuristic: find a single-component subdir under the game's install dir whose
+     * file names overlap with what's at `<userdata>/<appid>/remote/`. Scans install
+     * top-level only (no recursion — saves typically live one level deep). Returns
+     * the subdir name with the highest filename overlap, or null if none match.
+     *
+     * Used by the container-config UI "Detect" button. Resolves paths via the
+     * container's own rootDir rather than the global xuser symlink so it works even
+     * when a different container is currently active.
+     *
+     * Best-effort — never returns a guess on ambiguous/empty state. Users still
+     * confirm before enabling the mirror.
+     */
+    fun detectSdkCloudSaveSubdir(context: Context, appId: Int): String? {
+        val accountId = SteamService.userSteamId?.accountID?.toLong()
+        if (accountId == null) {
+            Timber.w("detectSdkCloudSaveSubdir: no Steam account — cannot resolve userdata path for $appId")
+            return null
+        }
+
+        val container = runCatching {
+            ContainerUtils.getContainer(context, "STEAM_$appId")
+        }.getOrNull() ?: run {
+            Timber.w("detectSdkCloudSaveSubdir: no container found for STEAM_$appId")
+            return null
+        }
+
+        val remoteDir = File(
+            container.rootDir,
+            ".wine/drive_c/Program Files (x86)/Steam/userdata/$accountId/$appId/remote",
+        )
+        if (!remoteDir.isDirectory) {
+            Timber.i("detectSdkCloudSaveSubdir: no remote/ at ${remoteDir.absolutePath}")
+            return null
+        }
+        val remoteNames = remoteDir.listFiles()
+            ?.filter { it.isFile }
+            ?.map { it.name }
+            ?.toSet()
+            ?.takeIf { it.isNotEmpty() }
+            ?: run {
+                Timber.i("detectSdkCloudSaveSubdir: remote/ empty at ${remoteDir.absolutePath}")
+                return null
+            }
+
+        val installDir = File(SteamService.getAppDirPath(appId))
+        if (!installDir.isDirectory) {
+            Timber.i("detectSdkCloudSaveSubdir: install dir missing at ${installDir.absolutePath}")
+            return null
+        }
+
+        var bestName: String? = null
+        var bestOverlap = 0
+        installDir.listFiles()?.forEach { sub ->
+            if (!sub.isDirectory) return@forEach
+            if (!isValidSdkCloudSubdir(sub.name)) return@forEach
+            val names = sub.listFiles()?.filter { it.isFile }?.map { it.name }?.toSet() ?: return@forEach
+            val overlap = remoteNames.intersect(names).size
+            if (overlap > bestOverlap) {
+                bestOverlap = overlap
+                bestName = sub.name
+            }
+        }
+        Timber.i("detectSdkCloudSaveSubdir appId=$appId: remote=${remoteNames.size} file(s), best=$bestName overlap=$bestOverlap")
+        return bestName
     }
 
     fun mirrorSdkCloudRemoteToSave(context: Context, appId: Int) {

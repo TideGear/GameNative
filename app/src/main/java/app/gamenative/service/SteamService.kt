@@ -2217,14 +2217,14 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             try {
-                // Pluvia is the sole cloud client in both modes: Wine-Steam has
+                // GameNative is the sole cloud client in both modes: Wine-Steam has
                 // cloudenabled=0 written to localconfig.vdf AND sharedconfig.vdf and
                 // is launched with -no-browser so it performs no cloud I/O. Running
-                // Pluvia's AutoCloud on launch is required in real-Steam mode so users
+                // GameNative's AutoCloud on launch is required in real-Steam mode so users
                 // get fresh saves from other devices before the Wine-hosted game loads
                 // them — skipping this on launch caused Dead Cells to boot into an
                 // empty save. The original "save conflict" dialog that motivated a
-                // skip was driven by a ChangeNumber race between Wine-Steam and Pluvia
+                // skip was driven by a ChangeNumber race between Wine-Steam and GameNative
                 // both writing cloud state; with Wine-Steam's cloud fully suppressed
                 // there is no second writer to race with.
                 val maxAttempts = 3
