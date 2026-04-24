@@ -9,6 +9,7 @@ import app.gamenative.data.LaunchInfo
 import app.gamenative.data.ManifestInfo
 import app.gamenative.data.SteamApp
 import app.gamenative.enums.Marker
+import app.gamenative.enums.PathType
 import app.gamenative.enums.SpecialGameSaveMapping
 import app.gamenative.service.SteamService
 import app.gamenative.service.SteamService.Companion.getAppDirName
@@ -807,8 +808,8 @@ object SteamUtils {
                         steamAppId,
                     )
                 }
-                // Still refresh 228980's manifest — it's independent of the child's state.
-                writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
+                // Still refresh shared helper manifests (228980, 241100) — they're independent of the child's state.
+                writeAllSharedAppManifests(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
                 return
             }
 
@@ -885,9 +886,11 @@ object SteamUtils {
                     )
                 }
 
-                // cloud_enabled="0" deliberately: GameNative already runs SteamAutoCloud.syncUserFiles
-                // around every launch, and letting the Wine-hosted Steam client also sync races it
-                // and occasionally blows away saves.
+                // cloud_enabled="0" in both modes: Pluvia's SteamAutoCloud owns cloud sync
+                // (runs on app close + manual "Cloud Sync" button; skipped only on launch in
+                // real-Steam mode to avoid a launch-time conflict dialog). Letting Wine-Steam
+                // also sync in real-Steam mode re-introduced the Steam Input (241100) AutoCloud
+                // watcher and blocked graceful steam.exe -shutdown on cloud upload — hence 0.
                 appendLine("\t\"UserConfig\"")
                 appendLine("\t{")
                 appendLine("\t\t\"language\"\t\t\"english\"")
@@ -903,24 +906,28 @@ object SteamUtils {
             val acfFile = File(steamappsDir, "appmanifest_$steamAppId.acf")
             acfFile.writeText(acfContent)
 
-            // Always write a real appmanifest_228980.acf for Steamworks Common
-            // Redistributables — Steam's PICS metadata declares this dependency
-            // server-side (not in the child's depot list), and without a valid
-            // 228980 manifest the child gets stuck in Update Queued / gray Play.
-            // writeSteamworksCommonManifest is a no-op if PICS has no AppInfo for 228980.
-            writeSteamworksCommonManifest(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
+            // Always refresh shared helper manifests: 228980 (Steamworks Common
+            // Redistributables — referenced via child's SharedDepots) and 241100
+            // (Steam Controller Configs — auto-installed by Steam for any game
+            // using Steam Input, regardless of child declaration). Without valid
+            // manifests for these, the child gets stuck in Update Queued / gray
+            // Play. The writers are no-ops when PICS has no AppInfo for a helper.
+            writeAllSharedAppManifests(steamappsDir, commonDir, lastOwner, sharedDepots.keys)
 
             // Self-check: assert the acfs we just wrote are in the shape that
             // avoids gray Play. Catches silent regressions in the writers + any
             // case where Steam immediately rewrites the file between our write
             // and the next launch.
             validateAcfShape(acfFile, expectDepotCount = regularDepots.size, label = "child $steamAppId")
-            if (sharedDepots.isNotEmpty()) {
-                validateAcfShape(
-                    File(steamappsDir, "appmanifest_228980.acf"),
-                    expectDepotCount = -1,
-                    label = "shared 228980",
-                )
+            sharedHelperApps.forEach { helper ->
+                val helperAcf = File(steamappsDir, "appmanifest_${helper.appId}.acf")
+                if (helperAcf.isFile) {
+                    validateAcfShape(
+                        helperAcf,
+                        expectDepotCount = -1,
+                        label = "shared ${helper.appId}",
+                    )
+                }
             }
 
         } catch (e: Exception) {
@@ -968,17 +975,19 @@ object SteamUtils {
         229032 to "_CommonRedist\\\\PhysX\\\\9.13.1220\\\\installscript.vdf",
     )
 
-    // Resolve the depots that 228980 owns for this child by intersecting the
-    // child's PICS-declared SharedDepots with 228980's own PICS depot list,
-    // pulling manifest GID + size from PICS. This replaces the old approach of
-    // hardcoding a depot table and filtering by installscript.vdf presence —
-    // that broke for games (DD, others) that ship a half-empty _CommonRedist.
-    private fun resolveSharedDepotsForChild(
+    // Resolve depots for a shared parent app (228980, 241100, etc.) by pulling
+    // manifest GID + size from the parent's own PICS entry. If depotFilter is
+    // non-null, only those depot IDs are kept (used when a child game declares
+    // its own SharedDepots list, e.g. 228980's 228985/228989). If null, every
+    // depot PICS lists for the parent is included (used for apps Steam
+    // auto-installs regardless of child declaration, e.g. 241100 Steam Input).
+    private fun resolveSharedAppDepots(
         sharedAppId: Int,
-        childSharedDepotIds: Set<Int>,
+        depotFilter: Set<Int>?,
     ): List<ResolvedSharedDepot> {
         val sharedAppInfo = SteamService.getAppInfoOf(sharedAppId) ?: return emptyList()
-        return childSharedDepotIds.mapNotNull { depotId ->
+        val depotIds = depotFilter ?: sharedAppInfo.depots.keys
+        return depotIds.mapNotNull { depotId ->
             val depot = sharedAppInfo.depots[depotId] ?: return@mapNotNull null
             val manifest = depot.manifests["public"]
                 ?: depot.manifests.values.firstOrNull()
@@ -993,25 +1002,50 @@ object SteamUtils {
         }
     }
 
+    // Shared helper apps that Steam will try to update before launching any
+    // game unless we pre-declare them as installed. 228980 (Steamworks Common
+    // Redistributables) is referenced via the child's PICS SharedDepots block
+    // (228985/228989 for VC++ redist). Without a valid acf for it, Steam
+    // cascades Update Queued onto the child and grays out Play.
+    //
+    // 241100 (Steam Input configs) was tried here too but caused a worse bug:
+    // Steam's scheduler re-runs `Reconfiguring → Staging → Committing (0 files)`
+    // every 20s indefinitely while the game is running, because its content
+    // lives at workshop/content/241100 (not under common/) and our synthetic
+    // acf makes Steam think it should exist. Left pre-fix behavior alone: 241100
+    // reconciles once and stops.
+    private data class SharedHelperApp(
+        val appId: Int,
+        val installDir: String,
+        // If null: include all depots PICS lists for this app.
+        // If set: only include depots that appear in both PICS and the
+        // provided set (currently only 228980 uses the child-declared set).
+        val useChildDeclaredDepots: Boolean,
+    )
+
+    private val sharedHelperApps = listOf(
+        SharedHelperApp(appId = 228980, installDir = "Steamworks Shared", useChildDeclaredDepots = true),
+    )
+
     /**
-     * Write appmanifest_228980.acf for Steamworks Common Redistributables
-     * declaring exactly the depots whose installscript.vdf is present on disk.
-     * This "0 bytes to download" shape makes Steam's reconcile a ~1s no-op; an
-     * empty or mismatched manifest otherwise leaves 228980 stuck in Update
-     * Queued and cascades gray Play onto the child game.
+     * Write appmanifest_<sharedAppId>.acf for a shared helper app. The
+     * "0 bytes to download" shape makes Steam's reconcile a ~1s no-op; an
+     * empty or mismatched manifest otherwise leaves the helper stuck in
+     * Update Queued and cascades gray Play onto the child game.
      */
-    private fun writeSteamworksCommonManifest(
+    private fun writeSharedAppManifest(
         steamappsDir: File,
         commonDir: File,
         lastOwner: String,
-        childSharedDepotIds: Set<Int> = emptySet(),
+        helper: SharedHelperApp,
+        childSharedDepotIds: Set<Int>,
     ) {
-        val sharedAppId = 228980
+        val sharedAppId = helper.appId
         val staleAcf = File(steamappsDir, "appmanifest_$sharedAppId.acf")
         val sharedAppInfo = SteamService.getAppInfoOf(sharedAppId)
         if (sharedAppInfo == null) {
             if (staleAcf.exists()) staleAcf.delete()
-            Timber.w("writeSteamworksCommonManifest: PICS has no AppInfo for 228980 — Steam will gray Play")
+            Timber.w("writeSharedAppManifest: PICS has no AppInfo for $sharedAppId — Steam may gray Play")
             return
         }
 
@@ -1019,21 +1053,17 @@ object SteamUtils {
             ?: sharedAppInfo.branches.values.firstOrNull()?.buildId
             ?: 0L
         if (sharedBuildId == 0L) {
-            Timber.w("writeSteamworksCommonManifest: 228980 PICS has no buildid — skipping")
+            Timber.w("writeSharedAppManifest: $sharedAppId PICS has no buildid — skipping")
             return
         }
 
-        // Source-of-truth: PICS. Resolve exactly the depots this child declared
-        // as owned by 228980, pulling manifest GIDs + sizes from PICS itself.
-        // No dependency on installscript.vdf files on disk — that's what
-        // trapped us in the empty-InstalledDepots → gray Play state for games
-        // like DD that ship a half-empty _CommonRedist skeleton.
-        val presentDepots = resolveSharedDepotsForChild(sharedAppId, childSharedDepotIds)
+        val depotFilter = if (helper.useChildDeclaredDepots) childSharedDepotIds else null
+        val presentDepots = resolveSharedAppDepots(sharedAppId, depotFilter)
         if (presentDepots.isEmpty()) {
             if (staleAcf.exists()) staleAcf.delete()
             Timber.w(
-                "writeSteamworksCommonManifest: no 228980 depots resolvable from PICS for child shared=%s — deleting stale acf",
-                childSharedDepotIds,
+                "writeSharedAppManifest: no $sharedAppId depots resolvable from PICS (filter=%s) — deleting stale acf",
+                depotFilter,
             )
             return
         }
@@ -1053,7 +1083,7 @@ object SteamUtils {
             }
         }
 
-        val sharedInstallDir = "Steamworks Shared"
+        val sharedInstallDir = helper.installDir
         val sharedCommonDir = File(commonDir, sharedInstallDir)
         if (!sharedCommonDir.exists()) {
             sharedCommonDir.mkdirs()
@@ -1067,9 +1097,9 @@ object SteamUtils {
             appendLine("\t\"appid\"\t\t\"$sharedAppId\"")
             appendLine("\t\"Universe\"\t\t\"1\"")
             appendLine("\t\"LauncherPath\"\t\t\"$launcherPath\"")
-            appendLine("\t\"name\"\t\t\"${escapeString(sharedAppInfo.name.ifBlank { "Steamworks Common Redistributables" })}\"")
+            appendLine("\t\"name\"\t\t\"${escapeString(sharedAppInfo.name.ifBlank { "App $sharedAppId" })}\"")
             appendLine("\t\"StateFlags\"\t\t\"4\"")
-            appendLine("\t\"installdir\"\t\t\"$sharedInstallDir\"")
+            appendLine("\t\"installdir\"\t\t\"${escapeString(sharedInstallDir)}\"")
             appendLine("\t\"LastUpdated\"\t\t\"${System.currentTimeMillis() / 1000}\"")
             appendLine("\t\"LastPlayed\"\t\t\"0\"")
             val presentSizeOnDisk = presentDepots.sumOf { it.size }
@@ -1099,12 +1129,15 @@ object SteamUtils {
             }
             appendLine("\t}")
 
-            appendLine("\t\"InstallScripts\"")
-            appendLine("\t{")
-            presentDepots.filter { it.installScript.isNotEmpty() }.forEach { d ->
-                appendLine("\t\t\"${d.id}\"\t\t\"${d.installScript}\"")
+            val scriptedDepots = presentDepots.filter { it.installScript.isNotEmpty() }
+            if (scriptedDepots.isNotEmpty()) {
+                appendLine("\t\"InstallScripts\"")
+                appendLine("\t{")
+                scriptedDepots.forEach { d ->
+                    appendLine("\t\t\"${d.id}\"\t\t\"${d.installScript}\"")
+                }
+                appendLine("\t}")
             }
-            appendLine("\t}")
 
             appendLine("\t\"UserConfig\"")
             appendLine("\t{")
@@ -1118,6 +1151,28 @@ object SteamUtils {
         }
 
         staleAcf.writeText(acfContent)
+    }
+
+    // AppIds that an older build of GameNative wrote synthetic manifests for,
+    // but which have since been removed from sharedHelperApps. Delete any
+    // leftover acfs so Steam doesn't keep reconciling phantom installs.
+    private val retiredSharedHelperAppIds = setOf(241100)
+
+    private fun writeAllSharedAppManifests(
+        steamappsDir: File,
+        commonDir: File,
+        lastOwner: String,
+        childSharedDepotIds: Set<Int>,
+    ) {
+        retiredSharedHelperAppIds.forEach { retiredId ->
+            val stale = File(steamappsDir, "appmanifest_$retiredId.acf")
+            if (stale.isFile && stale.delete()) {
+                Timber.i("writeAllSharedAppManifests: removed stale appmanifest_%d.acf from prior build", retiredId)
+            }
+        }
+        sharedHelperApps.forEach { helper ->
+            writeSharedAppManifest(steamappsDir, commonDir, lastOwner, helper, childSharedDepotIds)
+        }
     }
 
     private fun escapeString(input: String?): String {
@@ -1662,6 +1717,31 @@ object SteamUtils {
     }
 
     /**
+     * Removes Steam userdata for a phantom AppID across every logged-in user. When a
+     * synthetic appmanifest_<id>.acf was written in a past session, Steam registers
+     * an AutoCloud watch for that app and on shutdown blocks exit until every
+     * watched file (78 Steam Controller configs for 241100) round-trips the cloud.
+     * Deleting userdata/<steamId>/<phantomAppId>/ breaks the association so
+     * shutdown completes promptly for subsequent real-Steam launches.
+     */
+    fun purgePhantomAppUserdata(imageFs: ImageFs, phantomAppId: String) {
+        try {
+            val userdataRoot = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/userdata")
+            if (!userdataRoot.isDirectory) return
+            val victims = userdataRoot.listFiles { f -> f.isDirectory }?.mapNotNull { userDir ->
+                File(userDir, phantomAppId).takeIf { it.exists() }
+            }.orEmpty()
+            if (victims.isEmpty()) return
+            victims.forEach { dir ->
+                deleteTreeNoFollowSymlinks(dir)
+                Timber.i("purgePhantomAppUserdata: removed ${dir.absolutePath}")
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "purgePhantomAppUserdata[$phantomAppId] failed")
+        }
+    }
+
+    /**
      * Sibling folder "steam_settings" + empty "offline.txt" file, no-ops if they already exist.
      */
     private fun ensureSteamSettings(context: Context, dllPath: Path, appId: String, ticketBase64: String? = null, isOffline: Boolean = false) {
@@ -2050,11 +2130,28 @@ object SteamUtils {
                     app.children.add(KeyValue("LaunchOptions", exeCommandLine))
                 }
 
-                // Suppress the Wine-hosted Steam client's per-app cloud sync. GameNative owns
-                // cloud via its own SteamKit connection around every launch; letting the client
-                // sync in parallel races us and produces spurious Save Conflict popups.
+                // Suppress Wine-Steam's per-app cloud sync. Pluvia's SteamAutoCloud handles
+                // cloud (runs on closeApp + manual sync); letting Wine-Steam also sync
+                // blocked graceful shutdown on cloud upload and resurrected the Steam Input
+                // (241100) AutoCloud watcher that purgePhantomAppUserdata works around.
+                //
+                // "cloudenabled" (no underscore) is the canonical per-app key documented in
+                // community reverse-engineering (l3laze/Steam-Data, l3laze/SteamConfig) and
+                // is what the Steam GUI writes when the user unchecks cloud for a game.
+                // "cloud_enabled" (with underscore) is retained as belt-and-suspenders in
+                // case a client build reads the underscored variant.
+                setOrReplaceKey(app, "cloudenabled", "0")
                 setOrReplaceKey(app, "cloud_enabled", "0")
                 setOrReplaceKey(app, "cce", "0")
+
+                // Wipe AutoCloud reconciliation state left over from a prior run where
+                // cloud_enabled was "1". Wine-Steam uses last_sync_state + autocloud
+                // lastlaunch/lastexit to decide whether to show "Synchronizing cloud
+                // saves" on startup and block shutdown on upload; flipping cloud_enabled
+                // to "0" alone doesn't clear those, so the client keeps reconciling
+                // ghosts on every launch. Pluvia's SteamAutoCloud owns cloud now, so
+                // Wine-Steam shouldn't retain any sync bookkeeping for this app.
+                app.children.removeAll { it.name == "last_sync_state" || it.name == "autocloud" }
 
                 vdfData.saveToFile(localConfigFile, false)
             } else {
@@ -2067,6 +2164,7 @@ object SteamUtils {
                 val app = KeyValue(appId)
 
                 app.children.add(option)
+                app.children.add(KeyValue("cloudenabled", "0"))
                 app.children.add(KeyValue("cloud_enabled", "0"))
                 app.children.add(KeyValue("cce", "0"))
                 apps.children.add(app)
@@ -2077,6 +2175,15 @@ object SteamUtils {
 
                 vdfData.saveToFile(localConfigFile, false)
             }
+
+            // Mirror the per-app cloud-off state into sharedconfig.vdf. Steam keeps
+            // two per-app cloud flags: one in localconfig.vdf (UserLocalConfigStore)
+            // and one in sharedconfig.vdf (UserRoamingConfigStore/Software/Valve/Steam/Apps/<id>).
+            // Different client versions read the roaming vs. local copy at different
+            // points in the login flow, so writing only to localconfig leaves a live
+            // "cloudenabled=1" (or absent=default-on) in sharedconfig that still drives
+            // the "Synchronizing cloud saves" dialog on startup.
+            writeSharedConfigCloudDisabled(steamPath, steamUserId64, appId)
 
             val userLanguage = container.language
             val steamappsDir = File(steamPath, "steamapps")
@@ -2120,6 +2227,91 @@ object SteamUtils {
         } catch (e: Exception) {
             Timber.e(e, "Failed to update or modify local config")
         }
+    }
+
+    private fun writeSharedConfigCloudDisabled(steamPath: File, steamUserId64: String, appId: String) {
+        try {
+            val sharedConfigFile = File(steamPath, "userdata/$steamUserId64/7/remote/sharedconfig.vdf")
+            sharedConfigFile.parentFile?.mkdirs()
+
+            val root = if (sharedConfigFile.exists()) {
+                val content = FileUtils.readFileAsString(sharedConfigFile.absolutePath)
+                KeyValue.loadFromString(content!!) ?: KeyValue(name = "UserRoamingConfigStore")
+            } else {
+                KeyValue(name = "UserRoamingConfigStore")
+            }
+
+            val software = getOrCreateChild(root, "Software")
+            val valve = getOrCreateChild(software, "Valve")
+            val steam = getOrCreateChild(valve, "Steam")
+            // Both casings appear in the wild ("Apps" vs. "apps"); prefer "Apps" per
+            // the documented UserRoamingConfigStore schema but don't duplicate if the
+            // lowercase variant already exists in the file Steam wrote.
+            val apps = steam.children.firstOrNull { it.name.equals("Apps", ignoreCase = true) }
+                ?: KeyValue("Apps").also { steam.children.add(it) }
+            val app = getOrCreateChild(apps, appId)
+            setOrReplaceKey(app, "cloudenabled", "0")
+
+            root.saveToFile(sharedConfigFile, false)
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to write cloudenabled=0 to sharedconfig.vdf for appId=$appId")
+        }
+    }
+
+    data class RemoteCacheFile(
+        val relativePath: String,
+        val size: Long,
+        val timeSeconds: Long,
+        val shaHex: String,
+    )
+
+    /**
+     * Writes <userdata>/<sid>/<appId>/remotecache.vdf so Wine-Steam's ISteamRemoteStorage
+     * reports the cloud files to the game. With cloudenabled=0, Wine-Steam does not
+     * rescan the remote/ directory on startup; it trusts remotecache.vdf. Without this
+     * write, SDK-cloud games (e.g. Dead Cells) see FileExists=false on their saves and
+     * load a blank state even though the files are on disk.
+     */
+    fun writeRemoteCacheVdf(
+        remoteDir: File,
+        appId: Int,
+        changeNumber: Long,
+        files: List<RemoteCacheFile>,
+    ) {
+        try {
+            val userAppDir = remoteDir.parentFile ?: return
+            if (!userAppDir.exists()) userAppDir.mkdirs()
+            val vdfFile = File(userAppDir, "remotecache.vdf")
+
+            val root = KeyValue(appId.toString())
+            root.children.add(KeyValue("ChangeNumber", changeNumber.toString()))
+            root.children.add(KeyValue("ostype", "0"))
+
+            for (entry in files) {
+                val key = entry.relativePath.replace('/', '\\')
+                val node = KeyValue(key)
+                node.children.add(KeyValue("root", "0"))
+                node.children.add(KeyValue("size", entry.size.toString()))
+                node.children.add(KeyValue("localtime", entry.timeSeconds.toString()))
+                node.children.add(KeyValue("time", entry.timeSeconds.toString()))
+                node.children.add(KeyValue("remotetime", entry.timeSeconds.toString()))
+                node.children.add(KeyValue("sha", entry.shaHex))
+                node.children.add(KeyValue("syncstate", "1"))
+                node.children.add(KeyValue("persiststate", "0"))
+                node.children.add(KeyValue("platformstosync2", "-1"))
+                root.children.add(node)
+            }
+
+            root.saveToFile(vdfFile, false)
+            Timber.i("Wrote remotecache.vdf for appId=$appId (${files.size} file(s), ChangeNumber=$changeNumber)")
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to write remotecache.vdf for appId=$appId")
+        }
+    }
+
+    private fun getOrCreateChild(parent: KeyValue, name: String): KeyValue {
+        return parent.children.firstOrNull { it.name == name }
+            ?: KeyValue(name).also { parent.children.add(it) }
     }
 
     private fun setOrReplaceKey(parent: KeyValue, name: String, value: String) {
@@ -2190,6 +2382,80 @@ object SteamUtils {
             Timber.i("[${mapping.description}] Created symlink: ${targetPath.absolutePath} -> ${sourcePath.absolutePath}")
         } catch (e: Exception) {
             Timber.e(e, "[${mapping.description}] Failed to create save location symlink")
+        }
+    }
+
+    /**
+     * SDK-cloud games whose on-disk save location differs from the SDK's
+     * <userdata>/<appid>/remote/ directory. Value = install-relative subdir
+     * the game reads/writes. Desktop Steam reconciles the two internally;
+     * with our cloudenabled=0 setup that path is dead, so we bridge it.
+     */
+    private val sdkCloudSaveMirrors: Map<Int, String> = mapOf(
+        588650 to "save", // Dead Cells
+    )
+
+    private fun sdkCloudRemoteDir(context: Context, appId: Int): File? {
+        val accountId = SteamService.userSteamId?.accountID?.toLong() ?: return null
+        return File(PathType.SteamUserData.toAbsPath(context, appId, accountId))
+    }
+
+    private fun sdkCloudGameSaveDir(context: Context, appId: Int): File? {
+        val sub = sdkCloudSaveMirrors[appId] ?: return null
+        return File(SteamService.getAppDirPath(appId), sub)
+    }
+
+    fun mirrorSdkCloudRemoteToSave(context: Context, appId: Int) {
+        val gameSaveDir = sdkCloudGameSaveDir(context, appId) ?: return
+        val remoteDir = sdkCloudRemoteDir(context, appId) ?: return
+
+        if (!remoteDir.exists()) {
+            Timber.i("mirrorSdkCloudRemoteToSave: remote/ missing for appId=$appId")
+            return
+        }
+        if (!gameSaveDir.exists()) gameSaveDir.mkdirs()
+
+        remoteDir.listFiles()?.forEach { src ->
+            if (!src.isFile) return@forEach
+            val dst = File(gameSaveDir, src.name)
+            try {
+                Files.copy(
+                    src.toPath(),
+                    dst.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES,
+                )
+                Timber.i("SDK cloud mirror remote->save appId=$appId: ${src.name} (${src.length()} bytes)")
+            } catch (e: Exception) {
+                Timber.w(e, "Failed to mirror ${src.name} remote->save appId=$appId")
+            }
+        }
+    }
+
+    fun mirrorSdkCloudSaveToRemote(context: Context, appId: Int) {
+        val gameSaveDir = sdkCloudGameSaveDir(context, appId) ?: return
+        val remoteDir = sdkCloudRemoteDir(context, appId) ?: return
+
+        if (!gameSaveDir.exists()) return
+        if (!remoteDir.exists()) remoteDir.mkdirs()
+
+        gameSaveDir.listFiles()?.forEach { src ->
+            if (!src.isFile) return@forEach
+            // Skip local-only artifacts (e.g. Dead Cells writes backup-YYYY-MM-DD-N.zip snapshots
+            // alongside saves; those aren't cloud-synced).
+            if (src.name.startsWith("backup-") && src.name.endsWith(".zip")) return@forEach
+            val dst = File(remoteDir, src.name)
+            try {
+                Files.copy(
+                    src.toPath(),
+                    dst.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.COPY_ATTRIBUTES,
+                )
+                Timber.i("SDK cloud mirror save->remote appId=$appId: ${src.name} (${src.length()} bytes)")
+            } catch (e: Exception) {
+                Timber.w(e, "Failed to mirror ${src.name} save->remote appId=$appId")
+            }
         }
     }
 

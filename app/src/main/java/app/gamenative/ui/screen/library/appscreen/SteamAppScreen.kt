@@ -836,6 +836,7 @@ class SteamAppScreen : BaseAppScreen() {
                         val syncResult = SteamService.forceSyncUserFiles(
                             appId = gameId,
                             prefixToPath = prefixToPath,
+                            isLaunchRealSteam = container.isLaunchRealSteam,
                         ).await()
 
                         when (syncResult.syncResult) {
@@ -1134,6 +1135,7 @@ class SteamAppScreen : BaseAppScreen() {
                                             appId = gameId,
                                             prefixToPath = prefixToPath,
                                             overrideLocalChangeNumber = -1,
+                                            isLaunchRealSteam = container.isLaunchRealSteam,
                                         ).await()
                                     } else {
                                         SnackbarManager.show(context.getString(R.string.steam_not_logged_in))

@@ -2175,16 +2175,80 @@ class SteamService : Service(), IChallengeUrlChanged {
             var syncResult = PostSyncInfo(SyncResult.UnknownFail)
             var launchIntentRegistered = false
 
-            // Wine-hosted Steam establishes its own session via BYieldingAppLaunchIntent,
-            // so clearing server-side state here wipes orphan phantoms from prior aborted
-            // launches (emulation crash, killed mid-sync) without disrupting anything we're
+            // Wine-hosted Steam establishes its own session via BYieldingAppLaunchIntent
+            // under machineName="localhost", so clearing server-side state here wipes
+            // orphan phantoms from prior aborted launches without disrupting anything we're
             // about to do — we don't signal an intent in real-Steam mode anyway.
+            //
+            // Probe first: a bare signalAppLaunchIntent with ignorePendingOperations=false
+            // returns the list of pending ops without dismissing them. Only run the full
+            // dismissal cycle if the server actually reports a phantom, so we don't
+            // advance the cloud ChangeNumber on clean launches. A prior iteration always
+            // ran signalAppExitSyncDone(uploadsCompleted=true) proactively, which lied to
+            // the server that we completed uploads and reset cloud ChangeNumber to 0 —
+            // Wine-Steam then "forgot" steam_autocloud.vdf and games with Steamworks
+            // cloud integration (e.g. 868-HACK) exited with code 1.
             if (isLaunchRealSteam) {
                 runCatching { instance?._steamUser?.kickPlayingSession() }
                     .onFailure { Timber.w(it, "Proactive kickPlayingSession before real-Steam launch failed") }
+
+                val steamInstance = instance
+                val steamCloud = steamInstance?._steamCloud
+                val proactiveClientId = PrefManager.clientId
+                if (steamInstance != null && steamCloud != null && proactiveClientId != null) {
+                    val ourMachineName = SteamUtils.getMachineName(steamInstance)
+                    runCatching {
+                        val probed = steamCloud.signalAppLaunchIntent(
+                            appId = appId,
+                            clientId = proactiveClientId,
+                            machineName = ourMachineName,
+                            ignorePendingOperations = false,
+                            osType = EOSType.AndroidUnknown,
+                        ).await()
+
+                        if (probed.isNotEmpty()) {
+                            Timber.i(
+                                "Proactive real-Steam probe found %d pending op(s) (%s); dismissing phantom",
+                                probed.size,
+                                probed.joinToString { "${it.machineName}:${it.operation.name}" },
+                            )
+                            steamCloud.signalAppLaunchIntent(
+                                appId = appId,
+                                clientId = proactiveClientId,
+                                machineName = ourMachineName,
+                                ignorePendingOperations = true,
+                                osType = EOSType.AndroidUnknown,
+                            ).await()
+                            steamCloud.signalAppExitSyncDone(
+                                appId = appId,
+                                clientId = proactiveClientId,
+                                uploadsCompleted = false,
+                                uploadsRequired = false,
+                            )
+                        }
+                    }.onFailure {
+                        Timber.w(it, "Proactive phantom-clearing probe before real-Steam launch failed")
+                    }
+
+                    // Release the AppSessionActive the probe RPC registered under our
+                    // machineName so Wine-Steam's subsequent localhost intent doesn't see
+                    // a conflicting session from us.
+                    runCatching { steamInstance._steamUser?.kickPlayingSession() }
+                        .onFailure { Timber.w(it, "Probe-session kick after proactive launch intent failed") }
+                }
             }
 
             try {
+                // Pluvia is the sole cloud client in both modes: Wine-Steam has
+                // cloudenabled=0 written to localconfig.vdf AND sharedconfig.vdf and
+                // is launched with -no-browser so it performs no cloud I/O. Running
+                // Pluvia's AutoCloud on launch is required in real-Steam mode so users
+                // get fresh saves from other devices before the Wine-hosted game loads
+                // them — skipping this on launch caused Dead Cells to boot into an
+                // empty save. The original "save conflict" dialog that motivated a
+                // skip was driven by a ChangeNumber race between Wine-Steam and Pluvia
+                // both writing cloud state; with Wine-Steam's cloud fully suppressed
+                // there is no second writer to race with.
                 val maxAttempts = 3
                 for (attempt in 1..maxAttempts) {
                     try {
@@ -2207,6 +2271,15 @@ class SteamService : Service(), IChallengeUrlChanged {
                                             syncResult = info
 
                                             if (info.syncResult == SyncResult.Success || info.syncResult == SyncResult.UpToDate) {
+                                                // Bridge SDK-cloud games whose on-disk save dir differs
+                                                // from <userdata>/<appid>/remote/ (e.g. Dead Cells reads
+                                                // <install>/save/). Desktop Steam reconciles these via
+                                                // ISteamRemoteStorage internally; with cloudenabled=0 that
+                                                // path is dead, so mirror remote/ -> save/ ourselves.
+                                                steamInstance.applicationContext?.let { ctx ->
+                                                    SteamUtils.mirrorSdkCloudRemoteToSave(ctx, appId)
+                                                }
+
                                                 Timber.i(
                                                     "Signaling app launch:\n\tappId: %d\n\tclientId: %s\n\tosType: %s\n\tisLaunchRealSteam: %s",
                                                     appId,
@@ -2413,6 +2486,16 @@ class SteamService : Service(), IChallengeUrlChanged {
                         } catch (e: Exception) {
                             Timber.e(e, "Achievement sync failed for appId=$appId, continuing with cloud save sync")
                         }
+                    }
+
+                    // Reverse of the pre-launch mirror: copy the game's on-disk save
+                    // files (e.g. Dead Cells's <install>/save/) back into
+                    // <userdata>/<appid>/remote/ so the subsequent SteamAutoCloud
+                    // upload sees the player's progress.
+                    try {
+                        SteamUtils.mirrorSdkCloudSaveToRemote(context, appId)
+                    } catch (e: Exception) {
+                        Timber.w(e, "SDK cloud save->remote mirror failed for appId=$appId")
                     }
 
                     val maxAttempts = 3
