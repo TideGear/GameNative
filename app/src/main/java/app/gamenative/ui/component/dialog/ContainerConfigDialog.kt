@@ -143,6 +143,7 @@ fun ContainerConfigDialog(
     default: Boolean = false,
     title: String,
     initialConfig: ContainerData = ContainerData(),
+    appId: Int? = null,
     onDismissRequest: () -> Unit,
     onSave: (ContainerData) -> Unit,
 ) {
@@ -1037,6 +1038,7 @@ fun ContainerConfigDialog(
             applyScreenSizeToConfig = applyScreenSizeToConfig,
             vkd3dForcedVersion = { vkd3dForcedVersion() },
             currentDxvkContext = { currentDxvkContext() },
+            appId = appId,
         )
 
         LoadingDialog(

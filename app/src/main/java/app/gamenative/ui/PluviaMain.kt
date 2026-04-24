@@ -90,6 +90,7 @@ import app.gamenative.ui.theme.PluviaTheme
 import app.gamenative.ui.util.SnackbarManager
 import app.gamenative.utils.BestConfigService
 import app.gamenative.utils.ContainerUtils
+import app.gamenative.utils.SteamUtils
 import app.gamenative.utils.PlatformAuthUtils
 import app.gamenative.utils.CustomGameScanner
 import app.gamenative.utils.ManifestInstaller
@@ -786,6 +787,61 @@ fun PluviaMain(
                     type = "text/plain"
                 }
                 context.startActivity(Intent.createChooser(shareIntent, context.getString(R.string.main_share)))
+            }
+        }
+
+        DialogType.SDK_CLOUD_BRIDGE_SUGGESTION -> {
+            val relaunch = {
+                preLaunchApp(
+                    context = context,
+                    appId = state.launchedAppId,
+                    skipBridgePrompt = true,
+                    setLoadingDialogVisible = viewModel::setLoadingDialogVisible,
+                    setLoadingProgress = viewModel::setLoadingDialogProgress,
+                    setLoadingMessage = viewModel::setLoadingDialogMessage,
+                    setMessageDialogState = setMessageDialogState,
+                    onSuccess = viewModel::launchApp,
+                    isOffline = viewModel.isOffline.value,
+                )
+            }
+            onConfirmClick = {
+                // Enable: write Ludusavi's suggested subdir, then continue the launch.
+                msgDialogState = MessageDialogState(false)
+                CoroutineScope(Dispatchers.IO).launch {
+                    val gameId = ContainerUtils.extractGameIdFromContainerId(state.launchedAppId)
+                    val rec = runCatching {
+                        SteamUtils.getRecommendedSdkCloudSaveSubdirAsync(context, gameId)
+                    }.getOrNull()
+                    if (rec != null) {
+                        runCatching {
+                            val container = ContainerUtils.getContainer(context, state.launchedAppId)
+                            container.sdkCloudSaveSubdir = rec.subdir
+                            container.saveData()
+                        }.onFailure { Timber.w(it, "Failed to persist sdkCloudSaveSubdir=${rec.subdir}") }
+                    }
+                    withContext(Dispatchers.Main) { relaunch() }
+                }
+            }
+            onDismissClick = {
+                // Skip this time — continue launch without setting the field.
+                msgDialogState = MessageDialogState(false)
+                relaunch()
+            }
+            onActionClick = {
+                // Don't ask again for this game.
+                msgDialogState = MessageDialogState(false)
+                CoroutineScope(Dispatchers.IO).launch {
+                    runCatching {
+                        val container = ContainerUtils.getContainer(context, state.launchedAppId)
+                        container.putExtra("sdkCloudBridgePromptDismissed", "1")
+                        container.saveData()
+                    }.onFailure { Timber.w(it, "Failed to persist sdkCloudBridgePromptDismissed") }
+                    withContext(Dispatchers.Main) { relaunch() }
+                }
+            }
+            onDismissRequest = {
+                msgDialogState = MessageDialogState(false)
+                relaunch()
             }
         }
 
@@ -1519,6 +1575,7 @@ fun preLaunchApp(
     preferredSave: SaveLocation = SaveLocation.None,
     useTemporaryOverride: Boolean = false,
     skipCloudSync: Boolean = false,
+    skipBridgePrompt: Boolean = false,
     setLoadingDialogVisible: (Boolean) -> Unit,
     setLoadingProgress: (Float) -> Unit,
     setLoadingMessage: (String) -> Unit,
@@ -1549,6 +1606,41 @@ fun preLaunchApp(
 
         val gameSource = ContainerUtils.extractGameSourceFromContainerId(appId)
         val isLocalSavesOnly = ContainerUtils.isLocalSavesOnly(context, appId)
+
+        // First-launch suggestion for Pattern B SDK-cloud games (e.g. Dead Cells).
+        // Fires only when real-Steam is on, the subdir is blank, the user hasn't dismissed,
+        // Ludusavi knows this game, AND it has no Auto-Cloud saveFilePatterns in PICS UFS.
+        // That intersection is a reliable Pattern B signal and keeps false positives low.
+        if (!skipBridgePrompt &&
+            gameSource == GameSource.STEAM &&
+            container.isLaunchRealSteam &&
+            container.sdkCloudSaveSubdir.isBlank() &&
+            container.getExtra("sdkCloudBridgePromptDismissed", "") != "1"
+        ) {
+            val rec = runCatching {
+                SteamUtils.shouldSuggestSdkCloudBridge(context, gameId)
+            }.getOrNull()
+            if (rec != null) {
+                Timber.i("Pattern B bridge prompt for appId=$gameId (\"${rec.name}\" -> \"${rec.subdir}\")")
+                setLoadingDialogVisible(false)
+                setMessageDialogState(
+                    MessageDialogState(
+                        visible = true,
+                        type = DialogType.SDK_CLOUD_BRIDGE_SUGGESTION,
+                        title = context.getString(R.string.sdk_cloud_bridge_prompt_title),
+                        message = context.getString(
+                            R.string.sdk_cloud_bridge_prompt_message,
+                            rec.name.ifEmpty { gameId.toString() },
+                            rec.subdir,
+                        ),
+                        confirmBtnText = context.getString(R.string.sdk_cloud_bridge_prompt_enable),
+                        dismissBtnText = context.getString(R.string.sdk_cloud_bridge_prompt_skip),
+                        actionBtnText = context.getString(R.string.sdk_cloud_bridge_prompt_dont_ask),
+                    ),
+                )
+                return@launch
+            }
+        }
 
         // When "Open container" is used we boot to desktop/file manager only — skip executable check
         if (!bootToContainer) {

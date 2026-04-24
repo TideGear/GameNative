@@ -26,6 +26,9 @@ data class ContainerData(
     val showFPS: Boolean = false,
     val launchRealSteam: Boolean = false,
     val disableSteamOverlay: Boolean = true,
+    /** Install-relative subdir for SDK-cloud games that keep saves in their install dir
+     *  (e.g. Dead Cells -> "save"). Empty disables mirroring. Single-component only. */
+    val sdkCloudSaveSubdir: String = "",
     val allowSteamUpdates: Boolean = false,
     val steamType: String = "normal",
     val cpuList: String = Container.getFallbackCPUList(),
@@ -117,6 +120,7 @@ data class ContainerData(
                     "showFPS" to state.showFPS,
                     "launchRealSteam" to state.launchRealSteam,
                     "disableSteamOverlay" to state.disableSteamOverlay,
+                    "sdkCloudSaveSubdir" to state.sdkCloudSaveSubdir,
                     "allowSteamUpdates" to state.allowSteamUpdates,
                     "steamType" to state.steamType,
                     "cpuList" to state.cpuList,
@@ -180,6 +184,7 @@ data class ContainerData(
                     showFPS = savedMap["showFPS"] as Boolean,
                     launchRealSteam = savedMap["launchRealSteam"] as Boolean,
                     disableSteamOverlay = (savedMap["disableSteamOverlay"] as? Boolean) ?: true,
+                    sdkCloudSaveSubdir = (savedMap["sdkCloudSaveSubdir"] as? String) ?: "",
                     allowSteamUpdates = savedMap["allowSteamUpdates"] as Boolean,
                     steamType = (savedMap["steamType"] as? String) ?: "normal",
                     cpuList = savedMap["cpuList"] as String,
