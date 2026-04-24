@@ -1609,7 +1609,9 @@ fun XServerScreen(
                                     container.getExtra("vibrationMode", "controller"),
                                 ),
                             )
-                            handler.setVibrationIntensity(container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100)
+                            handler.setVibrationIntensity(
+                                (container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100).coerceIn(0, 100)
+                            )
                             if (container.isDisableMouseInput()) {
                                 PluviaApp.touchpadView?.setTouchscreenMouseDisabled(true)
                             } else if (container.isTouchscreenMode()) {
