@@ -86,6 +86,7 @@ public class Container {
     private boolean showFPS;
     private boolean launchRealSteam;
     private boolean disableSteamOverlay = true;
+    private String sdkCloudSaveSubdir = "";
     private boolean allowSteamUpdates;
     private boolean wow64Mode = true;
     private boolean needsUnpacking = true;
@@ -332,6 +333,14 @@ public class Container {
 
     public void setDisableSteamOverlay(boolean disableSteamOverlay) {
         this.disableSteamOverlay = disableSteamOverlay;
+    }
+
+    public String getSdkCloudSaveSubdir() {
+        return sdkCloudSaveSubdir == null ? "" : sdkCloudSaveSubdir;
+    }
+
+    public void setSdkCloudSaveSubdir(String sdkCloudSaveSubdir) {
+        this.sdkCloudSaveSubdir = sdkCloudSaveSubdir == null ? "" : sdkCloudSaveSubdir;
     }
 
     public boolean isAllowSteamUpdates() {
@@ -662,6 +671,7 @@ public class Container {
             data.put("showFPS", showFPS);
             data.put("launchRealSteam", launchRealSteam);
             data.put("disableSteamOverlay", disableSteamOverlay);
+            data.put("sdkCloudSaveSubdir", sdkCloudSaveSubdir);
             data.put("allowSteamUpdates", allowSteamUpdates);
             data.put("inputType", inputType);
             data.put("dinputMapperType", dinputMapperType);
@@ -783,6 +793,9 @@ public class Container {
                     break;
                 case "disableSteamOverlay" :
                     setDisableSteamOverlay(data.getBoolean(key));
+                    break;
+                case "sdkCloudSaveSubdir" :
+                    setSdkCloudSaveSubdir(data.optString(key, ""));
                     break;
                 case "allowSteamUpdates" :
                     setAllowSteamUpdates(data.getBoolean(key));
