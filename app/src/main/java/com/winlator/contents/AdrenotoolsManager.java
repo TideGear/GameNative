@@ -140,10 +140,48 @@ public class AdrenotoolsManager {
         Log.d("AdrenotoolsManager", "Extracting " + src + " to " + dst.getAbsolutePath());
         hasExtracted = TarCompressorUtils.extract(TarCompressorUtils.Type.ZSTD, mContext, src, dst);
 
+        // Post-extract integrity check. tzst can report success while the .so is silently
+        // truncated (storage hiccup, OOM, partial flush). A partial .so is the cross-game
+        // corruption point: every container sharing this Adrenotools driver dlopens the
+        // bad binary and renders nothing visible. Detecting it here forces clean re-extract
+        // on next launch instead of waiting for a manual game reinstall.
+        if (hasExtracted && !isDriverDirIntact(dst)) {
+            Log.w("AdrenotoolsManager", "Driver dir failed integrity check after extract: " + dst.getAbsolutePath());
+            hasExtracted = false;
+        }
+
         if (!hasExtracted)
             FileUtils.delete(dst);
 
         return hasExtracted;
+    }
+
+    /**
+     * Validates that an extracted Adrenotools driver dir is structurally sound:
+     *  1. meta.json exists and parses
+     *  2. The libraryName referenced by meta.json points at an existing file
+     *  3. That .so is at least 1 MB (real drivers are 5–20 MB; anything smaller is partial/empty)
+     *
+     * Returns true if all three hold. Cheap: a few stat calls + one small JSON parse.
+     */
+    private boolean isDriverDirIntact(File driverDir) {
+        try {
+            File metaFile = new File(driverDir, "meta.json");
+            if (!metaFile.isFile()) return false;
+            String metaText = FileUtils.readString(metaFile);
+            if (metaText == null || metaText.isEmpty()) return false;
+            JSONObject meta = new JSONObject(metaText);
+            String libraryName = meta.optString("libraryName", "");
+            if (libraryName.isEmpty()) return false;
+            File so = new File(driverDir, libraryName);
+            if (!so.isFile()) return false;
+            // Minimum sane size for a Vulkan driver .so. Real Turnip/Adreno builds are
+            // 5–20 MB; truncated extracts typically leave files much smaller than that.
+            return so.length() >= 1024L * 1024L;
+        } catch (Exception e) {
+            Log.w("AdrenotoolsManager", "isDriverDirIntact failed for " + driverDir.getAbsolutePath() + ": " + e);
+            return false;
+        }
     }
 
     public String installDriver(Uri driverUri) {
