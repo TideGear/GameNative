@@ -2837,7 +2837,13 @@ private fun setupXEnvironment(
     envVars.put("LC_ALL", lc_all)
     envVars.put("MESA_DEBUG", "silent")
     envVars.put("MESA_NO_ERROR", "1")
-    envVars.put("WINEPREFIX", imageFs.wineprefix)
+    // Use the per-container wine prefix path directly. imageFs.wineprefix
+    // resolves through the global `xuser` symlink which points at whichever
+    // container was last activated, so writes from this Wine process can race
+    // a concurrent activate-container on another launch and corrupt the wrong
+    // container's prefix (registry hives shrink, native d3dx9/d3dcompiler
+    // revert to Wine builtins, etc.).
+    envVars.put("WINEPREFIX", File(container.rootDir, ".wine").absolutePath)
     if (container.isSdlControllerAPI){
         if (container.inputType == PreferredInputApi.XINPUT.ordinal || container.inputType == PreferredInputApi.AUTO.ordinal){
             envVars.put("SDL_XINPUT_ENABLED", "1")
@@ -4027,15 +4033,28 @@ private fun setupWineSystemFiles(
     val imageFs = ImageFs.find(context)
     val appVersion = AppUtils.getVersionCode(context).toString()
     val imgVersion = imageFs.getVersion().toString()
-    val wineVersion = imageFs.getArch()
-    val variant = imageFs.getVariant()
+    // imageFs.getArch() and imageFs.getVariant() read .winlator/.arch and
+    // .winlator/.variant which are GLOBAL files shared across containers
+    // (whichever container launched last writes them). When a container with a
+    // different Wine version launches, that flips the global file and the next
+    // launch of any other container sees a fake "wineVersion changed" mismatch
+    // and runs applyGeneralPatches, which deletes and re-extracts every common
+    // DLL (including d3dx9_*/d3dcompiler_*) from Wine's bundle — reverting
+    // installed-redist DLLs back to Wine builtins and breaking the prefix.
+    // Compare against per-container state instead so a foreign launch can't
+    // contaminate this container.
+    val lastAppliedWine = container.getExtra("lastAppliedWineVersion", "")
+    val lastAppliedVariant = container.getExtra("lastAppliedVariant", "")
     var containerDataChanged = false
 
     if (!container.getExtra("appVersion").equals(appVersion) || !container.getExtra("imgVersion").equals(imgVersion) ||
-        container.containerVariant != variant || (container.containerVariant == variant && container.wineVersion != wineVersion)) {
+        container.containerVariant != lastAppliedVariant ||
+        (container.containerVariant == lastAppliedVariant && container.wineVersion != lastAppliedWine)) {
         applyGeneralPatches(context, container, imageFs, xServerState.value.wineInfo, containerManager, onExtractFileListener)
         container.putExtra("appVersion", appVersion)
         container.putExtra("imgVersion", imgVersion)
+        container.putExtra("lastAppliedWineVersion", container.wineVersion)
+        container.putExtra("lastAppliedVariant", container.containerVariant)
         containerDataChanged = true
     }
 
@@ -4056,7 +4075,7 @@ private fun setupWineSystemFiles(
         )
     }
 
-    val needReextract = ALWAYS_REEXTRACT || xServerState.value.dxwrapper != container.getExtra("dxwrapper") || container.wineVersion != wineVersion
+    val needReextract = ALWAYS_REEXTRACT || xServerState.value.dxwrapper != container.getExtra("dxwrapper") || container.wineVersion != lastAppliedWine
 
     Timber.i("needReextract is " + needReextract)
     Timber.i("xServerState.value.dxwrapper is " + xServerState.value.dxwrapper)
@@ -4093,7 +4112,9 @@ private fun setupWineSystemFiles(
     val openalState = if (needsOpenalDlls) "yes" else "no"
     if (openalState != container.getExtra("openal_dlls") || firstTimeBoot) {
         if (needsOpenalDlls) {
-            val windowsDir = File(imageFs.rootDir, ImageFs.WINEPREFIX + "/drive_c/windows")
+            // Per-container path; xuser symlink is unsafe for writes (see
+            // applySystemTweaks rationale).
+            val windowsDir = File(container.rootDir, ".wine/drive_c/windows")
             TarCompressorUtils.extract(
                 TarCompressorUtils.Type.ZSTD, context.assets,
                 "wincomponents/openal.tzst", windowsDir, onExtractFileListener,
@@ -4108,12 +4129,12 @@ private fun setupWineSystemFiles(
         // on launch, so invalidate the extraction when Wine version or variant changes.
         val steamExtractedKey = "${container.wineVersion}|${container.containerVariant}"
         val steamExtractedPrev = container.getExtra("steamExtractedForWine")
-        val steamExeFile = File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam/steam.exe")
+        val steamExeFile = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam/steam.exe")
         if (steamExtractedPrev != steamExtractedKey && steamExeFile.exists()) {
             // Symlink-safe delete: steamapps/common/<installdir> symlinks point at
             // GameNative's own Steam dir, and a following recursive delete would wipe
             // every installed game's files.
-            val steamDir = File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam")
+            val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
             SteamUtils.deleteTreeNoFollowSymlinks(steamDir)
         }
         extractSteamFiles(context, container, onExtractFileListener)
@@ -4126,7 +4147,7 @@ private fun setupWineSystemFiles(
 
     val desktopTheme = container.desktopTheme
     if ((desktopTheme + "," + screenInfo) != container.getExtra("desktopTheme")) {
-        WineThemeManager.apply(context, WineThemeManager.ThemeInfo(desktopTheme), screenInfo)
+        WineThemeManager.apply(context, WineThemeManager.ThemeInfo(desktopTheme), screenInfo, container)
         container.putExtra("desktopTheme", desktopTheme + "," + screenInfo)
         containerDataChanged = true
     }
@@ -4181,7 +4202,7 @@ private fun applyGeneralPatches(
         Timber.i("Attempting to extract _container_pattern.tzst with wine version " + container.wineVersion)
     }
     containerManager.extractContainerPatternFile(container.getWineVersion(), contentsManager, container.rootDir, null)
-    WineUtils.applySystemTweaks(context, wineInfo)
+    WineUtils.applySystemTweaks(context, wineInfo, container)
     container.putExtra("graphicsDriver", null)
     container.putExtra("desktopTheme", null)
     WinlatorPrefManager.init(context)
@@ -4215,9 +4236,11 @@ private fun extractDXWrapperFiles(
         "ddraw.dll",
     )
     val splitDxWrapper = dxwrapper.split("-")[0]
-    if (firstTimeBoot && splitDxWrapper != "vkd3d") cloneOriginalDllFiles(imageFs, *dlls)
-    val rootDir = imageFs.getRootDir()
-    val windowsDir = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows")
+    if (firstTimeBoot && splitDxWrapper != "vkd3d") cloneOriginalDllFiles(imageFs, container, *dlls)
+    // Per-container .wine paths; the xuser symlink is unsafe for writes
+    // (see applySystemTweaks for the cascade-corruption rationale).
+    val containerRoot = container.rootDir
+    val windowsDir = File(containerRoot, ".wine/drive_c/windows")
 
     when (splitDxWrapper) {
         "wined3d" -> {
@@ -4226,9 +4249,9 @@ private fun extractDXWrapperFiles(
         "cnc-ddraw" -> {
             restoreOriginalDllFiles(context, container, containerManager, imageFs, *dlls)
             val assetDir = "dxwrapper/cnc-ddraw-" + DefaultVersion.CNC_DDRAW
-            val configFile = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/ProgramData/cnc-ddraw/ddraw.ini")
+            val configFile = File(containerRoot, ".wine/drive_c/ProgramData/cnc-ddraw/ddraw.ini")
             if (!configFile.isFile) FileUtils.copy(context, "$assetDir/ddraw.ini", configFile)
-            val shadersDir = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/ProgramData/cnc-ddraw/Shaders")
+            val shadersDir = File(containerRoot, ".wine/drive_c/ProgramData/cnc-ddraw/Shaders")
             FileUtils.delete(shadersDir)
             FileUtils.copy(context, "$assetDir/Shaders", shadersDir)
             TarCompressorUtils.extract(
@@ -4287,11 +4310,11 @@ private fun extractDXWrapperFiles(
         }
     }
 }
-private fun cloneOriginalDllFiles(imageFs: ImageFs, vararg dlls: String) {
-    val rootDir = imageFs.rootDir
-    val cacheDir = File(rootDir, ImageFs.CACHE_PATH + "/original_dlls")
+private fun cloneOriginalDllFiles(imageFs: ImageFs, container: Container, vararg dlls: String) {
+    val containerRoot = container.rootDir
+    val cacheDir = File(containerRoot, ".cache/original_dlls")
     if (!cacheDir.isDirectory) cacheDir.mkdirs()
-    val windowsDir = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows")
+    val windowsDir = File(containerRoot, ".wine/drive_c/windows")
     val dirnames = arrayOf("system32", "syswow64")
 
     for (dll in dlls) {
@@ -4308,12 +4331,12 @@ private fun restoreOriginalDllFiles(
     imageFs: ImageFs,
     vararg dlls: String,
 ) {
-    val rootDir = imageFs.rootDir
+    val containerRoot = container.rootDir
     if (container.containerVariant.equals(Container.GLIBC)) {
-        val cacheDir = File(rootDir, ImageFs.CACHE_PATH + "/original_dlls")
+        val cacheDir = File(containerRoot, ".cache/original_dlls")
         val contentsManager = ContentsManager(context)
         if (cacheDir.isDirectory) {
-            val windowsDir = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows")
+            val windowsDir = File(containerRoot, ".wine/drive_c/windows")
             val dirnames = cacheDir.list()
             var filesCopied = 0
 
@@ -4345,9 +4368,9 @@ private fun restoreOriginalDllFiles(
             },
         )
 
-        cloneOriginalDllFiles(imageFs, *dlls)
+        cloneOriginalDllFiles(imageFs, container, *dlls)
     } else {
-        val windowsDir = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows")
+        val windowsDir = File(containerRoot, ".wine/drive_c/windows")
         var system32dlls: File? = null
         var syswow64dlls: File? = null
 
@@ -4376,9 +4399,11 @@ private fun extractWinComponentFiles(
     // shortcut: Shortcut?,
     onExtractFileListener: OnExtractFileListener?,
 ) {
-    val rootDir = imageFs.rootDir
-    val windowsDir = File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows")
-    val systemRegFile = File(rootDir, ImageFs.WINEPREFIX + "/system.reg")
+    // Resolve through container.rootDir, not the global xuser symlink — see
+    // applySystemTweaks for the cascade-corruption rationale.
+    val containerRoot = container.rootDir
+    val windowsDir = File(containerRoot, ".wine/drive_c/windows")
+    val systemRegFile = File(containerRoot, ".wine/system.reg")
 
     try {
         val wincomponentsJSONObject = JSONObject(FileUtils.readString(context, "wincomponents/wincomponents.json"))
@@ -4395,7 +4420,7 @@ private fun extractWinComponentFiles(
                 }
             }
 
-            cloneOriginalDllFiles(imageFs, *dlls.toTypedArray())
+            cloneOriginalDllFiles(imageFs, container, *dlls.toTypedArray())
             dlls.clear()
         }
 
@@ -4669,11 +4694,13 @@ private fun extractGraphicsDriverFiles(
                 )
                 val renderer = GPUInformation.getRenderer(null, null)
                 if (container.wineVersion.contains("arm64ec") && renderer?.contains("Mali") != true) {
+                    // Per-container path; xuser symlink is unsafe for writes
+                    // (see applySystemTweaks rationale).
                     TarCompressorUtils.extract(
                         TarCompressorUtils.Type.ZSTD,
                         context.assets,
                         "graphics_driver/zink_dlls" + ".tzst",
-                        File(rootDir, ImageFs.WINEPREFIX + "/drive_c/windows"),
+                        File(container.rootDir, ".wine/drive_c/windows"),
                     )
                 }
             }
@@ -4771,7 +4798,9 @@ private fun extractSteamFiles(
     onExtractFileListener: OnExtractFileListener?,
 ) {
     val imageFs = ImageFs.find(context)
-    if (File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam/steam.exe").exists()) return
+    // Per-container path; xuser symlink is unsafe for writes (see
+    // applySystemTweaks rationale).
+    if (File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam/steam.exe").exists()) return
     val downloaded = File(imageFs.getFilesDir(), "steam.tzst")
     Timber.i("Extracting steam.tzst")
     TarCompressorUtils.extract(
@@ -4802,8 +4831,9 @@ private fun readLibraryNameFromExtractedDir(destinationDir: File): String? {
 }
 private fun changeWineAudioDriver(audioDriver: String, container: Container, imageFs: ImageFs) {
     if (audioDriver != container.getExtra("audioDriver")) {
-        val rootDir = imageFs.rootDir
-        val userRegFile = File(rootDir, ImageFs.WINEPREFIX + "/user.reg")
+        // Per-container path; xuser symlink is unsafe for writes (see
+        // applySystemTweaks rationale).
+        val userRegFile = File(container.rootDir, ".wine/user.reg")
         WineRegistryEditor(userRegFile).use { registryEditor ->
             if (audioDriver == "alsa") {
                 registryEditor.setStringValue("Software\\Wine\\Drivers", "Audio", "alsa")
