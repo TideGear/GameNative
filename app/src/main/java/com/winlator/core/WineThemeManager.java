@@ -41,9 +41,10 @@ public abstract class WineThemeManager {
         }
     }
 
-    public static void apply(Context context, ThemeInfo themeInfo, ScreenInfo screenInfo) {
-        File rootDir = ImageFs.find(context).getRootDir();
-        File userRegFile = new File(rootDir, ImageFs.WINEPREFIX+"/user.reg");
+    public static void apply(Context context, ThemeInfo themeInfo, ScreenInfo screenInfo, com.winlator.container.Container container) {
+        // Per-container path; xuser symlink is unsafe for writes (see
+        // WineUtils.applySystemTweaks rationale).
+        File userRegFile = new File(container.getRootDir(), ".wine/user.reg");
         String background = Color.red(themeInfo.backgroundColor)+" "+Color.green(themeInfo.backgroundColor)+" "+Color.blue(themeInfo.backgroundColor);
 
         if (themeInfo.backgroundType == BackgroundType.IMAGE) createWallpaperBMPFile(context, screenInfo);

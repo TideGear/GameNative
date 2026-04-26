@@ -21,8 +21,10 @@ class RegistryKeyFix(
         installPathWindows: String,
         container: Container,
     ): Boolean {
-        val imageFs = ImageFs.find(context)
-        val systemRegFile = File(imageFs.wineprefix, "system.reg")
+        // Per-container path; imageFs.wineprefix resolves through the global
+        // xuser symlink which is unsafe for writes (see WineUtils.applySystemTweaks
+        // for the cascade-corruption rationale).
+        val systemRegFile = File(container.rootDir, ".wine/system.reg")
         if (!systemRegFile.exists()) {
             Timber.tag("GameFixes").w("system.reg not found at ${systemRegFile.absolutePath}")
             return false
