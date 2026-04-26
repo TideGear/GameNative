@@ -125,15 +125,22 @@ public abstract class WineUtils {
         registryEditor.setHexValue("Control Panel\\Desktop\\WindowMetrics", "StatusFont", fontNormalData);
     }
 
-    public static void applySystemTweaks(Context context, WineInfo wineInfo) {
-        File rootDir = ImageFs.find(context).getRootDir();
-        File systemRegFile = new File(rootDir, ImageFs.WINEPREFIX+"/system.reg");
-        File userRegFile = new File(rootDir, ImageFs.WINEPREFIX+"/user.reg");
-        File userCacheDir = new File(rootDir, "/home/xuser/.cache");
+    public static void applySystemTweaks(Context context, WineInfo wineInfo, Container container) {
+        // Resolve all per-container paths through container.getRootDir() rather
+        // than the global `xuser` symlink. The symlink points at whichever
+        // container was last activated, so writes through `xuser/.wine` race
+        // across launches and corrupt a different container's prefix when the
+        // launch flow runs while the symlink is still pointing at the previous
+        // game (e.g. registry hives shrink, native d3dx9/d3dcompiler revert to
+        // Wine builtins).
+        File containerRoot = container.getRootDir();
+        File systemRegFile = new File(containerRoot, ".wine/system.reg");
+        File userRegFile = new File(containerRoot, ".wine/user.reg");
+        File userCacheDir = new File(containerRoot, ".cache");
         if (!userCacheDir.isDirectory()) {
             userCacheDir.mkdirs();
         }
-        File userConfigDir = new File(rootDir, "/home/xuser/.config");
+        File userConfigDir = new File(containerRoot, ".config");
         if (!userConfigDir.isDirectory()) {
             userConfigDir.mkdirs();
         }
@@ -178,10 +185,11 @@ public abstract class WineUtils {
             setWindowMetrics(registryEditor);
         }
 
-        File wineSystem32Dir = new File(rootDir, "/opt/wine/lib/wine/x86_64-windows");
-        File wineSysWoW64Dir = new File(rootDir, "/opt/wine/lib/wine/i386-windows");
-        File containerSystem32Dir = new File(rootDir, ImageFs.WINEPREFIX+"/drive_c/windows/system32");
-        File containerSysWoW64Dir = new File(rootDir, ImageFs.WINEPREFIX+"/drive_c/windows/syswow64");
+        File imageFsRoot = ImageFs.find(context).getRootDir();
+        File wineSystem32Dir = new File(imageFsRoot, "/opt/wine/lib/wine/x86_64-windows");
+        File wineSysWoW64Dir = new File(imageFsRoot, "/opt/wine/lib/wine/i386-windows");
+        File containerSystem32Dir = new File(containerRoot, ".wine/drive_c/windows/system32");
+        File containerSysWoW64Dir = new File(containerRoot, ".wine/drive_c/windows/syswow64");
 
         final String[] dlnames = {"user32.dll", "shell32.dll", "dinput.dll", "dinput8.dll", "xinput1_1.dll", "xinput1_2.dll", "xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll", "xinputuap.dll", "winemenubuilder.exe", "explorer.exe"};
         boolean win64 = wineInfo.isWin64();

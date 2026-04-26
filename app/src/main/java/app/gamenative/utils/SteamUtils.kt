@@ -159,8 +159,11 @@ object SteamUtils {
      */
     fun applySteamInstallScriptShim(context: Context, steamAppId: Int) {
         try {
-            val imageFs = ImageFs.find(context)
-            val systemRegFile = File(imageFs.wineprefix, "system.reg")
+            // Per-container path; imageFs.wineprefix resolves through the
+            // global xuser symlink which is unsafe for writes (see
+            // WineUtils.applySystemTweaks rationale).
+            val container = ContainerUtils.getContainer(context, "STEAM_$steamAppId")
+            val systemRegFile = File(container.rootDir, ".wine/system.reg")
             if (!systemRegFile.isFile) return
 
             val appKeys = listOf(
@@ -298,7 +301,11 @@ object SteamUtils {
         var replaced64Count = 0
         val backupPaths = mutableSetOf<String>()
         val imageFs = ImageFs.find(context)
-        autoLoginUserChanges(imageFs)
+        // Pass the container so writes go to the per-container .wine prefix
+        // rather than through the global xuser symlink (which can race with
+        // another concurrent launch and corrupt that game's prefix).
+        val container = ContainerUtils.getContainer(context, appId)
+        autoLoginUserChanges(imageFs, container)
         setupLightweightSteamConfig(imageFs, SteamService.userSteamId?.toString())
 
         val rootPath = Paths.get(appDirPath)
@@ -555,7 +562,7 @@ object SteamUtils {
         )
     }
 
-    fun autoLoginUserChanges(imageFs: ImageFs) {
+    fun autoLoginUserChanges(imageFs: ImageFs, container: Container? = null) {
         val vdfFileText = SteamService.getLoginUsersVdfOauth(
             steamId64 = SteamService.userSteamId?.convertToUInt64().toString(),
             account = PrefManager.username,
@@ -563,11 +570,17 @@ object SteamUtils {
             accessToken = PrefManager.accessToken,      // may be blank
             personaName = SteamService.instance?.localPersona?.value?.name ?: PrefManager.username
         )
-        val steamConfigDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/config")
+        // When called from a launch flow, prefer the per-container path.
+        // imageFs.wineprefix resolves through the global xuser symlink which is
+        // unsafe for concurrent launches (writes leak into the wrong
+        // container's prefix). The symlink-based fallback is kept for the
+        // login flow, which has no specific container context.
+        val winePrefixBase: File = container?.let { File(it.rootDir, ".wine") }
+            ?: File(imageFs.wineprefix)
+        val steamConfigDir = File(winePrefixBase, "drive_c/Program Files (x86)/Steam/config")
         try {
             File(steamConfigDir, "loginusers.vdf").writeText(vdfFileText)
-            val rootDir = imageFs.rootDir
-            val userRegFile = File(rootDir, ImageFs.WINEPREFIX + "/user.reg")
+            val userRegFile = File(winePrefixBase, "user.reg")
             val steamRoot = "C:\\Program Files (x86)\\Steam"
             val steamExe = "$steamRoot\\steam.exe"
             val hkcu = "Software\\Valve\\Steam"
@@ -1372,7 +1385,7 @@ object SteamUtils {
         // Update or modify localconfig.vdf
         updateOrModifyLocalConfig(imageFs, container, steamAppId.toString(), SteamService.userSteamId!!.accountID.toString())
 
-        skipFirstTimeSteamSetup(imageFs.rootDir)
+        skipFirstTimeSteamSetup(imageFs.rootDir, container)
         val appDirPath = SteamService.getAppDirPath(steamAppId)
 
         val restoredMarkerPresent = MarkerUtils.hasMarker(appDirPath, Marker.STEAM_DLL_RESTORED)
@@ -1382,7 +1395,7 @@ object SteamUtils {
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED)
 
-            autoLoginUserChanges(imageFs)
+            autoLoginUserChanges(imageFs, container)
             setupLightweightSteamConfig(imageFs, SteamService.userSteamId!!.accountID.toString())
 
             putBackSteamDlls(appDirPath)
@@ -2015,8 +2028,11 @@ object SteamUtils {
         return androidId.hashCode()
     }
 
-    private fun skipFirstTimeSteamSetup(rootDir: File?) {
-        val systemRegFile = File(rootDir, ImageFs.WINEPREFIX + "/system.reg")
+    private fun skipFirstTimeSteamSetup(rootDir: File?, container: Container? = null) {
+        // Per-container path when available — see autoLoginUserChanges for the
+        // cascade-corruption rationale.
+        val systemRegFile = container?.let { File(it.rootDir, ".wine/system.reg") }
+            ?: File(rootDir, ImageFs.WINEPREFIX + "/system.reg")
         val redistributables = listOf(
             "DirectX\\Jun2010" to "DXSetup",              // DirectX Jun 2010
             ".NET\\3.5" to "3.5 SP1",              // .NET 3.5
