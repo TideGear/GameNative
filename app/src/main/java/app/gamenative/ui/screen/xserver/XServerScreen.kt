@@ -4429,9 +4429,9 @@ private fun setupWineSystemFiles(
             SteamUtils.deleteTreeNoFollowSymlinks(steamDir)
         }
         extractSteamFiles(context, container, onExtractFileListener)
-        SteamUtils.ensureSteamCfg(ImageFs.find(context))
-        SteamUtils.purgePhantomAppUserdata(ImageFs.find(context), "241100")
-        SteamUtils.logSteamBinaryFingerprint(ImageFs.find(context), "prepareContainer:realSteam")
+        SteamUtils.ensureSteamCfg(ImageFs.find(context), container)
+        SteamUtils.purgePhantomAppUserdata(ImageFs.find(context), "241100", container)
+        SteamUtils.logSteamBinaryFingerprint(ImageFs.find(context), "prepareContainer:realSteam", container)
         container.putExtra("steamExtractedForWine", steamExtractedKey)
         containerDataChanged = true
     }

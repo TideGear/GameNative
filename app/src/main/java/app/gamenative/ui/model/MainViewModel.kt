@@ -464,7 +464,7 @@ class MainViewModel @Inject constructor(
                         container.putExtra("lastSteamMode", currentMode)
                         container.saveData()
                         if (previousMode == "real" && currentMode == "emu") {
-                            SteamUtils.cleanupExtractedSteamFiles(context)
+                            SteamUtils.cleanupExtractedSteamFiles(context, container)
                         }
                     }
                     if (container.isLaunchRealSteam()) {

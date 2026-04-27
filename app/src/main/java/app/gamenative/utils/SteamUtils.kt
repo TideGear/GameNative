@@ -298,8 +298,12 @@ object SteamUtils {
         var replaced64Count = 0
         val backupPaths = mutableSetOf<String>()
         val imageFs = ImageFs.find(context)
-        autoLoginUserChanges(imageFs)
-        setupLightweightSteamConfig(imageFs, SteamService.userSteamId?.toString())
+        // Pass the container so writes go to the per-container .wine prefix
+        // rather than through the global xuser symlink (which can race with
+        // another concurrent launch and corrupt that game's prefix).
+        val container = ContainerUtils.getContainer(context, appId)
+        autoLoginUserChanges(imageFs, container)
+        setupLightweightSteamConfig(imageFs, SteamService.userSteamId?.toString(), container)
 
         val rootPath = Paths.get(appDirPath)
         // Get ticket once for all DLLs
@@ -429,15 +433,18 @@ object SteamUtils {
     }
 
     fun backupSteamclientFiles(context: Context, steamAppId: Int) {
-        val imageFs = ImageFs.find(context)
+        // Per-container path; imageFs.wineprefix resolves through the global xuser
+        // symlink which is unsafe for writes (see WineUtils.applySystemTweaks).
+        val container = ContainerUtils.getContainer(context, "STEAM_$steamAppId")
+        val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
 
         var backupCount = 0
 
-        val backupDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steamclient_backup")
+        val backupDir = File(steamDir, "steamclient_backup")
         backupDir.mkdirs()
 
         steamClientFiles().forEach { file ->
-            val dll = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/$file")
+            val dll = File(steamDir, file)
             if (dll.exists()) {
                 Files.copy(dll.toPath(), File(backupDir, "$file.orig").toPath(), StandardCopyOption.REPLACE_EXISTING)
                 backupCount++
@@ -473,13 +480,14 @@ object SteamUtils {
     }
 
     fun restoreSteamclientFiles(context: Context, steamAppId: Int) {
-        val imageFs = ImageFs.find(context)
+        // Per-container path; imageFs.wineprefix resolves through the global xuser
+        // symlink which is unsafe for writes (see WineUtils.applySystemTweaks).
+        val container = ContainerUtils.getContainer(context, "STEAM_$steamAppId")
+        val origDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
 
         var restoredCount = 0
 
-        val origDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
-
-        val backupDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steamclient_backup")
+        val backupDir = File(origDir, "steamclient_backup")
         if (backupDir.exists()) {
             steamClientFiles().forEach { file ->
                 val dll = File(backupDir, "$file.orig")
@@ -490,7 +498,7 @@ object SteamUtils {
             }
         }
 
-        val extraDllDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/extra_dlls")
+        val extraDllDir = File(origDir, "extra_dlls")
         if (extraDllDir.exists()) {
             extraDllDir.deleteRecursively()
         }
@@ -587,10 +595,13 @@ object SteamUtils {
      * Creates configuration files that make Steam run in lightweight mode
      * with reduced resource usage and disabled community features
      */
-    private fun setupLightweightSteamConfig(imageFs: ImageFs, steamId64: String?) {
+    private fun setupLightweightSteamConfig(imageFs: ImageFs, steamId64: String?, container: Container? = null) {
         Timber.i("Setting up lightweight steam configs")
         try {
-            val steamPath = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
+            // Prefer per-container path. Fallback to imageFs.wineprefix (xuser
+            // symlink) is kept for non-launch callers that have no container.
+            val steamPath = container?.let { File(it.rootDir, ".wine/drive_c/Program Files (x86)/Steam") }
+                ?: File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
 
             // Create necessary directories
             val userDataPath = File(steamPath, "userdata/$steamId64")
@@ -669,7 +680,6 @@ object SteamUtils {
      */
     private fun restoreUnpackedExecutable(context: Context, steamAppId: Int) {
         try {
-            val imageFs = ImageFs.find(context)
             val appDirPath = SteamService.getAppDirPath(steamAppId)
 
             // Convert to Wine path format
@@ -685,8 +695,11 @@ object SteamUtils {
             }
             val executableFile = "$drive:\\${executablePath}"
 
-            val exe = File(imageFs.wineprefix + "/dosdevices/" + executableFile.replace("A:", "a:").replace('\\', '/'))
-            val unpackedExe = File(imageFs.wineprefix + "/dosdevices/" + executableFile.replace("A:", "a:").replace('\\', '/') + ".unpacked.exe")
+            // Per-container .wine path; imageFs.wineprefix resolves through the
+            // global xuser symlink which is unsafe for writes.
+            val winePrefix = File(container.rootDir, ".wine").absolutePath
+            val exe = File(winePrefix + "/dosdevices/" + executableFile.replace("A:", "a:").replace('\\', '/'))
+            val unpackedExe = File(winePrefix + "/dosdevices/" + executableFile.replace("A:", "a:").replace('\\', '/') + ".unpacked.exe")
 
             if (unpackedExe.exists()) {
                 // Check if files are different (compare size and last modified time for efficiency)
@@ -720,10 +733,10 @@ object SteamUtils {
                 return
             }
 
-            val imageFs = ImageFs.find(context)
-
-            // Create the steamapps folder structure
-            val steamappsDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steamapps")
+            // Per-container path; imageFs.wineprefix resolves through the global
+            // xuser symlink which is unsafe for writes.
+            val container = ContainerUtils.getContainer(context, "STEAM_$steamAppId")
+            val steamappsDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam/steamapps")
             if (!steamappsDir.exists()) {
                 steamappsDir.mkdirs()
             }
@@ -1332,8 +1345,13 @@ object SteamUtils {
     }
 
     /** Writes steam.cfg with update-inhibit keys if missing. Both real-Steam and emu paths need it present. */
-    fun ensureSteamCfg(imageFs: ImageFs) {
-        val cfgFile = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steam.cfg")
+    fun ensureSteamCfg(imageFs: ImageFs, container: Container? = null) {
+        // Per-container path; imageFs.wineprefix resolves through the global
+        // xuser symlink which is unsafe for writes. Fallback retained for
+        // legacy callers without a container in scope.
+        val cfgFile = container?.let {
+            File(it.rootDir, ".wine/drive_c/Program Files (x86)/Steam/steam.cfg")
+        } ?: File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/steam.cfg")
         if (cfgFile.exists()) return
         try {
             cfgFile.parentFile?.mkdirs()
@@ -1345,9 +1363,11 @@ object SteamUtils {
     }
 
     /** Logs size + mtime of the Steam binaries whose unexpected change breaks launches. Diagnostic-only. */
-    fun logSteamBinaryFingerprint(imageFs: ImageFs, tag: String) {
+    fun logSteamBinaryFingerprint(imageFs: ImageFs, tag: String, container: Container? = null) {
         try {
-            val steamDir = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
+            // Per-container path with symlink fallback for legacy callers.
+            val steamDir = container?.let { File(it.rootDir, ".wine/drive_c/Program Files (x86)/Steam") }
+                ?: File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
             val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply { timeZone = TimeZone.getDefault() }
             val parts = listOf("steam.exe", "steamclient.dll", "steamclient64.dll").map { name ->
                 val f = File(steamDir, name)
@@ -1367,8 +1387,8 @@ object SteamUtils {
         val steamAppId = ContainerUtils.extractGameIdFromContainerId(appId)
         val imageFs = ImageFs.find(context)
         val container = ContainerUtils.getOrCreateContainer(context, appId)
-        ensureSteamCfg(imageFs)
-        logSteamBinaryFingerprint(imageFs, "restoreSteamApi:emu:$steamAppId")
+        ensureSteamCfg(imageFs, container)
+        logSteamBinaryFingerprint(imageFs, "restoreSteamApi:emu:$steamAppId", container)
 
         // Update or modify localconfig.vdf
         updateOrModifyLocalConfig(imageFs, container, steamAppId.toString(), SteamService.userSteamId!!.accountID.toString())
@@ -1383,8 +1403,8 @@ object SteamUtils {
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_DLL_REPLACED)
             MarkerUtils.removeMarker(appDirPath, Marker.STEAM_COLDCLIENT_USED)
 
-            autoLoginUserChanges(imageFs)
-            setupLightweightSteamConfig(imageFs, SteamService.userSteamId!!.accountID.toString())
+            autoLoginUserChanges(imageFs, container)
+            setupLightweightSteamConfig(imageFs, SteamService.userSteamId!!.accountID.toString(), container)
 
             putBackSteamDlls(appDirPath)
             restoreOriginalExecutable(context, steamAppId)
@@ -1476,8 +1496,10 @@ object SteamUtils {
         Timber.i("Checking directory: $appDirPath")
         var restoredCount = 0
 
-        val imageFs = ImageFs.find(context)
-        val dosDevicesPath = File(imageFs.wineprefix, "dosdevices/a:")
+        // Per-container path; imageFs.wineprefix resolves through the global
+        // xuser symlink which is unsafe.
+        val container = ContainerUtils.getContainer(context, "STEAM_$steamAppId")
+        val dosDevicesPath = File(container.rootDir, ".wine/dosdevices/a:")
 
         dosDevicesPath.walkTopDown().maxDepth(10)
             .filter { it.isFile && it.name.endsWith(".original.exe", ignoreCase = true) }
@@ -1511,7 +1533,6 @@ object SteamUtils {
      */
     fun migrateGSESavesToSteamUserdata(context: Context, appId: Int, isLaunchRealSteam: Boolean = true) {
         if (!isLaunchRealSteam) return
-        val imageFs = ImageFs.find(context)
         val accountId = SteamService.userSteamId?.accountID?.toInt()
             ?: PrefManager.steamUserAccountId.takeIf { it != 0 }
 
@@ -1520,15 +1541,13 @@ object SteamUtils {
             return
         }
 
-        val gseDir = File(
-            imageFs.rootDir,
-            "${ImageFs.WINEPREFIX}/drive_c/users/xuser/AppData/Roaming/GSE Saves/$appId"
-        )
+        // Per-container path; imageFs.rootDir + ImageFs.WINEPREFIX resolves through
+        // the global xuser symlink which is unsafe for writes.
+        val container = ContainerUtils.getContainer(context, "STEAM_$appId")
+        val winePrefix = File(container.rootDir, ".wine")
 
-        val steamUserdataDir = File(
-            imageFs.rootDir,
-            "${ImageFs.WINEPREFIX}/drive_c/Program Files (x86)/Steam/userdata/$accountId/$appId"
-        )
+        val gseDir = File(winePrefix, "drive_c/users/xuser/AppData/Roaming/GSE Saves/$appId")
+        val steamUserdataDir = File(winePrefix, "drive_c/Program Files (x86)/Steam/userdata/$accountId/$appId")
 
         fun isDirectoryEmpty(file: File): Boolean {
             return file.isDirectory && file.list()?.isEmpty() ?: true
@@ -1601,7 +1620,6 @@ object SteamUtils {
      */
     fun migrateSteamUserdataToGSESaves(context: Context, appId: Int, isLaunchRealSteam: Boolean = false) {
         if (isLaunchRealSteam) return
-        val imageFs = ImageFs.find(context)
         val accountId = SteamService.userSteamId?.accountID?.toInt()
             ?: PrefManager.steamUserAccountId.takeIf { it != 0 }
 
@@ -1610,14 +1628,13 @@ object SteamUtils {
             return
         }
 
-        val steamUserdataDir = File(
-            imageFs.rootDir,
-            "${ImageFs.WINEPREFIX}/drive_c/Program Files (x86)/Steam/userdata/$accountId/$appId"
-        )
-        val gseDir = File(
-            imageFs.rootDir,
-            "${ImageFs.WINEPREFIX}/drive_c/users/xuser/AppData/Roaming/GSE Saves/$appId"
-        )
+        // Per-container path; imageFs.rootDir + ImageFs.WINEPREFIX resolves through
+        // the global xuser symlink which is unsafe.
+        val container = ContainerUtils.getContainer(context, "STEAM_$appId")
+        val winePrefix = File(container.rootDir, ".wine")
+
+        val steamUserdataDir = File(winePrefix, "drive_c/Program Files (x86)/Steam/userdata/$accountId/$appId")
+        val gseDir = File(winePrefix, "drive_c/users/xuser/AppData/Roaming/GSE Saves/$appId")
 
         fun isDirectoryEmpty(file: File): Boolean {
             return file.isDirectory && file.list()?.isEmpty() ?: true
@@ -1704,10 +1721,12 @@ object SteamUtils {
         })
     }
 
-    fun cleanupExtractedSteamFiles(context: Context) {
+    fun cleanupExtractedSteamFiles(context: Context, container: Container? = null) {
         try {
-            val imageFs = ImageFs.find(context)
-            val steamDir = File(imageFs.rootDir, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam")
+            // Per-container path; imageFs.WINEPREFIX resolves through the
+            // global xuser symlink which is unsafe for writes.
+            val steamDir = container?.let { File(it.rootDir, ".wine/drive_c/Program Files (x86)/Steam") }
+                ?: File(ImageFs.find(context).rootDir, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam")
             if (!steamDir.exists()) return
             val steamExe = File(steamDir, "steam.exe")
             if (!steamExe.exists()) return
@@ -1725,9 +1744,11 @@ object SteamUtils {
      * Deleting userdata/<steamId>/<phantomAppId>/ breaks the association so
      * shutdown completes promptly for subsequent real-Steam launches.
      */
-    fun purgePhantomAppUserdata(imageFs: ImageFs, phantomAppId: String) {
+    fun purgePhantomAppUserdata(imageFs: ImageFs, phantomAppId: String, container: Container? = null) {
         try {
-            val userdataRoot = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/userdata")
+            // Per-container path with symlink fallback for legacy callers.
+            val userdataRoot = container?.let { File(it.rootDir, ".wine/drive_c/Program Files (x86)/Steam/userdata") }
+                ?: File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam/userdata")
             if (!userdataRoot.isDirectory) return
             val victims = userdataRoot.listFiles { f -> f.isDirectory }?.mapNotNull { userDir ->
                 File(userDir, phantomAppId).takeIf { it.exists() }
@@ -2111,7 +2132,9 @@ object SteamUtils {
         try {
             val exeCommandLine = container.execArgs
 
-            val steamPath = File(imageFs.wineprefix, "drive_c/Program Files (x86)/Steam")
+            // Per-container path; imageFs.wineprefix resolves through the global
+            // xuser symlink which is unsafe for writes.
+            val steamPath = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
 
             // Create necessary directories
             val userDataPath = File(steamPath, "userdata/$steamUserId64")
