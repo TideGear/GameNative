@@ -4420,12 +4420,12 @@ private fun setupWineSystemFiles(
         // on launch, so invalidate the extraction when Wine version or variant changes.
         val steamExtractedKey = "${container.wineVersion}|${container.containerVariant}"
         val steamExtractedPrev = container.getExtra("steamExtractedForWine")
-        val steamExeFile = File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam/steam.exe")
+        val steamExeFile = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam/steam.exe")
         if (steamExtractedPrev != steamExtractedKey && steamExeFile.exists()) {
             // Symlink-safe delete: steamapps/common/<installdir> symlinks point at
             // GameNative's own Steam dir, and a following recursive delete would wipe
             // every installed game's files.
-            val steamDir = File(ImageFs.find(context).rootDir.absolutePath, ImageFs.WINEPREFIX + "/drive_c/Program Files (x86)/Steam")
+            val steamDir = File(container.rootDir, ".wine/drive_c/Program Files (x86)/Steam")
             SteamUtils.deleteTreeNoFollowSymlinks(steamDir)
         }
         extractSteamFiles(context, container, onExtractFileListener)
