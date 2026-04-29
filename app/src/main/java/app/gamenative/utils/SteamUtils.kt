@@ -367,7 +367,6 @@ object SteamUtils {
         createAppManifest(context, steamAppId)
 
         // Game-specific Handling
-        val container = ContainerUtils.getOrCreateContainer(context, appId)
         ensureSaveLocationsForGames(context, steamAppId, container)
 
         // Generate achievements.json
@@ -2455,7 +2454,10 @@ object SteamUtils {
 
     private fun sdkCloudRemoteDir(context: Context, appId: Int): File? {
         val accountId = SteamService.userSteamId?.accountID?.toLong() ?: return null
-        return File(PathType.SteamUserData.toAbsPath(context, appId, accountId))
+        val container = runCatching {
+            ContainerUtils.getContainer(context, "STEAM_$appId")
+        }.getOrNull() ?: return null
+        return File(PathType.SteamUserData.toAbsPath(container, appId, accountId))
     }
 
     private fun sdkCloudGameSaveDir(context: Context, appId: Int): File? {
