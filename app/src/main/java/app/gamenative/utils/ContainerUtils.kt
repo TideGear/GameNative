@@ -321,8 +321,11 @@ object ContainerUtils {
             sharpnessEffect = container.getExtra("sharpnessEffect", "None"),
             sharpnessLevel = container.getExtra("sharpnessLevel", "100").toIntOrNull() ?: 100,
             sharpnessDenoise = container.getExtra("sharpnessDenoise", "100").toIntOrNull() ?: 100,
-            vibrationMode = container.getExtra("vibrationMode", "controller"),
-            vibrationIntensity = container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100,
+            vibrationMode = PrefManager.normalizeVibrationModeInput(
+                container.getExtra("vibrationMode", "controller"),
+            ),
+            vibrationIntensity = (container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100)
+                .coerceIn(0, 100),
         )
     }
 
@@ -489,8 +492,14 @@ object ContainerUtils {
         container.putExtra("sharpnessEffect", containerData.sharpnessEffect)
         container.putExtra("sharpnessLevel", containerData.sharpnessLevel.toString())
         container.putExtra("sharpnessDenoise", containerData.sharpnessDenoise.toString())
-        container.putExtra("vibrationMode", containerData.vibrationMode)
-        container.putExtra("vibrationIntensity", containerData.vibrationIntensity.toString())
+        container.putExtra(
+            "vibrationMode",
+            PrefManager.normalizeVibrationModeInput(containerData.vibrationMode),
+        )
+        container.putExtra(
+            "vibrationIntensity",
+            containerData.vibrationIntensity.coerceIn(0, 100).toString(),
+        )
         try {
             container.language = containerData.language
         } catch (e: Exception) {

@@ -100,6 +100,8 @@ data class ContainerData(
     val sharpnessDenoise: Int = 100,
 ) {
     companion object {
+        private val VALID_RESTORED_VIBRATION_MODES = setOf("off", "controller", "device")
+
         val Saver = mapSaver(
             save = { state ->
                 mapOf(
@@ -182,8 +184,11 @@ data class ContainerData(
                     executablePath = savedMap["executablePath"] as String,
                     installPath = savedMap["installPath"] as String,
                     showFPS = savedMap["showFPS"] as Boolean,
-                    vibrationMode = (savedMap["vibrationMode"] as? String) ?: "controller",
-                    vibrationIntensity = (savedMap["vibrationIntensity"] as? Int) ?: 100,
+                    vibrationMode = (savedMap["vibrationMode"] as? String)
+                        ?.trim()?.lowercase()
+                        ?.takeIf { it in VALID_RESTORED_VIBRATION_MODES }
+                        ?: "controller",
+                    vibrationIntensity = ((savedMap["vibrationIntensity"] as? Int) ?: 100).coerceIn(0, 100),
                     launchRealSteam = savedMap["launchRealSteam"] as Boolean,
                     allowSteamUpdates = savedMap["allowSteamUpdates"] as Boolean,
                     steamType = (savedMap["steamType"] as? String) ?: "normal",

@@ -505,7 +505,14 @@ public class WinHandler {
                 final boolean useVirtualGamepad = inputControlsView != null && profile != null && profile.isVirtualGamepad();
                 int processId = this.receiveData.getInt();
                 if (!useVirtualGamepad && ((externalController = this.currentController) == null || !externalController.isConnected())) {
-                    this.currentController = ExternalController.getController(0);
+                    // Use ControllerManager as the single source of truth for slot 0
+                    // rather than ExternalController.getController(0) which queries
+                    // InputDevice ID 0 — that ID is arbitrary and rarely matches the
+                    // user's slot-0 assignment.
+                    InputDevice p1Device = controllerManager.getAssignedDeviceForSlot(0);
+                    if (p1Device != null) {
+                        this.currentController = ExternalController.getController(p1Device.getId());
+                    }
                 }
                 boolean enabled2 = this.currentController != null || useVirtualGamepad;
                 if (enabled2) {
@@ -666,6 +673,11 @@ public class WinHandler {
         }
         this.running = true;
         startSendThread();
+
+        // Pre-register controllers from saved slot assignments so games that probe
+        // for controllers at startup see them before the first input arrives.
+        initializeAssignedControllers();
+
         Executors.newSingleThreadExecutor().execute(() -> {
             try {
                 DatagramSocket datagramSocket = new DatagramSocket((SocketAddress) null);
@@ -780,6 +792,11 @@ public class WinHandler {
                 if (waitMs <= 0) waitMs = 1; // never spin; ensure we yield to other threads
                 try {
                     synchronized (rumbleNotifyLock) {
+                        // Re-check running under the lock so a stop() that runs between the
+                        // outer while(running) check and this synchronized block is observed.
+                        // Without this, the poller would call wait(0) and miss the only
+                        // notify() the stop() path emits.
+                        if (!running) break;
                         // wait(0) means indefinite; cap at keepalive interval when rumbling.
                         rumbleNotifyLock.wait(waitMs == Long.MAX_VALUE ? 0 : waitMs);
                     }
@@ -841,13 +858,14 @@ public class WinHandler {
         int lowAmp  = scaleAmplitude(lowFreq,  vibrationIntensity);
         if (lowAmp == 0 && highAmp == 0) { vm.cancel(); return true; }
 
-        // Determine which ID drives the low-freq (heavy/left) motor and which drives
-        // the high-freq (light/right) motor by sorting IDs ascending.
+        // Sort IDs ascending so the low-freq (heavy/left) and high-freq (light/right)
+        // selection is well-defined regardless of the order getVibratorIds() returned.
+        // Manual two-element swap was correct for 2 IDs; sort generalises to 3+.
+        Arrays.sort(ids);
         int lowMotorId  = ids[0];
         int highMotorId = ids.length >= 2 ? ids[1] : ids[0];
 
         if (ids.length >= 2) {
-            if (ids[0] > ids[1]) { lowMotorId = ids[1]; highMotorId = ids[0]; }
             String motorKey = lowMotorId + "_" + highMotorId;
             if (loggedRumbleMotorIds.add(motorKey)) {
                 Log.d(TAG, "Rumble motors: lowMotor=" + lowMotorId + " highMotor=" + highMotorId);
