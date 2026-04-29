@@ -3247,14 +3247,38 @@ private fun setupXEnvironment(
         envVars.putAll(container.envVars)
         if (!envVars.has("WINEESYNC")) envVars.put("WINEESYNC", "1")
 
-        // Disable the Steam Vulkan overlay layer via its own disable_environment
-        // hook when the user has opted out. This is the Khronos-canonical way to
-        // skip an implicit layer — the loader sees the env var and never
-        // initializes the layer, which avoids the race where Steam re-extracts
-        // the stashed layer files during client startup.
+        // Disable the Steam overlay end-to-end when the user opts out:
+        //
+        //   1. DISABLE_VK_LAYER_VALVE_steam_overlay_1 — Khronos-canonical
+        //      disable hook for the Steam Vulkan implicit layer. The Vulkan
+        //      loader sees the env var and never initializes the layer.
+        //      (No Wine WINEDLLOVERRIDES needed for the Vulkan layer — it's
+        //      consumed by the Vulkan loader, not Wine's PE loader.)
+        //   2. SteamNoOverlayUIDrawing — read by gameoverlayrenderer*.dll
+        //      itself; tells the in-process DLL to skip drawing once it's
+        //      already been loaded.
+        //   3. WINEDLLOVERRIDES with empty load order on the two
+        //      gameoverlayrenderer PE DLLs — makes Wine's loader refuse
+        //      to map the DLLs into the game process at all. Real-Steam
+        //      only: in emu mode Goldberg replaces SteamAPI and the overlay
+        //      DLL is never loaded, so the override is dead code there;
+        //      gating it on isLaunchRealSteam also avoids any chance of
+        //      regressing emu-mode boots.
+        //
+        //   Each entry is its own `;`-separated key — comma-grouping the
+        //   names with a single trailing `=` (the prior shape) was the form
+        //   that hung Steam launches; individual entries parse unambiguously.
         if (container.isDisableSteamOverlay) {
             envVars.put("DISABLE_VK_LAYER_VALVE_steam_overlay_1", "1")
             envVars.put("SteamNoOverlayUIDrawing", "1")
+            if (container.isLaunchRealSteam) {
+                val overlayOverride = "gameoverlayrenderer=;gameoverlayrenderer64="
+                val existing = envVars.get("WINEDLLOVERRIDES")
+                envVars.put(
+                    "WINEDLLOVERRIDES",
+                    if (existing.isEmpty()) overlayOverride else "$existing;$overlayOverride",
+                )
+            }
         }
 
         val graphicsDriverConfig = KeyValueSet(container.getGraphicsDriverConfig())

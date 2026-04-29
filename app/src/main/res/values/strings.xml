@@ -680,7 +680,7 @@
     <string name="launch_steam_client_beta">Launch Steam Client (Beta)</string>
     <string name="launch_steam_client_description">Reduces performance and slows down launch\nAllows online play and fixes DRM and controller issues\nNot all games work</string>
     <string name="disable_steam_overlay">Disable Steam Overlay</string>
-    <string name="disable_steam_overlay_description">Skip injecting gameoverlayrenderer64.dll\nAchievements still unlock but popups won\'t appear\nMay fix crashes on Unity/Vulkan games</string>
+    <string name="disable_steam_overlay_description">Blocks the GameOverlayRenderer DLLs at Wine\'s loader and skips the Steam Vulkan overlay layer\nAchievements still unlock but popups won\'t appear\nMay fix crashes on Unity/Vulkan games</string>
     <string name="sdk_cloud_save_subdir_section">Cloud Save Bridge</string>
     <string name="sdk_cloud_save_subdir_section_description">For games that store cloud saves inside their install directory (e.g. Dead Cells). Leave blank unless saves aren\'t syncing. \"Use Recommended\" pulls from the Ludusavi manifest.</string>
     <string name="sdk_cloud_save_subdir_label">Local save subdirectory</string>
