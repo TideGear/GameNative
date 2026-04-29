@@ -24,6 +24,10 @@ data class ContainerData(
     val executablePath: String = "",
     val installPath: String = "",
     val showFPS: Boolean = false,
+    /** Vibration target: "off", "controller", "device" **/
+    val vibrationMode: String = "controller",
+    /** Vibration intensity percentage (0-100) **/
+    val vibrationIntensity: Int = 100,
     val launchRealSteam: Boolean = false,
     val allowSteamUpdates: Boolean = false,
     val steamType: String = "normal",
@@ -114,6 +118,8 @@ data class ContainerData(
                     "executablePath" to state.executablePath,
                     "installPath" to state.installPath,
                     "showFPS" to state.showFPS,
+                    "vibrationMode" to state.vibrationMode,
+                    "vibrationIntensity" to state.vibrationIntensity,
                     "launchRealSteam" to state.launchRealSteam,
                     "allowSteamUpdates" to state.allowSteamUpdates,
                     "steamType" to state.steamType,
@@ -176,6 +182,8 @@ data class ContainerData(
                     executablePath = savedMap["executablePath"] as String,
                     installPath = savedMap["installPath"] as String,
                     showFPS = savedMap["showFPS"] as Boolean,
+                    vibrationMode = (savedMap["vibrationMode"] as? String) ?: "controller",
+                    vibrationIntensity = (savedMap["vibrationIntensity"] as? Int) ?: 100,
                     launchRealSteam = savedMap["launchRealSteam"] as Boolean,
                     allowSteamUpdates = savedMap["allowSteamUpdates"] as Boolean,
                     steamType = (savedMap["steamType"] as? String) ?: "normal",

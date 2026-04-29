@@ -1,10 +1,18 @@
 package com.winlator.winhandler;
 
+import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioAttributes;
 import android.net.Uri;
+import android.os.Build;
+import android.os.CombinedVibration;
+import android.os.FileObserver;
+import android.os.SystemClock;
+import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -40,8 +48,12 @@ import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 
@@ -80,12 +92,63 @@ public class WinHandler {
     private final short[] lastLowFreqs = new short[MAX_PLAYERS];
     private final short[] lastHighFreqs = new short[MAX_PLAYERS];
     private final boolean[] isRumbling = new boolean[MAX_PLAYERS];
+    // Wall-clock timestamps (ms) used instead of tick counters so that the
+    // keepalive cadence is correct even when the poller wakes early (FileObserver)
+    // or late (GC pause).
+    private final long[] lastKeepaliveMs = new long[MAX_PLAYERS];
+    private final long[] lastDeviceRefreshMs = new long[MAX_PLAYERS];
+    // Notified by FileObserver.onEvent() and by stop() to wake the poller thread.
+    private final Object rumbleNotifyLock = new Object();
+    private final FileObserver[] gamepadFileObservers = new FileObserver[MAX_PLAYERS];
+    // Per-player phone-vibrator amplitude. Written by the rumble poller thread; read by
+    // vibrateDevice/stopVibrationForPlayer which also run on the same thread, so no lock needed.
+    private final int[] playerPhoneAmplitudes = new int[MAX_PLAYERS];
+    // How often (ms) to re-send rumble to the controller to reset its internal expiry timer.
+    private static final int RUMBLE_KEEPALIVE_MS = 240;   // was: 12 ticks × 20 ms
+    private static final int CONTROLLER_RUMBLE_MS = 500;
+    private static final int DEVICE_RUMBLE_MS = 60000;
+    // How long before the device one-shot expires to issue a refresh (DEVICE_RUMBLE_MS - 5 s).
+    private static final long DEVICE_RUMBLE_REFRESH_MS = DEVICE_RUMBLE_MS - 5_000L;
     private boolean isShowingAssignDialog = false;
     private Context activity;
     private final java.util.Set<Integer> ignoredDeviceIds = new java.util.HashSet<>();
+    // Motor ID pairs that have already been logged once; prevents flooding logcat every keepalive tick.
+    private final Set<String> loggedRumbleMotorIds = new HashSet<>();
+
+    private static final Set<String> VALID_VIBRATION_MODES = new HashSet<>(Arrays.asList(
+            "off", "controller", "device"));
+    private static final String DEFAULT_VIBRATION_MODE = "controller";
+
+    // Pre-built attribute objects — constructing these on every keepalive tick
+    // (every 240 ms × up to 4 players) causes unnecessary allocations.
+    // AudioAttributes is available on all supported API levels.
+    private static final AudioAttributes AUDIO_ATTRS_GAME = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_GAME)
+            .build();
+    // VibrationAttributes requires API 31; USAGE_MEDIA requires API 33.
+    // Computed once at construction time to avoid repeated API-version checks.
+    private final VibrationAttributes vibrationAttrs;
+
+    private volatile String vibrationMode = "controller";
+    private volatile int vibrationIntensity = 100;
 
     public void setInputControlsView(InputControlsView view) {
         this.inputControlsView = view;
+    }
+
+    /** Sets the vibration routing mode (off/controller/device), normalizing and validating input. */
+    public void setVibrationMode(String mode) {
+        if (mode == null) {
+            this.vibrationMode = DEFAULT_VIBRATION_MODE;
+        } else {
+            String normalized = mode.trim().toLowerCase(Locale.US);
+            this.vibrationMode = VALID_VIBRATION_MODES.contains(normalized) ? normalized : DEFAULT_VIBRATION_MODE;
+        }
+    }
+
+    /** Sets the vibration intensity percentage, clamped to 0–100. */
+    public void setVibrationIntensity(int intensity) {
+        this.vibrationIntensity = Math.max(0, Math.min(100, intensity));
     }
 
     public enum PreferredInputApi {
@@ -115,48 +178,77 @@ public class WinHandler {
         this.xServerView = xServerView;
         this.controllerManager = ControllerManager.getInstance();
         this.activity = xServerView.getContext();
+
+        // Build VibrationAttributes once — requires API 31, USAGE_MEDIA requires API 33.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            VibrationAttributes.Builder vab = new VibrationAttributes.Builder();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                vab.setUsage(VibrationAttributes.USAGE_MEDIA);
+            }
+            this.vibrationAttrs = vab.build();
+        } else {
+            this.vibrationAttrs = null;
+        }
     }
 
+    /** Re-scans connected devices and re-initializes per-slot ExternalController references. */
     public void refreshControllerMappings() {
         Log.d(TAG, "Refreshing controller assignments from settings...");
-        // Route through setControllerForSlot() so any in-progress rumble is cancelled and the
-        // per-slot rumble cache (lastLowFreqs/lastHighFreqs/isRumbling) is reset on swap.
-        // Direct writes would leave stale rumble state that can mask the first transition for
-        // the incoming controller.
-        for (int slot = 0; slot < MAX_PLAYERS; slot++) {
-            setControllerForSlot(slot, null);
+        currentController = null;
+        for (int i = 0; i < extraControllers.length; i++) {
+            extraControllers[i] = null;
         }
         controllerManager.scanForDevices();
-        for (int slot = 0; slot < MAX_PLAYERS; slot++) {
-            InputDevice device = controllerManager.getAssignedDeviceForSlot(slot);
-            if (device == null) continue;
-            ExternalController controller = ExternalController.getController(device.getId());
-            if (controller == null) continue;
-            if (slot == 0) controller.setContext(activity);
-            setControllerForSlot(slot, controller);
-            Log.i(TAG, "Initialized Player " + (slot + 1) + " with: " + device.getName());
+        InputDevice p1Device = controllerManager.getAssignedDeviceForSlot(0);
+        if (p1Device != null) {
+            currentController = ExternalController.getController(p1Device.getId());
+            if (currentController != null) {
+                currentController.setContext(activity);
+                Log.i(TAG, "Initialized Player 1 with: " + p1Device.getName());
+            }
+        }
+        // Initialize Extra Players (2, 3, 4)
+        for (int i = 0; i < extraControllers.length; i++) {
+            // Player 2 is slot 1, which corresponds to extraControllers[0]
+            InputDevice extraDevice = controllerManager.getAssignedDeviceForSlot(i + 1);
+            if (extraDevice != null) {
+                extraControllers[i] = ExternalController.getController(extraDevice.getId());
+                Log.i(TAG, "Initialized Player " + (i + 2) + " with: " + extraDevice.getName());
+            }
         }
     }
 
+    /** Returns the shared-memory buffer for the given player slot (0-based), or null if unavailable. */
     public MappedByteBuffer getBufferForSlot(int slot) {
         if (slot == 0) return gamepadBuffer;
         if (slot > 0 && slot <= extraGamepadBuffers.length) return extraGamepadBuffers[slot - 1];
         return null;
     }
 
+    /** Returns the ExternalController assigned to the given player slot, or null if none. */
     public ExternalController getControllerForSlot(int slot) {
         if (slot == 0) return currentController;
         if (slot > 0 && slot <= extraControllers.length) return extraControllers[slot - 1];
         return null;
     }
 
+    /** Assigns a controller to a player slot, stopping any active vibration on the previous occupant. */
     public void setControllerForSlot(int slot, ExternalController controller) {
         if (slot < 0 || slot >= MAX_PLAYERS) return;
         ExternalController old = getControllerForSlot(slot);
         if (old != null && old != controller) {
-            stopVibrationForSlot(slot, old);
+            stopVibrationForPlayer(slot);
             lastLowFreqs[slot] = 0;
             lastHighFreqs[slot] = 0;
+            lastDeviceRefreshMs[slot] = SystemClock.elapsedRealtime();
+            // Zero the shared-memory rumble bytes so the next poll doesn't see
+            // the old controller's stale rumble values and immediately vibrate
+            // the new controller.
+            MappedByteBuffer buf = getBufferForSlot(slot);
+            if (buf != null) {
+                buf.putShort(32, (short) 0);
+                buf.putShort(34, (short) 0);
+            }
         }
         if (slot == 0) { currentController = controller; return; }
         if (slot > 0 && slot <= extraControllers.length) extraControllers[slot - 1] = controller;
@@ -359,8 +451,16 @@ public class WinHandler {
         });
     }
 
+    /** Stops all WinHandler threads, cancels vibration for all players, and closes the UDP socket. */
     public void stop() {
         this.running = false;
+        // Wake the rumble poller so it can observe running==false and exit.
+        synchronized (rumbleNotifyLock) {
+            rumbleNotifyLock.notifyAll();
+        }
+        for (int p = 0; p < MAX_PLAYERS; p++) {
+            stopVibrationForPlayer(p);
+        }
         DatagramSocket datagramSocket = this.socket;
         if (datagramSocket != null) {
             datagramSocket.close();
@@ -404,21 +504,10 @@ public class WinHandler {
                 final ControlsProfile profile = inputControlsView.getProfile();
                 final boolean useVirtualGamepad = inputControlsView != null && profile != null && profile.isVirtualGamepad();
                 int processId = this.receiveData.getInt();
-
-                Log.d(TAG, "GET_GAMEPAD: isXInput=" + isXInput + " notify=" + notify + " processId=" + processId
-                    + " preferredApi=" + preferredInputApi + " currentController=" + (currentController != null ? currentController.getName() + "(#" + currentController.getDeviceId() + ")" : "null")
-                    + " useVirtualGamepad=" + useVirtualGamepad);
-
                 if (!useVirtualGamepad && ((externalController = this.currentController) == null || !externalController.isConnected())) {
-                    // Use ControllerManager as the single source of truth for slot 0
-                    InputDevice p1Device = controllerManager.getAssignedDeviceForSlot(0);
-                    Log.d(TAG, "GET_GAMEPAD: no current controller, ControllerManager slot0 device=" + (p1Device != null ? p1Device.getName() : "null"));
-                    if (p1Device != null) {
-                        this.currentController = ExternalController.getController(p1Device.getId());
-                    }
+                    this.currentController = ExternalController.getController(0);
                 }
                 boolean enabled2 = this.currentController != null || useVirtualGamepad;
-                Log.d(TAG, "GET_GAMEPAD: final enabled=" + enabled2 + " controller=" + (currentController != null ? currentController.getName() + "(#" + currentController.getDeviceId() + ")" : "null"));
                 if (enabled2) {
                     switch (this.preferredInputApi) {
                         case DINPUT:
@@ -510,6 +599,9 @@ public class WinHandler {
                 final boolean useVirtualGamepad2 = inputControlsView != null && profile2 != null && profile2.isVirtualGamepad();
                 ExternalController externalController2 = this.currentController;
                 final boolean enabled3 = externalController2 != null || useVirtualGamepad2;
+                if (externalController2 != null && externalController2.getDeviceId() != gamepadId) {
+                    this.currentController = null;
+                }
                 addAction(() -> {
                     sendData.rewind();
                     sendData.put(RequestCodes.GET_GAMEPAD_STATE);
@@ -572,10 +664,6 @@ public class WinHandler {
             } catch (UnknownHostException e2) {
             }
         }
-        // Pre-register controllers from saved assignments so games that check at
-        // startup sees a controller before any input arrives
-        initializeAssignedControllers();
-
         this.running = true;
         startSendThread();
         Executors.newSingleThreadExecutor().execute(() -> {
@@ -597,87 +685,381 @@ public class WinHandler {
         });
 
         startRumblePoller();
-        running = true;
-        startSendThread();
     }
 
+    /**
+     * Starts a background thread that reacts to rumble changes in shared-memory buffers.
+     *
+     * <p>Instead of sleeping a fixed interval, the thread waits on {@code rumbleNotifyLock}.
+     * A {@link FileObserver} per player slot watches the corresponding {@code gamepad.mem} file;
+     * when evshim's {@code pwrite()} at offset 32 triggers {@code IN_MODIFY}, the observer
+     * calls {@code notifyAll()} and the thread wakes within microseconds.
+     *
+     * <p>The keepalive path (periodic controller re-rumble to prevent motor auto-expiry) still
+     * fires on a wall-clock schedule via the {@code wait(timeoutMs)} overload.
+     */
+    @SuppressWarnings("deprecation")  // FileObserver(String, int) deprecated API 29; File ctor not available below Q
     private void startRumblePoller() {
-        // poller skips case where controller is null and we
-        // do NOT vibrate phone as of now to prevent issues with docked users.
-        // TODO: add phone vibration option in upcoming ux when no controller device connected
-        rumblePollerThread = new Thread(() -> {
-            while (running) {
-                try {
-                    for (int slot = 0; slot < MAX_PLAYERS; slot++) {
-                        MappedByteBuffer buffer = getBufferForSlot(slot);
-                        if (buffer == null) continue;
+        final String[] memPaths = {
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad.mem",
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad1.mem",
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad2.mem",
+            "/data/data/app.gamenative/files/imagefs/tmp/gamepad3.mem",
+        };
 
-                        short lowFreq = buffer.getShort(32);
-                        short highFreq = buffer.getShort(34);
-
-                        if (lowFreq != lastLowFreqs[slot] || highFreq != lastHighFreqs[slot]) {
-                            ExternalController controller = getControllerForSlot(slot);
-
-                            // case: disable vibration, attempt to disable safely
-                            if (lowFreq == 0 && highFreq == 0) {
-                                lastLowFreqs[slot] = lowFreq;
-                                lastHighFreqs[slot] = highFreq;
-                                stopVibrationForSlot(slot, controller);
-
-                            // case: controller exists and vibration exists
-                            } else if (controller != null) {
-                                // Only mark as delivered when we can actually vibrate
-                                lastLowFreqs[slot] = lowFreq;
-                                lastHighFreqs[slot] = highFreq;
-                                startVibrationForSlot(slot, controller, lowFreq, highFreq);
-                            }
-                            // else: controller not yet adopted for this slot — don't update
-                            // lastFreqs so the poller retries on the next tick
-                        }
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            final String path = memPaths[i];
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                gamepadFileObservers[i] = new FileObserver(new File(path), FileObserver.MODIFY) {
+                    @Override public void onEvent(int event, String filename) {
+                        synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
                     }
-                } catch (Exception e) {
-                    continue;
+                };
+            } else {
+                gamepadFileObservers[i] = new FileObserver(path, FileObserver.MODIFY) {
+                    @Override public void onEvent(int event, String filename) {
+                        synchronized (rumbleNotifyLock) { rumbleNotifyLock.notifyAll(); }
+                    }
+                };
+            }
+            gamepadFileObservers[i].startWatching();
+        }
+
+        rumblePollerThread = new Thread(() -> {
+            long now = SystemClock.elapsedRealtime();
+            for (int p = 0; p < MAX_PLAYERS; p++) {
+                lastKeepaliveMs[p] = now;
+                lastDeviceRefreshMs[p] = now;
+            }
+
+            while (running) {
+                now = SystemClock.elapsedRealtime();
+
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    try {
+                        MappedByteBuffer buf = getBufferForSlot(p);
+                        if (buf == null) continue;
+                        short lowFreq = buf.getShort(32);
+                        short highFreq = buf.getShort(34);
+                        boolean changed = lowFreq != lastLowFreqs[p] || highFreq != lastHighFreqs[p];
+                        if (changed) {
+                            lastLowFreqs[p] = lowFreq;
+                            lastHighFreqs[p] = highFreq;
+                            lastKeepaliveMs[p] = now;
+                            lastDeviceRefreshMs[p] = now;
+                            if (lowFreq == 0 && highFreq == 0) {
+                                stopVibrationForPlayer(p);
+                            } else {
+                                startVibrationForPlayer(p, lowFreq, highFreq, false);
+                            }
+                        } else if (isRumbling[p]) {
+                            long elapsedKeepalive = now - lastKeepaliveMs[p];
+                            if (elapsedKeepalive >= RUMBLE_KEEPALIVE_MS) {
+                                lastKeepaliveMs[p] = now;
+                                long elapsedDeviceRefresh = now - lastDeviceRefreshMs[p];
+                                boolean deviceRefresh = elapsedDeviceRefresh >= DEVICE_RUMBLE_REFRESH_MS;
+                                if (deviceRefresh) lastDeviceRefreshMs[p] = now;
+                                refreshVibrationForPlayer(p, lowFreq, highFreq, deviceRefresh);
+                            }
+                        }
+                    } catch (Exception e) {
+                        // Buffer may be unmapped; continue polling
+                    }
                 }
+
+                // Compute how long to wait: until the next keepalive deadline among
+                // all rumbling players.  If no player is rumbling, wait indefinitely
+                // (until a FileObserver notification or stop() wakes us).
+                long waitMs = Long.MAX_VALUE;
+                for (int p = 0; p < MAX_PLAYERS; p++) {
+                    if (isRumbling[p]) {
+                        long timeToNextKeepalive = RUMBLE_KEEPALIVE_MS - (now - lastKeepaliveMs[p]);
+                        if (timeToNextKeepalive < waitMs) waitMs = timeToNextKeepalive;
+                    }
+                }
+                if (waitMs <= 0) waitMs = 1; // never spin; ensure we yield to other threads
                 try {
-                    Thread.sleep(20); // Poll for new commands 50 times per second
+                    synchronized (rumbleNotifyLock) {
+                        // wait(0) means indefinite; cap at keepalive interval when rumbling.
+                        rumbleNotifyLock.wait(waitMs == Long.MAX_VALUE ? 0 : waitMs);
+                    }
                 } catch (InterruptedException e) {
                     break;
                 }
             }
+
+            // Clean up inotify watches when the poller exits.
+            for (FileObserver obs : gamepadFileObservers) {
+                if (obs != null) obs.stopWatching();
+            }
         });
+        rumblePollerThread.setName("rumble-poller");
         rumblePollerThread.start();
     }
 
-    private void startVibrationForSlot(int slot, ExternalController controller, short lowFreq, short highFreq) {
-        int unsignedLowFreq = lowFreq & 0xFFFF;
-        int unsignedHighFreq = highFreq & 0xFFFF;
-        int dominantRumble = Math.max(unsignedLowFreq, unsignedHighFreq);
-        int amplitude = Math.round((float) dominantRumble / 65535.0f * 254.0f) + 1;
-        if (amplitude > 255) amplitude = 255;
-        if (amplitude <= 1) {
-            stopVibrationForSlot(slot, controller);
+    /** Converts a raw 16-bit XInput rumble value (0–65535) to a 0–255 amplitude, scaled by intensity percent. */
+    private int scaleAmplitude(short rawFreq, int intensityPercent) {
+        int unsigned = rawFreq & 0xFFFF;
+        if (unsigned == 0 || intensityPercent == 0) return 0;
+        // Map full 16-bit range to 1–255 so that any non-zero game rumble produces
+        // a non-zero amplitude, then scale by the user's intensity preference.
+        int base = (int) Math.round(unsigned * 255.0 / 65535.0);
+        return Math.min(255, Math.max(1, (base * intensityPercent) / 100));
+    }
+
+    /** Issues a one-shot vibration on a single vibrator, respecting amplitude control availability. */
+    private void vibrateSingle(Vibrator vibrator, int amplitude, int durationMs) {
+        if (amplitude <= 0) { vibrator.cancel(); return; }
+        int amp = Math.min(255, amplitude);
+        int finalAmp = vibrator.hasAmplitudeControl() ? amp : VibrationEffect.DEFAULT_AMPLITUDE;
+        VibrationEffect effect = VibrationEffect.createOneShot(durationMs, finalAmp);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && vibrationAttrs != null) {
+            vibrator.vibrate(effect, vibrationAttrs);
+        } else {
+            vibrator.vibrate(effect, AUDIO_ATTRS_GAME);
+        }
+    }
+
+    /**
+     * Drives per-motor rumble through VibratorManager (API 31+).
+     *
+     * <p>Motor identification strategy:
+     * <p>Motor identification: Sort vibrator IDs ascending. The kernel evdev layer enumerates
+     * vibrators in HID descriptor order, which for XInput-compatible controllers is
+     * heavy-then-light (low-freq first), matching ascending ID order for most drivers.
+     * The IDs are logged on first use so swapped-motor behaviour on untested hardware can be
+     * diagnosed and reported.
+     *
+     * <p>Falls back to a blended single-motor vibration when only one vibrator is available.
+     */
+    @TargetApi(31)
+    private boolean rumbleViaVibratorManager(VibratorManager vm, short lowFreq, short highFreq) {
+        int[] ids = vm.getVibratorIds();
+        if (ids.length == 0) return false;
+
+        int highAmp = scaleAmplitude(highFreq, vibrationIntensity);
+        int lowAmp  = scaleAmplitude(lowFreq,  vibrationIntensity);
+        if (lowAmp == 0 && highAmp == 0) { vm.cancel(); return true; }
+
+        // Determine which ID drives the low-freq (heavy/left) motor and which drives
+        // the high-freq (light/right) motor by sorting IDs ascending.
+        int lowMotorId  = ids[0];
+        int highMotorId = ids.length >= 2 ? ids[1] : ids[0];
+
+        if (ids.length >= 2) {
+            if (ids[0] > ids[1]) { lowMotorId = ids[1]; highMotorId = ids[0]; }
+            String motorKey = lowMotorId + "_" + highMotorId;
+            if (loggedRumbleMotorIds.add(motorKey)) {
+                Log.d(TAG, "Rumble motors: lowMotor=" + lowMotorId + " highMotor=" + highMotorId);
+            }
+        }
+
+        CombinedVibration.ParallelCombination combo = CombinedVibration.startParallel();
+        boolean anyAdded = false;
+
+        if (ids.length >= 2) {
+            if (lowAmp > 0) {
+                int a = vm.getVibrator(lowMotorId).hasAmplitudeControl() ? lowAmp : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(lowMotorId, VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                anyAdded = true;
+            }
+            if (highAmp > 0) {
+                int a = vm.getVibrator(highMotorId).hasAmplitudeControl() ? highAmp : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(highMotorId, VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                anyAdded = true;
+            }
+        } else {
+            int blended = Math.min(255, (int)(lowAmp * 0.80 + highAmp * 0.33));
+            if (blended > 0) {
+                int a = vm.getVibrator(ids[0]).hasAmplitudeControl() ? blended : VibrationEffect.DEFAULT_AMPLITUDE;
+                combo.addVibrator(ids[0], VibrationEffect.createOneShot(CONTROLLER_RUMBLE_MS, a));
+                anyAdded = true;
+            }
+        }
+
+        if (!anyAdded) { vm.cancel(); return true; }
+        vm.vibrate(combo.combine(), vibrationAttrs);
+        return true;
+    }
+
+    /**
+     * Resolves the physical InputDevice for a player slot.
+     * Checks ControllerManager slot assignment first, then falls back to
+     * the slot's ExternalController. For P0 only, if there is exactly one
+     * detected gamepad and no mapping above, that device is used — with multiple
+     * pads connected, returning null avoids rumbling the wrong controller.
+     */
+    private InputDevice resolveInputDeviceForPlayer(int player) {
+        InputDevice device = controllerManager.getAssignedDeviceForSlot(player);
+        if (device != null) return device;
+
+        ExternalController ctrl = getControllerForSlot(player);
+        if (ctrl != null) {
+            device = InputDevice.getDevice(ctrl.getDeviceId());
+            if (device != null) return device;
+        }
+
+        if (player == 0) {
+            List<InputDevice> detected = controllerManager.getDetectedDevices();
+            if (detected.size() == 1) {
+                return detected.get(0);
+            }
+        }
+        return null;
+    }
+
+    /** Vibrates the physical controller assigned to [player], trying VibratorManager first, then legacy Vibrator. */
+    private boolean vibrateController(int player, short lowFreq, short highFreq) {
+        InputDevice device = resolveInputDeviceForPlayer(player);
+        if (device == null) {
+            Log.w(TAG, "Rumble P" + player + ": no physical controller found");
+            return false;
+        }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                VibratorManager vm = device.getVibratorManager();
+                if (rumbleViaVibratorManager(vm, lowFreq, highFreq)) {
+                    return true;
+                }
+            }
+
+            Vibrator v = device.getVibrator();
+            if (v != null && v.hasVibrator()) {
+                int lowMSB = scaleAmplitude(lowFreq, vibrationIntensity);
+                int highMSB = scaleAmplitude(highFreq, vibrationIntensity);
+                int blended = Math.min(255, (int)(lowMSB * 0.80 + highMSB * 0.33));
+                vibrateSingle(v, blended, CONTROLLER_RUMBLE_MS);
+                return true;
+            }
+            Log.w(TAG, "Rumble P" + player + ": no vibrators available on '" + device.getName() + "'");
+        } catch (Exception e) {
+            Log.e(TAG, "Rumble P" + player + ": exception vibrating controller", e);
+        }
+        return false;
+    }
+
+    /**
+     * Vibrates the Android device's built-in vibrator.
+     *
+     * <p>Stores this player's computed amplitude in {@code playerPhoneAmplitudes[player]}, then
+     * applies the maximum across all players so that a single phone-vibrator command always
+     * reflects the loudest active player rather than whichever player happened to write last.
+     */
+    private void vibrateDevice(int player, short lowFreq, short highFreq) {
+        try {
+            int lowMSB = scaleAmplitude(lowFreq, vibrationIntensity);
+            int highMSB = scaleAmplitude(highFreq, vibrationIntensity);
+            int rawAmplitude = Math.min(255, (int)(lowMSB * 0.80 + highMSB * 0.33));
+
+            if (rawAmplitude > 0) {
+                float curved = (float) Math.pow((float) rawAmplitude / 255f, 0.6f);
+                playerPhoneAmplitudes[player] = Math.max(1, Math.round(curved * 255));
+            } else {
+                playerPhoneAmplitudes[player] = 0;
+            }
+
+            int combinedAmp = 0;
+            for (int amp : playerPhoneAmplitudes) {
+                if (amp > combinedAmp) combinedAmp = amp;
+            }
+
+            Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+            if (phoneVibrator == null || !phoneVibrator.hasVibrator()) return;
+
+            if (combinedAmp <= 0) {
+                phoneVibrator.cancel();
+            } else {
+                vibrateSingle(phoneVibrator, combinedAmp, DEVICE_RUMBLE_MS);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Rumble: exception vibrating device", e);
+        }
+    }
+
+    /** Routes vibration to either the controller or the device based on the current vibration mode. */
+    private void startVibrationForPlayer(int player, short lowFreq, short highFreq, boolean skipDevice) {
+        if ("off".equals(vibrationMode)) return;
+
+        isRumbling[player] = true;
+
+        if ("controller".equals(vibrationMode)) {
+            vibrateController(player, lowFreq, highFreq);
+        } else if ("device".equals(vibrationMode)) {
+            if (!skipDevice) vibrateDevice(player, lowFreq, highFreq);
+        }
+    }
+
+    /**
+     * Periodic refresh for ongoing vibration. Controller rumble uses short pulses
+     * and must be refreshed frequently. Device vibration uses a long one-shot and
+     * only needs refresh when {@code deviceRefresh} signals the one-shot is about
+     * to expire.
+     */
+    private void refreshVibrationForPlayer(int player, short lowFreq, short highFreq, boolean deviceRefresh) {
+        if ("off".equals(vibrationMode)) return;
+        if ("device".equals(vibrationMode)) {
+            if (deviceRefresh) vibrateDevice(player, lowFreq, highFreq);
             return;
         }
-        if (controller == null) return;
-        InputDevice device = InputDevice.getDevice(controller.getDeviceId());
-        if (device == null) return;
-        Vibrator controllerVibrator = device.getVibrator();
-        if (controllerVibrator == null || !controllerVibrator.hasVibrator()) return;
-        isRumbling[slot] = true;
-        controllerVibrator.vibrate(VibrationEffect.createOneShot(50, amplitude));
+        vibrateController(player, lowFreq, highFreq);
     }
 
-    private void stopVibrationForSlot(int slot, ExternalController controller) {
-        if (!isRumbling[slot]) return;
-        isRumbling[slot] = false;  // handle before early returns - disconnected or null controller leaves slot, assures to disable
-        if (controller == null) return;
-        InputDevice device = InputDevice.getDevice(controller.getDeviceId());
-        if (device == null) return;
-        Vibrator controllerVibrator = device.getVibrator();
-        if (controllerVibrator == null || !controllerVibrator.hasVibrator()) return;
-        controllerVibrator.cancel();
+    /** Cancels all vibration for a player, only stopping the device vibrator if no other player is rumbling. */
+    private void stopVibrationForPlayer(int player) {
+        if (!isRumbling[player]) return;
+        isRumbling[player] = false;
+
+        try {
+            InputDevice device = resolveInputDeviceForPlayer(player);
+            if (device != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    VibratorManager vm = device.getVibratorManager();
+                    if (vm.getVibratorIds().length > 0) {
+                        // Cancel via VibratorManager when motors are available.
+                        vm.cancel();
+                    } else {
+                        // VibratorManager reported no motors — vibrateController fell back
+                        // to device.getVibrator(), so cancel that same vibrator.
+                        Vibrator fallback = device.getVibrator();
+                        if (fallback != null && fallback.hasVibrator()) {
+                            fallback.cancel();
+                        }
+                    }
+                } else {
+                    Vibrator vibrator = device.getVibrator();
+                    if (vibrator != null && vibrator.hasVibrator()) {
+                        vibrator.cancel();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error cancelling controller vibration", e);
+        }
+
+        if ("device".equals(vibrationMode)) {
+            playerPhoneAmplitudes[player] = 0;
+            int combinedAmp = 0;
+            for (int amp : playerPhoneAmplitudes) {
+                if (amp > combinedAmp) combinedAmp = amp;
+            }
+            try {
+                Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+                if (phoneVibrator != null) {
+                    if (combinedAmp <= 0) {
+                        phoneVibrator.cancel();
+                    } else {
+                        // Other players are still rumbling — keep the phone vibrating at their level.
+                        vibrateSingle(phoneVibrator, combinedAmp, DEVICE_RUMBLE_MS);
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Error cancelling device vibration", e);
+            }
+        }
     }
 
+    /** Broadcasts the current Player 1 gamepad state to all connected gamepad clients. */
     public void sendGamepadState() {
         if (!this.initReceived || this.gamepadClients.isEmpty()) {
             return;
@@ -715,15 +1097,12 @@ public class WinHandler {
 
         ExternalController controller = getControllerForSlot(slot);
         if (controller == null || controller.getDeviceId() != deviceId) {
-            ExternalController adopted = null;
-            if (inputControlsView != null) {
+            ExternalController adopted = ExternalController.getController(deviceId);
+            if (adopted == null && inputControlsView != null) {
                 ControlsProfile profile = inputControlsView.getProfile();
                 if (profile != null) {
                     adopted = profile.getController(deviceId);
                 }
-            }
-            if (adopted == null) {
-                adopted = ExternalController.getController(deviceId);
             }
             if (adopted != null) {
                 setControllerForSlot(slot, adopted);
@@ -733,6 +1112,7 @@ public class WinHandler {
         return slot;
     }
 
+    /** Handles joystick/gamepad motion events, routing them to the correct player slot. */
     public boolean onGenericMotionEvent(MotionEvent event) {
         if (!ExternalController.isJoystickDevice(event)) return false;
 
@@ -749,6 +1129,7 @@ public class WinHandler {
         return false;
     }
 
+    /** Handles controller button press/release events, routing them to the correct player slot. */
     public boolean onKeyEvent(KeyEvent event) {
         InputDevice device = event.getDevice();
         if (device == null || !ExternalController.isGameController(device) || event.getRepeatCount() != 0) {
@@ -780,11 +1161,13 @@ public class WinHandler {
         this.preferredInputApi = preferredInputApi;
     }
 
+    /** Returns the ExternalController assigned to Player 1. */
     public ExternalController getCurrentController() {
         return this.currentController;
     }
 
 
+    /** Writes a controller's current gamepad state into the shared-memory buffer for evshim consumption. */
     public void sendMemoryFileState(ExternalController controller, MappedByteBuffer buffer) {
         if (buffer == null || controller == null) {
             return;
@@ -826,6 +1209,7 @@ public class WinHandler {
         buffer.put((byte)0); // Ignored HAT value
     }
 
+    /** Writes a virtual on-screen gamepad's state into the Player 1 shared-memory buffer. */
     public void sendVirtualGamepadState(GamepadState state) {
         if (gamepadBuffer == null || state == null) {
             return;
@@ -866,6 +1250,7 @@ public class WinHandler {
         gamepadBuffer.put((byte)0); // Ignored HAT value
     }
 
+    /** Populates per-slot ExternalController references from the saved ControllerManager assignments. */
     private void initializeAssignedControllers() {
         Log.d(TAG, "Initializing controller assignments from saved settings...");
         for (int i = 0; i < MAX_PLAYERS; i++) {
@@ -886,6 +1271,7 @@ public class WinHandler {
         // This ensures P1-specific settings (like trigger type) are applied from preferences.
         refreshControllerMappings();
     }
+    /** Clears the set of device IDs that were rejected from slot assignment. */
     public void clearIgnoredDevices() {
         ignoredDeviceIds.clear();
     }
