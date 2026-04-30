@@ -181,8 +181,7 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
         // Always pre-create all 4 mem files so controllers can be hot-plugged during gameplay.
         // Unused gamepads just read zeroes (no-op in evshim).
-        final int enabledPlayerCount = WinHandler.MAX_PLAYERS;
-        for (int i = 0; i < enabledPlayerCount; i++) {
+        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
             String memPath;
             if (i == 0) {
                 // Player 1 uses the original, non-numbered path that is known to work.
@@ -223,7 +222,16 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
 
         EnvVars envVars = new EnvVars();
 
-        // Use the ControllerManager's dynamic count for the environment variable
+        // Tell evshim how many SDL virtual joysticks to register, capped at the count of
+        // currently-detected physical controllers. Without the cap we'd always spawn
+        // MAX_PLAYERS vjoys regardless of how many were connected, and games (e.g. ToS
+        // controller tester) would see phantom unbound gamepads — they don't respond to
+        // input and rumble routed at them goes nowhere. Floor at 1 so the virtual
+        // on-screen gamepad still has a vjoy when no physical controller is present.
+        final int connectedControllerCount =
+            com.winlator.inputcontrols.ControllerManager.getInstance().getDetectedDevices().size();
+        final int enabledPlayerCount =
+            Math.max(1, Math.min(connectedControllerCount, WinHandler.MAX_PLAYERS));
         envVars.put("EVSHIM_MAX_PLAYERS", String.valueOf(enabledPlayerCount));
         if (true) {
             envVars.put("EVSHIM_SHM_ID", 1);
