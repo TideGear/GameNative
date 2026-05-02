@@ -463,20 +463,14 @@ private fun SdkCloudSaveSubdirField(
     NoExtractOutlinedTextField(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
         value = current,
+        // Manual typing is an intentional edit — commit each keystroke directly. The first-activation
+        // confirmation flow (pendingValue/showConfirmDialog) is reserved for auto-filled values from
+        // the Recommend / Detect buttons below, which the user didn't type and may want to reject.
+        // Earlier shapes of this handler tried to gate typing through the confirmation too, but any
+        // such gate either broke after the first keystroke (state was no longer "blank") or
+        // interrupted normal multi-character typing.
         onValueChange = { raw ->
-            val trimmed = raw.trim()
-            val wasBlank = current.isBlank()
-            // Don't trigger the confirm dialog on the first character — that disrupts normal
-            // typing of a multi-character subdir name. Wait until the user has typed something
-            // meaningful before asking them to confirm activation.
-            val meaningful = trimmed.length > 1
-            if (wasBlank && meaningful) {
-                // First activation for this container — confirm before committing.
-                pendingValue = trimmed
-                showConfirmDialog = true
-            } else {
-                state.config.value = config.copy(sdkCloudSaveSubdir = trimmed)
-            }
+            state.config.value = config.copy(sdkCloudSaveSubdir = raw.trim())
         },
         label = { Text(text = stringResource(R.string.sdk_cloud_save_subdir_label)) },
         placeholder = { Text(text = stringResource(R.string.sdk_cloud_save_subdir_placeholder)) },

@@ -229,7 +229,13 @@ object SteamUtils {
                 val n = file.name.lowercase()
                 if (n == "steam_api.dll" || n == "steam_api64.dll") {
                     found = true
-                    val expected = assetHashes[n] ?: return@forEach
+                    val expected = assetHashes[n]
+                    if (expected == null) {
+                        // Missing pipe-asset hash means we can't verify — fail closed and force
+                        // a re-replace rather than silently trust the marker.
+                        Timber.w("DLL marker desync: pipe asset hash missing for %s, can't verify replaced state", n)
+                        return false
+                    }
                     if (sha256OfFile(file) != expected) {
                         Timber.w("DLL marker desync: %s hash mismatch (marker says REPLACED)", file.absolutePath)
                         return false
@@ -254,7 +260,13 @@ object SteamUtils {
                 if (!file.isFile) return@forEach
                 val n = file.name.lowercase()
                 if (n == "steam_api.dll" || n == "steam_api64.dll") {
-                    val pipeHash = assetHashes[n] ?: return@forEach
+                    val pipeHash = assetHashes[n]
+                    if (pipeHash == null) {
+                        // Missing pipe-asset hash means we can't tell whether this is the pipe
+                        // DLL or the original Valve DLL — fail closed so the caller re-restores.
+                        Timber.w("DLL marker desync: pipe asset hash missing for %s, can't verify restored state", n)
+                        return false
+                    }
                     if (sha256OfFile(file) == pipeHash) {
                         Timber.w("DLL marker desync: %s is still the pipe DLL (marker says RESTORED)", file.absolutePath)
                         return false

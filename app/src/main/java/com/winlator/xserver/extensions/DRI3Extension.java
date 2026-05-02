@@ -184,13 +184,18 @@ public class DRI3Extension implements Extension {
             if (drawable == null) throw new BadIdChoice(pixmapId);
             drawable.setData(buffer);
             drawable.setTexture(null);
-            drawable.setOnDestroyListener(onDestroyDrawableListener);
+            // NB: don't register onDestroyDrawableListener until after pixmap creation succeeds.
+            // If we register early and createPixmap returns null, removeDrawable() would invoke
+            // the listener → unmapSHMSegment, and the finally block below would unmap again.
             if (client.xServer.pixmapManager.createPixmap(drawable) == null) {
-                // Drawable is already registered; unregister it before throwing or it leaks.
+                // Drawable is registered without a destroy listener; unregister and bail. The
+                // finally block will unmap the buffer (handedOffToDrawable is still false).
                 client.xServer.drawableManager.removeDrawable(drawable.id);
                 throw new BadIdChoice(pixmapId);
             }
-            // Drawable now owns the buffer; onDestroyDrawableListener will unmap it.
+            // Drawable + Pixmap created. Hand the buffer over: register the listener and flag
+            // handedOff so the finally block doesn't unmap (the listener will, on destruction).
+            drawable.setOnDestroyListener(onDestroyDrawableListener);
             handedOffToDrawable = true;
         }
         finally {

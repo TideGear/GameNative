@@ -2,6 +2,8 @@ package app.gamenative.utils
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import org.json.JSONArray
@@ -36,6 +38,11 @@ object LudusaviRegistry {
 
     @Volatile
     private var memoryCache: Map<Int, SteamUtils.SdkCloudSaveRecommendation>? = null
+    // Serializes the fetch + disk-write + memoryCache populate path. Without this, a
+    // concurrent primeCache() + lookup() could both pass the null check, both fetch the
+    // 5 MB manifest, and both write the disk cache (last writer wins; the wasted work and
+    // duplicate network traffic are the real cost).
+    private val loadMutex = Mutex()
 
     /**
      * Returns the recommended save subdir for [appId] from the Ludusavi manifest, or null
@@ -57,38 +64,45 @@ object LudusaviRegistry {
     }
 
     private suspend fun ensureLoaded(context: Context): Map<Int, SteamUtils.SdkCloudSaveRecommendation>? {
+        // Fast path: in-memory cache populated.
         memoryCache?.let { return it }
 
-        val cacheFile = File(context.filesDir, CACHE_FILE)
-        if (cacheFile.isFile && (System.currentTimeMillis() - cacheFile.lastModified()) < CACHE_TTL_MS) {
-            runCatching { parseCacheJson(cacheFile.readText()) }
-                .onSuccess { parsed ->
-                    memoryCache = parsed
-                    Timber.i("LudusaviRegistry: loaded ${parsed.size} Pattern B entries from disk cache")
-                    return parsed
-                }
-                .onFailure { Timber.w(it, "LudusaviRegistry: disk cache parse failed; will refetch") }
-        }
+        // Slow path: serialize so concurrent callers don't all fetch the 5 MB manifest.
+        return loadMutex.withLock {
+            // Re-check after acquiring the lock; another caller may have populated while we waited.
+            memoryCache?.let { return@withLock it }
 
-        val fetched = fetchAndFilter() ?: run {
-            // Fall back to a stale disk cache if fetch failed and one exists
-            if (cacheFile.isFile) {
+            val cacheFile = File(context.filesDir, CACHE_FILE)
+            if (cacheFile.isFile && (System.currentTimeMillis() - cacheFile.lastModified()) < CACHE_TTL_MS) {
                 runCatching { parseCacheJson(cacheFile.readText()) }
-                    .onSuccess {
-                        memoryCache = it
-                        Timber.w("LudusaviRegistry: using stale disk cache (${it.size} entries) after fetch failure")
-                        return it
+                    .onSuccess { parsed ->
+                        memoryCache = parsed
+                        Timber.i("LudusaviRegistry: loaded ${parsed.size} Pattern B entries from disk cache")
+                        return@withLock parsed
                     }
+                    .onFailure { Timber.w(it, "LudusaviRegistry: disk cache parse failed; will refetch") }
             }
-            return null
-        }
 
-        runCatching {
-            cacheFile.writeText(serializeCacheJson(fetched))
-        }.onFailure { Timber.w(it, "LudusaviRegistry: failed to write disk cache") }
-        memoryCache = fetched
-        Timber.i("LudusaviRegistry: fetched ${fetched.size} Pattern B entries from upstream manifest")
-        return fetched
+            val fetched = fetchAndFilter() ?: run {
+                // Fall back to a stale disk cache if fetch failed and one exists
+                if (cacheFile.isFile) {
+                    runCatching { parseCacheJson(cacheFile.readText()) }
+                        .onSuccess {
+                            memoryCache = it
+                            Timber.w("LudusaviRegistry: using stale disk cache (${it.size} entries) after fetch failure")
+                            return@withLock it
+                        }
+                }
+                return@withLock null
+            }
+
+            runCatching {
+                cacheFile.writeText(serializeCacheJson(fetched))
+            }.onFailure { Timber.w(it, "LudusaviRegistry: failed to write disk cache") }
+            memoryCache = fetched
+            Timber.i("LudusaviRegistry: fetched ${fetched.size} Pattern B entries from upstream manifest")
+            fetched
+        }
     }
 
     private fun fetchAndFilter(): Map<Int, SteamUtils.SdkCloudSaveRecommendation>? {

@@ -2266,9 +2266,9 @@ class SteamService : Service(), IChallengeUrlChanged {
             isLaunchRealSteam: Boolean = false,
             onProgress: ((message: String, progress: Float) -> Unit)? = null,
         ): Deferred<PostSyncInfo> = parentScope.async {
-            if (isOffline || !isConnected) {
-                return@async PostSyncInfo(SyncResult.UpToDate)
-            }
+            // NB: don't early-return on isOffline/!isConnected here — local prep below
+            // (GSE→userdata migrate, future SDK-cloud mirror) is independent of cloud
+            // connectivity and needs to run before the game launches even when offline.
             if (!tryAcquireSync(appId)) {
                 Timber.w("Cannot launch app when sync already in progress for appId=$appId")
                 return@async PostSyncInfo(SyncResult.InProgress)
@@ -2319,24 +2319,43 @@ class SteamService : Service(), IChallengeUrlChanged {
                         ).await()
 
                         if (probed.isNotEmpty()) {
+                            // Only auto-dismiss our OWN phantom entries. A pending op from a
+                            // different machineName is a legitimate cross-device cloud conflict —
+                            // those need to surface to the SYNC_CONFLICT dialog so the user can
+                            // resolve, not get silently wiped by ignorePendingOperations=true.
+                            val selfPhantoms = probed.filter {
+                                it.machineName.equals(ourMachineName, ignoreCase = true) ||
+                                    it.machineName.equals("localhost", ignoreCase = true)
+                            }
+                            val crossDevice = probed - selfPhantoms.toSet()
                             Timber.i(
-                                "Proactive real-Steam probe found %d pending op(s) (%s); dismissing phantom",
+                                "Proactive real-Steam probe found %d pending op(s) (%s); selfPhantoms=%d crossDevice=%d",
                                 probed.size,
                                 probed.joinToString { "${it.machineName}:${it.operation.name}" },
+                                selfPhantoms.size,
+                                crossDevice.size,
                             )
-                            steamCloud.signalAppLaunchIntent(
-                                appId = appId,
-                                clientId = proactiveClientId,
-                                machineName = ourMachineName,
-                                ignorePendingOperations = true,
-                                osType = EOSType.AndroidUnknown,
-                            ).await()
-                            steamCloud.signalAppExitSyncDone(
-                                appId = appId,
-                                clientId = proactiveClientId,
-                                uploadsCompleted = false,
-                                uploadsRequired = false,
-                            )
+                            if (crossDevice.isNotEmpty()) {
+                                Timber.w(
+                                    "Skipping phantom auto-dismiss: %d cross-device pending op(s) present (%s) — leaving for the conflict dialog.",
+                                    crossDevice.size,
+                                    crossDevice.joinToString { "${it.machineName}:${it.operation.name}" },
+                                )
+                            } else if (selfPhantoms.isNotEmpty()) {
+                                steamCloud.signalAppLaunchIntent(
+                                    appId = appId,
+                                    clientId = proactiveClientId,
+                                    machineName = ourMachineName,
+                                    ignorePendingOperations = true,
+                                    osType = EOSType.AndroidUnknown,
+                                ).await()
+                                steamCloud.signalAppExitSyncDone(
+                                    appId = appId,
+                                    clientId = proactiveClientId,
+                                    uploadsCompleted = false,
+                                    uploadsRequired = false,
+                                )
+                            }
                         }
                     }.onFailure {
                         Timber.w(it, "Proactive phantom-clearing probe before real-Steam launch failed")
@@ -2354,6 +2373,13 @@ class SteamService : Service(), IChallengeUrlChanged {
                 // Migrate GSE saves -> Steam userdata layout. Inside the try so any
                 // exception still flows through finally { releaseSync(appId) }.
                 SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
+
+                // Local prep done. If we're offline or disconnected, skip the cloud RPCs
+                // below but still report UpToDate — the migrate above ran and the game
+                // can launch from whatever's in userdata/<appid>/remote/ already.
+                if (isOffline || !isConnected) {
+                    return@async PostSyncInfo(SyncResult.UpToDate)
+                }
 
                 // GameNative is the sole cloud client in both modes: Wine-Steam has
                 // cloudenabled=0 written to localconfig.vdf AND sharedconfig.vdf and

@@ -1637,7 +1637,14 @@ fun preLaunchApp(
         // Fires only when real-Steam is on, the subdir is blank, the user hasn't dismissed,
         // Ludusavi knows this game, AND it has no Auto-Cloud saveFilePatterns in PICS UFS.
         // That intersection is a reliable Pattern B signal and keeps false positives low.
+        //
+        // Skip the prompt for non-game launches (Open Container / temporary override / explicit
+        // skipCloudSync). The post-prompt `relaunch` lambda doesn't carry those flags forward,
+        // so firing the prompt for them would silently turn an Open-Container into a game launch.
         if (!skipBridgePrompt &&
+            !bootToContainer &&
+            !useTemporaryOverride &&
+            !skipCloudSync &&
             gameSource == GameSource.STEAM &&
             container.isLaunchRealSteam &&
             container.sdkCloudSaveSubdir.isBlank() &&
