@@ -25,6 +25,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
@@ -1328,8 +1329,21 @@ object SteamUtils {
     }
 
     private fun createSteamCommonLink(link: File, target: File) {
-        if (link.exists()) return
+        // File.exists() follows symlinks, so it returns false for broken symlinks (target gone)
+        // and would let createSymbolicLink below blow up with FileAlreadyExistsException on
+        // the dangling link entry. Use NOFOLLOW_LINKS to detect the link itself, and replace
+        // it if it points somewhere other than the intended target.
         link.parentFile?.mkdirs()
+        if (Files.exists(link.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+            val existingTarget = runCatching { Files.readSymbolicLink(link.toPath()) }.getOrNull()
+            if (existingTarget == target.toPath()) return
+            try {
+                deleteTreeNoFollowSymlinks(link)
+            } catch (e: Exception) {
+                Timber.w(e, "createSteamCommonLink: failed to remove existing entry at ${link.absolutePath}")
+                return
+            }
+        }
         Files.createSymbolicLink(link.toPath(), target.toPath())
     }
 

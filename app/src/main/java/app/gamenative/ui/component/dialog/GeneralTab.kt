@@ -510,7 +510,9 @@ private fun SdkCloudSaveSubdirField(
                                 rec.name.ifEmpty { appId.toString() },
                                 rec.subdir,
                             )
-                            if (current.isBlank()) {
+                            // Re-read after suspend: user may have typed in the field while
+                            // we were off-thread asking Ludusavi for a recommendation.
+                            if (state.config.value.sdkCloudSaveSubdir.isBlank()) {
                                 pendingValue = rec.subdir
                                 showConfirmDialog = true
                             }
@@ -543,7 +545,8 @@ private fun SdkCloudSaveSubdirField(
                     } else {
                         context.getString(R.string.sdk_cloud_save_subdir_detect_none)
                     }
-                    if (detected != null && current.isBlank()) {
+                    // Re-read after the IO suspend; the user may have typed in the field meanwhile.
+                    if (detected != null && state.config.value.sdkCloudSaveSubdir.isBlank()) {
                         pendingValue = detected
                         showConfirmDialog = true
                     }

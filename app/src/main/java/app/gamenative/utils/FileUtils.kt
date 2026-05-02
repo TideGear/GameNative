@@ -135,12 +135,29 @@ object FileUtils {
 
     fun matchesGlob(fileName: String, pattern: String): Boolean {
         if (pattern.isEmpty() || pattern == "*") return true
+        // Pattern with no '*' is an exact (case-insensitive) match, not a substring search.
+        if (!pattern.contains('*')) return fileName.equals(pattern, ignoreCase = true)
+        val hasLeadingStar = pattern.startsWith('*')
+        val hasTrailingStar = pattern.endsWith('*')
         val patternParts = pattern.split("*").filter { it.isNotEmpty() }
-        var startIndex = 0
-        for (part in patternParts) {
+        if (patternParts.isEmpty()) return true
+        // Anchor the first token at fileName start when the pattern has no leading '*'.
+        if (!hasLeadingStar && !fileName.startsWith(patternParts.first(), ignoreCase = true)) return false
+        // Anchor the last token at fileName end when the pattern has no trailing '*'.
+        if (!hasTrailingStar && !fileName.endsWith(patternParts.last(), ignoreCase = true)) return false
+        // Walk middle tokens in order, starting after any anchored prefix.
+        var startIndex = if (!hasLeadingStar) patternParts.first().length else 0
+        val afterFirst = if (!hasLeadingStar) patternParts.drop(1) else patternParts
+        val middle = if (!hasTrailingStar && afterFirst.isNotEmpty()) afterFirst.dropLast(1) else afterFirst
+        for (part in middle) {
             val index = fileName.indexOf(part, startIndex, ignoreCase = true)
             if (index < 0) return false
             startIndex = index + part.length
+        }
+        // If the trailing anchor consumed a token that overlaps startIndex, ensure no overlap.
+        if (!hasTrailingStar && afterFirst.isNotEmpty()) {
+            val lastTokenStart = fileName.length - afterFirst.last().length
+            if (lastTokenStart < startIndex) return false
         }
         return true
     }

@@ -2275,7 +2275,14 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             // Only migrate GSE -> userdata when booting real Steam; reverse direction lives in ensureSteamSettings.
-            SteamUtils.migrateGSESavesToSteamUserdata(instance?.applicationContext!!, appId, isLaunchRealSteam)
+            // Null-guard before the migrate: a NPE here would skip the try/finally below and leak the sync flag.
+            val migrateCtx = instance?.applicationContext
+            if (migrateCtx == null) {
+                Timber.e("migrateGSESavesToSteamUserdata: applicationContext is null, releasing sync and bailing")
+                releaseSync(appId)
+                return@async PostSyncInfo(SyncResult.UnknownFail)
+            }
+            SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
 
             var syncResult = PostSyncInfo(SyncResult.UnknownFail)
             var launchIntentRegistered = false
@@ -2417,11 +2424,13 @@ class SteamService : Service(), IChallengeUrlChanged {
                                                 // mode, a stale localhost entry from a prior real-Steam session
                                                 // could still surface here. Strip those so we never surface
                                                 // spurious dialogs or kick our own launch — genuine entries
-                                                // from other devices still flow through.
+                                                // from other devices still flow through. (In real-Steam mode the
+                                                // RPC was skipped, so rawPending is empty and the filter is a no-op
+                                                // — the work that matters happens in the emulation branch.)
                                                 var pendingRemoteOperations = if (isLaunchRealSteam) {
-                                                    rawPending.filterNot { it.machineName.equals("localhost", ignoreCase = true) }
-                                                } else {
                                                     rawPending
+                                                } else {
+                                                    rawPending.filterNot { it.machineName.equals("localhost", ignoreCase = true) }
                                                 }
 
                                                 // Self-phantom auto-clear: when every pending op is from our own
@@ -2523,7 +2532,14 @@ class SteamService : Service(), IChallengeUrlChanged {
                 return@async PostSyncInfo(SyncResult.InProgress)
             }
 
-            SteamUtils.migrateGSESavesToSteamUserdata(instance?.applicationContext!!, appId, isLaunchRealSteam)
+            // Null-guard: a NPE here would skip the try/finally below and leak the sync flag.
+            val migrateCtx = instance?.applicationContext
+            if (migrateCtx == null) {
+                Timber.e("forceSyncUserFiles: applicationContext is null, releasing sync and bailing")
+                releaseSync(appId)
+                return@async PostSyncInfo(SyncResult.UnknownFail)
+            }
+            SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
 
             try {
                 val context = instance?.applicationContext ?: return@async PostSyncInfo(SyncResult.UnknownFail)

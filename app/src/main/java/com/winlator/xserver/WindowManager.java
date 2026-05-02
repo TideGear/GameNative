@@ -206,6 +206,10 @@ public class WindowManager extends XResourceManager {
             if (!cand.isInputOutput()) continue;
             if (!cand.getClassName().isEmpty()) continue;
             if (cand.getWidth() != w || cand.getHeight() != h) continue;
+            // Don't reap currently-mapped windows; the leak chain we're cleaning up is
+            // composed of unmapped phantoms. A real surface that happens to share the
+            // other attributes (very rare) would still be safe.
+            if (cand.attributes.isMapped()) continue;
             matches.add(cand);
         }
         if (matches.size() < LEAK_CLIENT_CAP) return;

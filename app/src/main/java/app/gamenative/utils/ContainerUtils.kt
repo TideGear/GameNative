@@ -827,6 +827,7 @@ object ContainerUtils {
                 execArgs = PrefManager.execArgs,
                 showFPS = false,
                 launchRealSteam = PrefManager.launchRealSteam,
+                disableSteamOverlay = PrefManager.disableSteamOverlay,
                 wow64Mode = PrefManager.wow64Mode,
                 startupSelection = PrefManager.startupSelection.toByte(),
                 box86Version = PrefManager.box86Version,

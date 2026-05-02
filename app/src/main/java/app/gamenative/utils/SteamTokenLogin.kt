@@ -64,8 +64,11 @@ class SteamTokenLogin(
                 future.get(WINE_EXEC_TIMEOUT_SECONDS, TimeUnit.SECONDS)
             } catch (e: TimeoutException) {
                 future.cancel(true)
-                Timber.tag("SteamTokenLogin").e("wine exec timed out after %ds: %s", WINE_EXEC_TIMEOUT_SECONDS, command)
-                throw IllegalStateException("wine exec timed out: $command", e)
+                // Don't log/throw the full command — `command` may contain a refresh JWT
+                // (steam-token.exe encrypt <user> <token>). Log just the executable name.
+                val redacted = command.substringBefore(' ').substringAfterLast('/').ifEmpty { "<command>" }
+                Timber.tag("SteamTokenLogin").e("wine exec timed out after %ds: %s [args redacted]", WINE_EXEC_TIMEOUT_SECONDS, redacted)
+                throw IllegalStateException("wine exec timed out: $redacted [args redacted]", e)
             }
         } finally {
             executor.shutdownNow()

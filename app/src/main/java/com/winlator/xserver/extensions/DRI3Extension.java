@@ -161,7 +161,11 @@ public class DRI3Extension implements Extension {
             Drawable drawable = client.xServer.drawableManager.createDrawable(pixmapId, gpuImage.getStride(), height, depth);
             if (drawable == null) throw new BadIdChoice(pixmapId);
             drawable.setTexture(gpuImage);
-            if (client.xServer.pixmapManager.createPixmap(drawable) == null) throw new BadIdChoice(pixmapId);
+            if (client.xServer.pixmapManager.createPixmap(drawable) == null) {
+                // Drawable is already registered; unregister it before throwing or it leaks.
+                client.xServer.drawableManager.removeDrawable(drawable.id);
+                throw new BadIdChoice(pixmapId);
+            }
         }
         finally {
             XConnectorEpoll.closeFd(fd);
@@ -179,7 +183,11 @@ public class DRI3Extension implements Extension {
             drawable.setData(buffer);
             drawable.setTexture(null);
             drawable.setOnDestroyListener(onDestroyDrawableListener);
-            if (client.xServer.pixmapManager.createPixmap(drawable) == null) throw new BadIdChoice(pixmapId);
+            if (client.xServer.pixmapManager.createPixmap(drawable) == null) {
+                // Drawable is already registered; unregister it before throwing or it leaks.
+                client.xServer.drawableManager.removeDrawable(drawable.id);
+                throw new BadIdChoice(pixmapId);
+            }
         }
         finally {
             XConnectorEpoll.closeFd(fd);
