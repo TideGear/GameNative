@@ -2275,14 +2275,14 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             // Only migrate GSE -> userdata when booting real Steam; reverse direction lives in ensureSteamSettings.
-            // Null-guard before the migrate: a NPE here would skip the try/finally below and leak the sync flag.
+            // Null-guard for context; the migrate itself is invoked inside the main try below so any
+            // exception goes through finally { releaseSync(appId) } and never leaks the sync flag.
             val migrateCtx = instance?.applicationContext
             if (migrateCtx == null) {
                 Timber.e("migrateGSESavesToSteamUserdata: applicationContext is null, releasing sync and bailing")
                 releaseSync(appId)
                 return@async PostSyncInfo(SyncResult.UnknownFail)
             }
-            SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
 
             var syncResult = PostSyncInfo(SyncResult.UnknownFail)
             var launchIntentRegistered = false
@@ -2351,6 +2351,10 @@ class SteamService : Service(), IChallengeUrlChanged {
             }
 
             try {
+                // Migrate GSE saves -> Steam userdata layout. Inside the try so any
+                // exception still flows through finally { releaseSync(appId) }.
+                SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
+
                 // GameNative is the sole cloud client in both modes: Wine-Steam has
                 // cloudenabled=0 written to localconfig.vdf AND sharedconfig.vdf and
                 // is launched with -no-browser so it performs no cloud I/O. Running
@@ -2532,19 +2536,19 @@ class SteamService : Service(), IChallengeUrlChanged {
                 return@async PostSyncInfo(SyncResult.InProgress)
             }
 
-            // Null-guard: a NPE here would skip the try/finally below and leak the sync flag.
+            // Null-guard for context; the migrate itself runs inside the try below so any
+            // exception flows through finally { releaseSync(appId) } and never leaks the lock.
             val migrateCtx = instance?.applicationContext
             if (migrateCtx == null) {
                 Timber.e("forceSyncUserFiles: applicationContext is null, releasing sync and bailing")
                 releaseSync(appId)
                 return@async PostSyncInfo(SyncResult.UnknownFail)
             }
-            SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
 
             try {
-                val context = instance?.applicationContext ?: return@async PostSyncInfo(SyncResult.UnknownFail)
-                // Migrate GSE Saves to Steam userdata
-                SteamUtils.migrateGSESavesToSteamUserdata(context, appId)
+                // Single mode-aware migrate: drop the duplicate two-arg call that ignored
+                // the isLaunchRealSteam flag and ran every time regardless of mode.
+                SteamUtils.migrateGSESavesToSteamUserdata(migrateCtx, appId, isLaunchRealSteam)
 
                 var syncResult = PostSyncInfo(SyncResult.UnknownFail)
 

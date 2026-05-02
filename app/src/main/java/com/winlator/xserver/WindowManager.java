@@ -198,6 +198,15 @@ public class WindowManager extends XResourceManager {
         int w = created.getWidth();
         int h = created.getHeight();
 
+        // Build the ancestor chain of `created` so we never reap one of its parents.
+        // destroyWindow recursively destroys descendants, so destroying any ancestor of
+        // the just-created window would destroy `created` itself, and createWindow()
+        // would return a stale handle that is no longer in the window tree.
+        java.util.HashSet<Integer> ancestors = new java.util.HashSet<>();
+        for (Window p = created.getParent(); p != null && p != rootWindow; p = p.getParent()) {
+            ancestors.add(p.id);
+        }
+
         ArrayList<Window> matches = new ArrayList<>();
         for (int i = 0; i < windows.size(); i++) {
             Window cand = windows.valueAt(i);
@@ -210,6 +219,9 @@ public class WindowManager extends XResourceManager {
             // composed of unmapped phantoms. A real surface that happens to share the
             // other attributes (very rare) would still be safe.
             if (cand.attributes.isMapped()) continue;
+            // Don't reap an ancestor of `created`; destroyWindow recurses into descendants
+            // so this would destroy `created` too.
+            if (ancestors.contains(cand.id)) continue;
             matches.add(cand);
         }
         if (matches.size() < LEAK_CLIENT_CAP) return;

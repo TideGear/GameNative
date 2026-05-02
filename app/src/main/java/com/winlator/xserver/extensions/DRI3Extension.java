@@ -173,8 +173,10 @@ public class DRI3Extension implements Extension {
     }
 
     private void pixmapFromFd(XClient client, int pixmapId, short width, short height, int stride, int offset, byte depth, int fd, long size)  throws IOException, XRequestError {
+        ByteBuffer buffer = null;
+        boolean handedOffToDrawable = false;
         try {
-            ByteBuffer buffer = SysVSharedMemory.mapSHMSegment(fd, size, offset, true);
+            buffer = SysVSharedMemory.mapSHMSegment(fd, size, offset, true);
             if (buffer == null) throw new BadAlloc();
 
             short totalWidth = (short)(stride / 4);
@@ -188,8 +190,16 @@ public class DRI3Extension implements Extension {
                 client.xServer.drawableManager.removeDrawable(drawable.id);
                 throw new BadIdChoice(pixmapId);
             }
+            // Drawable now owns the buffer; onDestroyDrawableListener will unmap it.
+            handedOffToDrawable = true;
         }
         finally {
+            // If we mapped the buffer but never handed it to a Drawable (e.g. drawable creation
+            // failed, or createPixmap returned null and we removed the drawable above), the SHM
+            // segment is otherwise leaked.
+            if (buffer != null && !handedOffToDrawable) {
+                SysVSharedMemory.unmapSHMSegment(buffer, size);
+            }
             XConnectorEpoll.closeFd(fd);
         }
     }

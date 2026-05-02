@@ -466,8 +466,11 @@ private fun SdkCloudSaveSubdirField(
         onValueChange = { raw ->
             val trimmed = raw.trim()
             val wasBlank = current.isBlank()
-            val nowNonBlank = trimmed.isNotEmpty()
-            if (wasBlank && nowNonBlank) {
+            // Don't trigger the confirm dialog on the first character — that disrupts normal
+            // typing of a multi-character subdir name. Wait until the user has typed something
+            // meaningful before asking them to confirm activation.
+            val meaningful = trimmed.length > 1
+            if (wasBlank && meaningful) {
                 // First activation for this container — confirm before committing.
                 pendingValue = trimmed
                 showConfirmDialog = true
