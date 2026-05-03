@@ -596,6 +596,12 @@ object SteamUtils {
             ?: File(imageFs.wineprefix)
         val steamConfigDir = File(winePrefixBase, "drive_c/Program Files (x86)/Steam/config")
         try {
+            // Ensure the Steam config dir exists. On a fresh container the Wine prefix
+            // skeleton is in place but Steam's own subdir hasn't been laid down yet —
+            // writeText() would fail with FileNotFoundException without this.
+            if (!steamConfigDir.isDirectory && !steamConfigDir.mkdirs()) {
+                Timber.w("autoLoginUserChanges: failed to create $steamConfigDir; loginusers.vdf write may fail")
+            }
             File(steamConfigDir, "loginusers.vdf").writeText(vdfFileText)
             val userRegFile = File(winePrefixBase, "user.reg")
             val steamRoot = "C:\\Program Files (x86)\\Steam"
@@ -1108,10 +1114,15 @@ object SteamUtils {
             val existingBuildId = parseAcfBuildId(staleAcf)
             val existingDepots = parseAcfInstalledDepotIds(staleAcf)
             val existingScripts = parseAcfInstallScriptDepotIds(staleAcf)
+            val existingOwner = parseAcfLastOwner(staleAcf)
             val depotsMatch = existingDepots == presentDepotIds
             val buildIdMatch = existingBuildId == sharedBuildId
             val scriptsMatch = existingScripts == presentScriptDepotIds
-            if (depotsMatch && buildIdMatch && scriptsMatch) {
+            // LastOwner mismatch means the manifest was last written by a different
+            // signed-in account; reusing it would attribute the install to that account
+            // and break cloud/ownership checks for the current user. Force a rewrite.
+            val lastOwnerMatch = existingOwner == lastOwner
+            if (depotsMatch && buildIdMatch && scriptsMatch && lastOwnerMatch) {
                 val updateResult = parseAcfUpdateResult(staleAcf)
                 if (updateResult == 0L) return
                 staleAcf.delete()
@@ -1217,6 +1228,7 @@ object SteamUtils {
 
     private val acfBuildIdRegex = Regex("\"buildid\"\\s*\"(\\d+)\"")
     private val acfUpdateResultRegex = Regex("\"UpdateResult\"\\s*\"(\\d+)\"")
+    private val acfLastOwnerRegex = Regex("\"LastOwner\"\\s*\"(\\d+)\"")
 
     // Matches `"<depotId>" { "manifest" "<gid>" ... }` entries inside the
     // InstalledDepots block of our own acf output. Tolerant of whitespace /
@@ -1241,6 +1253,14 @@ object SteamUtils {
             match.groupValues[1].toLongOrNull() ?: 0L
         } catch (_: Exception) {
             0L
+        }
+    }
+
+    private fun parseAcfLastOwner(acf: File): String {
+        return try {
+            acfLastOwnerRegex.find(acf.readText())?.groupValues?.get(1).orEmpty()
+        } catch (_: Exception) {
+            ""
         }
     }
 

@@ -792,11 +792,15 @@ fun PluviaMain(
         }
 
         DialogType.SDK_CLOUD_BRIDGE_SUGGESTION -> {
-            val relaunch = {
+            val relaunch = { suppressPrompt: Boolean ->
                 preLaunchApp(
                     context = context,
                     appId = state.launchedAppId,
-                    skipBridgePrompt = true,
+                    // Only suppress the prompt next time when we actually persisted a subdir
+                    // (or the user picked "Don't ask again"). If persistence failed, leave
+                    // the prompt enabled so it fires again on the next attempt rather than
+                    // silently disabling itself in memory.
+                    skipBridgePrompt = suppressPrompt,
                     setLoadingDialogVisible = viewModel::setLoadingDialogVisible,
                     setLoadingProgress = viewModel::setLoadingDialogProgress,
                     setLoadingMessage = viewModel::setLoadingDialogMessage,
@@ -813,36 +817,37 @@ fun PluviaMain(
                     val rec = runCatching {
                         SteamUtils.getRecommendedSdkCloudSaveSubdirAsync(context, gameId)
                     }.getOrNull()
-                    if (rec != null) {
-                        runCatching {
-                            val container = ContainerUtils.getContainer(context, state.launchedAppId)
-                            container.sdkCloudSaveSubdir = rec.subdir
-                            container.saveData()
-                        }.onFailure { Timber.w(it, "Failed to persist sdkCloudSaveSubdir=${rec.subdir}") }
-                    }
-                    withContext(Dispatchers.Main) { relaunch() }
+                    val persisted = rec != null && runCatching {
+                        val container = ContainerUtils.getContainer(context, state.launchedAppId)
+                        container.sdkCloudSaveSubdir = rec.subdir
+                        container.saveData()
+                    }.onFailure { Timber.w(it, "Failed to persist sdkCloudSaveSubdir=${rec.subdir}") }
+                        .isSuccess
+                    withContext(Dispatchers.Main) { relaunch(persisted) }
                 }
             }
             onDismissClick = {
-                // Skip this time — continue launch without setting the field.
+                // Skip this time — continue launch without setting the field. Don't suppress
+                // the prompt on the next launch since we didn't persist anything.
                 msgDialogState = MessageDialogState(false)
-                relaunch()
+                relaunch(false)
             }
             onActionClick = {
                 // Don't ask again for this game.
                 msgDialogState = MessageDialogState(false)
                 CoroutineScope(Dispatchers.IO).launch {
-                    runCatching {
+                    val persisted = runCatching {
                         val container = ContainerUtils.getContainer(context, state.launchedAppId)
                         container.putExtra("sdkCloudBridgePromptDismissed", "1")
                         container.saveData()
                     }.onFailure { Timber.w(it, "Failed to persist sdkCloudBridgePromptDismissed") }
-                    withContext(Dispatchers.Main) { relaunch() }
+                        .isSuccess
+                    withContext(Dispatchers.Main) { relaunch(persisted) }
                 }
             }
             onDismissRequest = {
                 msgDialogState = MessageDialogState(false)
-                relaunch()
+                relaunch(false)
             }
         }
 
@@ -1639,12 +1644,16 @@ fun preLaunchApp(
         // That intersection is a reliable Pattern B signal and keeps false positives low.
         //
         // Skip the prompt for non-game launches (Open Container / temporary override / explicit
-        // skipCloudSync). The post-prompt `relaunch` lambda doesn't carry those flags forward,
-        // so firing the prompt for them would silently turn an Open-Container into a game launch.
+        // skipCloudSync) and for re-entries from conflict resolution (preferredSave set, or
+        // ignorePendingOperations true). The post-prompt `relaunch` lambda doesn't carry those
+        // flags forward, so firing the prompt for them would silently drop the user's
+        // conflict-resolution choice.
         if (!skipBridgePrompt &&
             !bootToContainer &&
             !useTemporaryOverride &&
             !skipCloudSync &&
+            !ignorePendingOperations &&
+            preferredSave == SaveLocation.None &&
             gameSource == GameSource.STEAM &&
             container.isLaunchRealSteam &&
             container.sdkCloudSaveSubdir.isBlank() &&

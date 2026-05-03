@@ -810,60 +810,15 @@ object ContainerUtils {
                 customConfig
             }
         } else {
-            // Use default config with drives
-            ContainerData(
-                screenSize = PrefManager.screenSize,
-                envVars = PrefManager.envVars,
-                cpuList = PrefManager.cpuList,
-                cpuListWoW64 = PrefManager.cpuListWoW64,
-                graphicsDriver = PrefManager.graphicsDriver,
-                graphicsDriverVersion = PrefManager.graphicsDriverVersion,
-                graphicsDriverConfig = PrefManager.graphicsDriverConfig,
-                dxwrapper = initialDxWrapper,
-                dxwrapperConfig = PrefManager.dxWrapperConfig,
-                audioDriver = PrefManager.audioDriver,
-                wincomponents = PrefManager.winComponents,
+            // Build the default config from PrefManager and override only what this
+            // create-site needs to vary (drives + the per-game initial dxwrapper). Inheriting
+            // from getDefaultContainerData() means new containers automatically pick up
+            // any new fields added there (localSavesOnly, useSteamInput, sharpnessEffect/Level/
+            // Denoise, vibrationMode/Intensity, lsfgEnabled, ...) without this branch needing
+            // to be edited every time.
+            getDefaultContainerData().copy(
                 drives = drives,
-                execArgs = PrefManager.execArgs,
-                showFPS = false,
-                launchRealSteam = PrefManager.launchRealSteam,
-                disableSteamOverlay = PrefManager.disableSteamOverlay,
-                wow64Mode = PrefManager.wow64Mode,
-                startupSelection = PrefManager.startupSelection.toByte(),
-                box86Version = PrefManager.box86Version,
-                box64Version = PrefManager.box64Version,
-                box86Preset = PrefManager.box86Preset,
-                box64Preset = PrefManager.box64Preset,
-                desktopTheme = WineThemeManager.DEFAULT_DESKTOP_THEME,
-                language = PrefManager.containerLanguage,
-                containerVariant = PrefManager.containerVariant,
-                wineVersion = PrefManager.wineVersion,
-                emulator = PrefManager.emulator,
-                fexcoreVersion = PrefManager.fexcoreVersion,
-                fexcoreTSOMode = PrefManager.fexcoreTSOMode,
-                fexcoreX87Mode = PrefManager.fexcoreX87Mode,
-                fexcoreMultiBlock = PrefManager.fexcoreMultiBlock,
-                fexcorePreset = PrefManager.fexcorePreset,
-                renderer = PrefManager.renderer,
-                csmt = PrefManager.csmt,
-                videoPciDeviceID = PrefManager.videoPciDeviceID,
-                offScreenRenderingMode = PrefManager.offScreenRenderingMode,
-                strictShaderMath = PrefManager.strictShaderMath,
-                useDRI3 = PrefManager.useDRI3,
-                videoMemorySize = PrefManager.videoMemorySize,
-                mouseWarpOverride = PrefManager.mouseWarpOverride,
-                enableXInput = PrefManager.xinputEnabled,
-                enableDInput = PrefManager.dinputEnabled,
-                dinputMapperType = PrefManager.dinputMapperType.toByte(),
-                disableMouseInput = PrefManager.disableMouseInput,
-                forceDlc = PrefManager.forceDlc,
-                steamOfflineMode = PrefManager.steamOfflineMode,
-                useLegacyDRM = PrefManager.useLegacyDRM,
-                unpackFiles = PrefManager.unpackFiles,
-                suspendPolicy = PrefManager.suspendPolicy,
-                portraitMode = PrefManager.portraitMode,
-                externalDisplayMode = PrefManager.externalDisplayInputMode,
-                externalDisplaySwap = PrefManager.externalDisplaySwap,
+                dxwrapper = initialDxWrapper,
             )
         }
 
