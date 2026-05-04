@@ -108,6 +108,7 @@ import app.gamenative.utils.ManifestComponentHelper
 import app.gamenative.utils.PreInstallSteps
 import app.gamenative.utils.SteamTokenLogin
 import app.gamenative.utils.SteamUtils
+import app.gamenative.utils.WineProcessSnapshotHelper
 import com.posthog.PostHog
 import com.winlator.alsaserver.ALSAClient
 import com.winlator.container.Container
@@ -379,6 +380,7 @@ private suspend fun awaitSteamShutdown(
         }
     }
 }
+
 
 // TODO logs in composables are 'unstable' which can cause recomposition (performance issues)
 
@@ -1031,24 +1033,10 @@ fun XServerScreen(
             return@LaunchedEffect
         }
 
-        val winHandler = xServerView?.getxServer()?.winHandler
-        if (winHandler == null) {
-            quickMenuWineProcesses = emptyList()
-            quickMenuWineProcessesLoading = false
-            return@LaunchedEffect
-        }
-
         quickMenuWineProcessesLoading = true
         while (showQuickMenu && quickMenuToolsVisible) {
-            val snapshot = withContext(Dispatchers.IO) {
-                requestWineProcessSnapshot(winHandler)
-                    ?.sortedWith(
-                        compareByDescending<ProcessInfo> { normalizeProcessName(it.name) !in buildEssentialProcessAllowlist() }
-                            .thenByDescending { it.memoryUsage },
-                    )
-            }
-            if (snapshot != null) {
-                quickMenuWineProcesses = snapshot
+            quickMenuWineProcesses = withContext(Dispatchers.IO) {
+                WineProcessSnapshotHelper.readFromProc()
             }
             quickMenuWineProcessesLoading = false
             delay(QUICK_MENU_PROCESS_POLL_INTERVAL_MS)
@@ -2518,10 +2506,20 @@ fun XServerScreen(
             onItemSelected = onQuickMenuItemSelected,
             renderer = xServerView?.renderer,
             container = container,
-            winHandler = xServerView?.getxServer()?.winHandler,
             wineProcesses = quickMenuWineProcesses,
             isWineProcessesLoading = quickMenuWineProcessesLoading,
             onToolsVisibilityChanged = { quickMenuToolsVisible = it },
+            onEndWineProcess = { process ->
+                val killed = runCatching {
+                    ProcessHelper.killProcess(process.pid)
+                }.onFailure { error ->
+                    Timber.w(error, "Failed to kill Wine process pid=%d", process.pid)
+                }.isSuccess
+
+                if (killed) {
+                    quickMenuWineProcesses = quickMenuWineProcesses.filterNot { it.pid == process.pid }
+                }
+            },
             isPerformanceHudEnabled = isPerformanceHudEnabled,
             performanceHudConfig = performanceHudConfig,
             fpsLimiterEnabled = fpsLimiterEnabled,
