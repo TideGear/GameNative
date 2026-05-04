@@ -201,9 +201,24 @@ public class WinHandler {
         if (command2.isEmpty()) {
             return;
         }
-        String[] cmdList = command2.split(" ", 2);
-        final String filename = cmdList[0];
-        final String parameters = cmdList.length > 1 ? cmdList[1] : "";
+        final String filename;
+        final String parameters;
+        // A naive split(" ", 2) would shred Windows paths like
+        // "C:\Program Files (x86)\Steam\steam.exe" -shutdown.
+        if (command2.charAt(0) == '"') {
+            int closing = command2.indexOf('"', 1);
+            if (closing > 0) {
+                filename = command2.substring(1, closing);
+                parameters = command2.substring(closing + 1).trim();
+            } else {
+                filename = command2.substring(1);
+                parameters = "";
+            }
+        } else {
+            String[] cmdList = command2.split(" ", 2);
+            filename = cmdList[0];
+            parameters = cmdList.length > 1 ? cmdList[1] : "";
+        }
         exec(filename, parameters);
     }
 
@@ -253,10 +268,18 @@ public class WinHandler {
             if (!sendPacket(CLIENT_PORT)) {
                 OnGetProcessInfoListener slotListener = this.onGetProcessInfoListener;
                 if (slotListener != null) {
-                    slotListener.onGetProcessInfo(0, 0, null);
+                    try {
+                        slotListener.onGetProcessInfo(0, 0, null);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "process info listener threw", t);
+                    }
                 }
                 for (OnGetProcessInfoListener l : extraProcessInfoListeners) {
-                    l.onGetProcessInfo(0, 0, null);
+                    try {
+                        l.onGetProcessInfo(0, 0, null);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "process info listener threw", t);
+                    }
                 }
             }
         });
@@ -378,6 +401,26 @@ public class WinHandler {
         extraProcessInfoListeners.remove(listener);
     }
 
+    /**
+     * Coordinates listProcesses-driven snapshot collection so events from one
+     * snapshot don't bleed into another concurrent snapshot's listener. The
+     * wire protocol has no request id to disambiguate broadcast responses, so
+     * a serializing primitive is the cheapest fix that preserves the existing
+     * GET_PROCESS packet format.
+     *
+     * <p>Callers that wrap an {@code addOnGetProcessInfoListener} /
+     * {@code listProcesses} / await / {@code removeOnGetProcessInfoListener}
+     * sequence should hold this lock for the duration of the sequence.
+     * Long-running listeners that don't drive listProcesses themselves don't
+     * need to acquire it.
+     *
+     * <p>Exposed as a {@link kotlinx.coroutines.sync.Mutex} so Kotlin callers
+     * can suspend on it without binding to a thread, which a JVM monitor would
+     * forbid across coroutine suspension points.
+     */
+    public final kotlinx.coroutines.sync.Mutex processSnapshotMutex =
+            kotlinx.coroutines.sync.MutexKt.Mutex(false);
+
     private void startSendThread() {
         Executors.newSingleThreadExecutor().execute(() -> {
             while (this.running) {
@@ -432,11 +475,21 @@ public class WinHandler {
                 this.receiveData.get(bytes);
                 String name = StringUtils.fromANSIString(bytes);
                 ProcessInfo info = new ProcessInfo(pid, name, memoryUsage, affinityMask, wow64Process);
+                // Isolate each listener so a misbehaving consumer can't kill the
+                // receive thread and break future polling for everyone else.
                 if (this.onGetProcessInfoListener != null) {
-                    this.onGetProcessInfoListener.onGetProcessInfo(index, numProcesses, info);
+                    try {
+                        this.onGetProcessInfoListener.onGetProcessInfo(index, numProcesses, info);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "process info listener threw", t);
+                    }
                 }
                 for (OnGetProcessInfoListener l : extraProcessInfoListeners) {
-                    l.onGetProcessInfo(index, numProcesses, info);
+                    try {
+                        l.onGetProcessInfo(index, numProcesses, info);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "process info listener threw", t);
+                    }
                 }
                 return;
             case RequestCodes.GET_GAMEPAD:

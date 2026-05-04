@@ -93,9 +93,19 @@ object LudusaviRegistry {
                 if (cacheFile.isFile) {
                     runCatching { parseCacheJson(cacheFile.readText()) }
                         .onSuccess {
-                            memoryCache = it
-                            Timber.w("LudusaviRegistry: using stale disk cache (${it.size} entries) after fetch failure")
-                            return@withLock it
+                            // Mirror the empty-fetch guard above: a 0-entry disk cache is a
+                            // poisoned/stale artifact (e.g. a `{}` file from before this guard
+                            // shipped). Promoting it to memoryCache would let the fast path
+                            // short-circuit forever. Delete the file so a future fetch can
+                            // replace it, and fall through to return null.
+                            if (it.isEmpty()) {
+                                Timber.w("LudusaviRegistry: disk cache parsed to 0 entries; deleting poisoned file")
+                                runCatching { cacheFile.delete() }
+                            } else {
+                                memoryCache = it
+                                Timber.w("LudusaviRegistry: using stale disk cache (${it.size} entries) after fetch failure")
+                                return@withLock it
+                            }
                         }
                 }
                 return@withLock null

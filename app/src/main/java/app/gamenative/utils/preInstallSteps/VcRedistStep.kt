@@ -69,26 +69,32 @@ object VcRedistStep : PreInstallStep {
         gameDirPath: String,
     ): Boolean {
         // vcredist installs system-wide into the Wine prefix, not per-game. We
-        // track installed years at the container root (one marker per year)
-        // so reinstalling the game (which wipes the game dir) doesn't force a
-        // redundant re-run, while still detecting when a *different* game
-        // bundles a year we have not yet installed.
+        // track installed years/arches at the container root (one marker per
+        // year+arch) so reinstalling the game (which wipes the game dir)
+        // doesn't force a redundant re-run, while still detecting when a
+        // *different* game bundles a year/arch we have not yet installed.
         val gameDir = File(gameDirPath)
         val required = requiredVersions(gameDir)
         if (required.isEmpty()) {
-            // Nothing to install: treat the step as satisfied.
             return false
         }
         val containerRoot = container.rootDir?.absolutePath
         migrateLegacyContainerMarker(containerRoot, required)
+        migrateLegacyArchlessMarkers(containerRoot)
         val installed = installedVersions(containerRoot)
+        if (containerRoot != null && installed.isNotEmpty()) {
+            // Per-year/arch markers are the source of truth here. The coarse
+            // game-dir marker is ignored — if anything required is missing we
+            // must run buildCommand for the missing set.
+            return required.any { it !in installed }
+        }
         val missing = required - installed
         if (missing.isEmpty()) {
-            // All required years already covered by container-level markers.
             return false
         }
-        // Fall back to the legacy game-dir marker so an in-flight install
-        // that already ran for this exact game directory still short-circuits.
+        // No per-year markers to consult: fall back to the legacy game-dir
+        // marker so an in-flight install that already ran for this exact game
+        // directory still short-circuits.
         return !MarkerUtils.hasMarker(gameDirPath, Marker.VCREDIST_INSTALLED)
     }
 
@@ -125,6 +131,7 @@ object VcRedistStep : PreInstallStep {
         gameDirPath: String,
     ): String? {
         val containerRoot = container.rootDir?.absolutePath
+        migrateLegacyArchlessMarkers(containerRoot)
         val installed = installedVersions(containerRoot)
         val parts = mutableListOf<String>()
         for ((winPath, args) in vcRedistMap) {
@@ -134,11 +141,11 @@ object VcRedistStep : PreInstallStep {
             if (lastSep < 0) continue
             val hostFile = File(gameDir, rest.replace('\\', '/'))
             if (!hostFile.isFile) continue
-            // Skip installer entries for years already installed system-wide
-            // so we don't pop a fresh installer window per launch (the
-            // 963d7999 fix). Years we haven't seen still run.
+            // Skip installer entries for year+arch combos already installed
+            // system-wide so we don't pop a fresh installer window per launch
+            // (the 963d7999 fix). Year+arch combos we haven't seen still run.
             val version = versionKey(winPath)
-            if (version != null && installed.contains(version)) continue
+            if (installed.contains(version)) continue
             parts.add(if (args.isEmpty()) winPath else "$winPath $args")
         }
         return if (parts.isEmpty()) null else parts.joinToString(" & ")
@@ -170,7 +177,7 @@ object VcRedistStep : PreInstallStep {
             if (rest.lastIndexOf('\\') < 0) continue
             val hostFile = File(gameDir, rest.replace('\\', '/'))
             if (!hostFile.isFile) continue
-            versionKey(winPath)?.let { out.add(it) }
+            out.add(versionKey(winPath))
         }
         return out
     }
@@ -192,23 +199,55 @@ object VcRedistStep : PreInstallStep {
     }
 
     /**
-     * Map an installer's Windows path to a stable version key. Recognises
-     * year-suffixed folders ("2005".."2022"). Paths with no clear year
-     * (legacy `A:\redist\…`, root-level `A:\_CommonRedist\VC_redist.*`) map
-     * to "legacy" so they are still tracked, just with a single shared key.
+     * Map an installer's Windows path to a stable "$year-$arch" key (or
+     * "legacy-$arch" when no year is present). x86 and x64 installers from
+     * the same year get distinct keys so installing one does not mask the
+     * other. When no architecture hint is detectable we default to x86,
+     * matching the most common older redistributable layout.
      */
-    private fun versionKey(winPath: String): String? {
+    private fun versionKey(winPath: String): String {
         val lower = winPath.lowercase()
+        val arch = archKey(lower)
         for (year in YEAR_KEYS) {
             if (lower.contains("\\$year\\") || lower.contains("\\msvc$year\\") ||
                 lower.contains("\\msvc${year}_x64\\")
             ) {
-                return year
+                return "$year-$arch"
             }
         }
-        // Generic / yearless installers — track under a shared key so they
-        // don't all collapse to "no key" and bypass the marker check.
-        return "legacy"
+        return "legacy-$arch"
+    }
+
+    private fun archKey(lowerWinPath: String): String {
+        val x64Hints = listOf("x64", "amd64", "wow64", "x86_64", "_x64\\", ".x64.")
+        if (x64Hints.any { lowerWinPath.contains(it) }) return "x64"
+        if (lowerWinPath.contains("x86") || lowerWinPath.contains(".x86.")) return "x86"
+        return "x86"
+    }
+
+    /**
+     * One-time upgrade for markers written by the prior round-5 fix that were
+     * keyed by year only (e.g. `.vcredist_installed_2005`, `.vcredist_installed_legacy`).
+     * We don't know which arch was actually installed back then, so we
+     * conservatively claim only x86 coverage; if x64 was also installed it
+     * will be re-run on the next launch (one redundant installer at most).
+     */
+    private fun migrateLegacyArchlessMarkers(containerRoot: String?) {
+        if (containerRoot == null) return
+        val dir = File(containerRoot)
+        val files = dir.listFiles() ?: return
+        for (f in files) {
+            if (!f.isFile) continue
+            val name = f.name
+            if (!name.startsWith(PER_VERSION_MARKER_PREFIX)) continue
+            val suffix = name.substring(PER_VERSION_MARKER_PREFIX.length)
+            if (suffix.contains('-')) continue
+            val migrated = File(containerRoot, "$PER_VERSION_MARKER_PREFIX$suffix-x86")
+            if (!migrated.exists()) {
+                runCatching { migrated.createNewFile() }
+            }
+            runCatching { f.delete() }
+        }
     }
 
     private val YEAR_KEYS = listOf(

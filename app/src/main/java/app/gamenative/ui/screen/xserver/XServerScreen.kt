@@ -177,6 +177,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONException
@@ -310,20 +311,27 @@ private fun buildEssentialProcessAllowlist(): Set<String> {
     return (essentialServices + CORE_WINE_PROCESSES).toSet()
 }
 
+private class ProcessSnapshotException(msg: String) : Exception(msg)
+
 private suspend fun requestWineProcessSnapshot(winHandler: WinHandler): List<ProcessInfo>? {
     val lock = Any()
     var currentList = mutableListOf<ProcessInfo>()
     var expectedCount = 0
     val deferred = CompletableDeferred<List<ProcessInfo>?>()
 
-    // Register via add/removeOnGetProcessInfoListener so we don't clobber
-    // other concurrent watchers (e.g. startExitWatchForUnmappedGameWindow,
-    // or another awaitSteamShutdown poll on the same WinHandler) that also
-    // need process-info events.
     val listener = OnGetProcessInfoListener { index, count, processInfo ->
         synchronized(lock) {
+            // (0, 0, null) is only emitted by WinHandler.listProcesses() when
+            // the underlying UDP send fails; wine itself never broadcasts an
+            // empty list. Treating it as a successful empty snapshot would let
+            // awaitSteamShutdown conclude Steam exited on a transient send
+            // failure, so surface it as an exception instead.
             if (count == 0 && processInfo == null) {
-                if (!deferred.isCompleted) deferred.complete(emptyList())
+                if (!deferred.isCompleted) {
+                    deferred.completeExceptionally(
+                        ProcessSnapshotException("request/send failure"),
+                    )
+                }
                 return@synchronized
             }
             if (index == 0) {
@@ -343,14 +351,23 @@ private suspend fun requestWineProcessSnapshot(winHandler: WinHandler): List<Pro
         }
     }
 
-    return try {
+    // Serialize the add/list/await/remove sequence against any other concurrent
+    // snapshot caller; the wire protocol broadcasts GET_PROCESS responses to
+    // every registered listener with no request id to disambiguate.
+    return winHandler.processSnapshotMutex.withLock {
         winHandler.addOnGetProcessInfoListener(listener)
-        winHandler.listProcesses()
-        withTimeoutOrNull(EXIT_PROCESS_RESPONSE_TIMEOUT_MS) {
-            deferred.await()
+        try {
+            winHandler.listProcesses()
+            withTimeoutOrNull(EXIT_PROCESS_RESPONSE_TIMEOUT_MS) {
+                try {
+                    deferred.await()
+                } catch (e: ProcessSnapshotException) {
+                    null
+                }
+            }
+        } finally {
+            winHandler.removeOnGetProcessInfoListener(listener)
         }
-    } finally {
-        winHandler.removeOnGetProcessInfoListener(listener)
     }
 }
 
@@ -860,12 +877,17 @@ fun XServerScreen(
                 val startTime = System.currentTimeMillis()
                 while (System.currentTimeMillis() - startTime < EXIT_PROCESS_TIMEOUT_MS) {
                     val deferred = CompletableDeferred<List<ProcessInfo>?>()
-                    synchronized(lock) {
-                        pendingSnapshot = deferred
-                    }
-                    winHandler.listProcesses()
-                    val snapshot = withTimeoutOrNull(EXIT_PROCESS_RESPONSE_TIMEOUT_MS) {
-                        deferred.await()
+                    // Serialize against any other listProcesses-driven caller so a
+                    // concurrent awaitSteamShutdown poll doesn't deliver its
+                    // GET_PROCESS responses into this watcher's pending snapshot.
+                    val snapshot = winHandler.processSnapshotMutex.withLock {
+                        synchronized(lock) {
+                            pendingSnapshot = deferred
+                        }
+                        winHandler.listProcesses()
+                        withTimeoutOrNull(EXIT_PROCESS_RESPONSE_TIMEOUT_MS) {
+                            deferred.await()
+                        }
                     }
                     if (snapshot != null) {
                         val hasNonEssential = snapshot.any {

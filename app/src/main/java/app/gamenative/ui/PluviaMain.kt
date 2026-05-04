@@ -821,12 +821,13 @@ fun PluviaMain(
                     val rec = runCatching {
                         SteamUtils.getRecommendedSdkCloudSaveSubdirAsync(context, gameId)
                     }.getOrNull()
-                    val persisted = rec != null && runCatching {
-                        val container = ContainerUtils.getContainer(context, state.launchedAppId)
-                        container.sdkCloudSaveSubdir = rec.subdir
-                        container.saveData()
-                    }.onFailure { Timber.w(it, "Failed to persist sdkCloudSaveSubdir=${rec.subdir}") }
-                        .isSuccess
+                    if (rec != null) {
+                        runCatching {
+                            val container = ContainerUtils.getContainer(context, state.launchedAppId)
+                            container.sdkCloudSaveSubdir = rec.subdir
+                            container.saveData()
+                        }.onFailure { Timber.w(it, "Failed to persist sdkCloudSaveSubdir=${rec.subdir}") }
+                    }
                     withContext(Dispatchers.Main) { relaunch(true) }
                 }
             }
@@ -841,12 +842,11 @@ fun PluviaMain(
                 // Don't ask again for this game.
                 msgDialogState = MessageDialogState(false)
                 CoroutineScope(Dispatchers.IO).launch {
-                    val persisted = runCatching {
+                    runCatching {
                         val container = ContainerUtils.getContainer(context, state.launchedAppId)
                         container.putExtra("sdkCloudBridgePromptDismissed", "1")
                         container.saveData()
                     }.onFailure { Timber.w(it, "Failed to persist sdkCloudBridgePromptDismissed") }
-                        .isSuccess
                     withContext(Dispatchers.Main) { relaunch(true) }
                 }
             }

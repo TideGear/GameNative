@@ -233,6 +233,10 @@ public class WindowManager extends XResourceManager {
             if (!cand.getChildren().isEmpty()) continue;
             Window candParent = cand.getParent();
             if (candParent == null || candParent == rootWindow) continue;
+            // The compositor's orphan-chain marker pins the parent to a 1x1 orphanage
+            // (see dd3987be). Mirror that here so we never reap children of a blank
+            // pid=0 parent that isn't the actual orphanage stub.
+            if (candParent.getWidth() != 1 || candParent.getHeight() != 1) continue;
             if (!candParent.getClassName().isEmpty()) continue;
             if (candParent.getProcessId() != 0) continue;
             matches.add(cand);
