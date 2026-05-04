@@ -64,6 +64,13 @@ public class WinHandler {
     private boolean initReceived;
     private InetAddress localhost;
     private OnGetProcessInfoListener onGetProcessInfoListener;
+    // Additional listeners that subscribe via add/removeOnGetProcessInfoListener.
+    // The single-slot setter above is kept for backwards compatibility; the
+    // dispatch path forwards to the slot AND every listener in this list, so
+    // multiple concurrent watchers (e.g. awaitSteamShutdown polling at the
+    // same time as startExitWatchForUnmappedGameWindow) no longer clobber
+    // each other's listener installation.
+    private final CopyOnWriteArrayList<OnGetProcessInfoListener> extraProcessInfoListeners = new CopyOnWriteArrayList<>();
     private PreferredInputApi preferredInputApi;
     private final ByteBuffer receiveData;
     private final DatagramPacket receivePacket;
@@ -240,12 +247,17 @@ public class WinHandler {
 
     public void listProcesses() {
         addAction(() -> {
-            OnGetProcessInfoListener onGetProcessInfoListener;
             this.sendData.rewind();
             this.sendData.put(RequestCodes.LIST_PROCESSES);
             this.sendData.putInt(0);
-            if (!sendPacket(CLIENT_PORT) && (onGetProcessInfoListener = this.onGetProcessInfoListener) != null) {
-                onGetProcessInfoListener.onGetProcessInfo(0, 0, null);
+            if (!sendPacket(CLIENT_PORT)) {
+                OnGetProcessInfoListener slotListener = this.onGetProcessInfoListener;
+                if (slotListener != null) {
+                    slotListener.onGetProcessInfo(0, 0, null);
+                }
+                for (OnGetProcessInfoListener l : extraProcessInfoListeners) {
+                    l.onGetProcessInfo(0, 0, null);
+                }
             }
         });
     }
@@ -349,6 +361,23 @@ public class WinHandler {
         }
     }
 
+    /**
+     * Register an additional listener that will be notified for every process-info
+     * event. Unlike {@link #setOnGetProcessInfoListener}, multiple listeners can
+     * coexist; each caller manages its own registration via
+     * {@link #removeOnGetProcessInfoListener}. This is the preferred API when more
+     * than one component polls process info concurrently.
+     */
+    public void addOnGetProcessInfoListener(OnGetProcessInfoListener listener) {
+        if (listener == null) return;
+        extraProcessInfoListeners.addIfAbsent(listener);
+    }
+
+    public void removeOnGetProcessInfoListener(OnGetProcessInfoListener listener) {
+        if (listener == null) return;
+        extraProcessInfoListeners.remove(listener);
+    }
+
     private void startSendThread() {
         Executors.newSingleThreadExecutor().execute(() -> {
             while (this.running) {
@@ -388,7 +417,7 @@ public class WinHandler {
                 }
                 return;
             case RequestCodes.GET_PROCESS:
-                if (this.onGetProcessInfoListener == null) {
+                if (this.onGetProcessInfoListener == null && extraProcessInfoListeners.isEmpty()) {
                     return;
                 }
                 ByteBuffer byteBuffer = this.receiveData;
@@ -402,7 +431,13 @@ public class WinHandler {
                 byte[] bytes = new byte[32];
                 this.receiveData.get(bytes);
                 String name = StringUtils.fromANSIString(bytes);
-                this.onGetProcessInfoListener.onGetProcessInfo(index, numProcesses, new ProcessInfo(pid, name, memoryUsage, affinityMask, wow64Process));
+                ProcessInfo info = new ProcessInfo(pid, name, memoryUsage, affinityMask, wow64Process);
+                if (this.onGetProcessInfoListener != null) {
+                    this.onGetProcessInfoListener.onGetProcessInfo(index, numProcesses, info);
+                }
+                for (OnGetProcessInfoListener l : extraProcessInfoListeners) {
+                    l.onGetProcessInfo(index, numProcesses, info);
+                }
                 return;
             case RequestCodes.GET_GAMEPAD:
                 boolean isXInput = this.receiveData.get() == 1;

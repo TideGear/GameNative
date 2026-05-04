@@ -300,10 +300,12 @@ object SteamUtils {
     private fun verifyRestoredState(context: Context, appDirPath: String): Boolean {
         return try {
             val assetHashes = pipeDllHashes(context)
+            var found = false
             Paths.get(appDirPath).toFile().walkTopDown().maxDepth(10).forEach { file ->
                 if (!file.isFile) return@forEach
                 val n = file.name.lowercase()
                 if (n == "steam_api.dll" || n == "steam_api64.dll") {
+                    found = true
                     val pipeHash = assetHashes[n]
                     if (pipeHash == null) {
                         // Missing pipe-asset hash means we can't tell whether this is the pipe
@@ -316,6 +318,13 @@ object SteamUtils {
                         return false
                     }
                 }
+            }
+            if (!found) {
+                // No steam_api*.dll on disk — marker is stale (game dir moved/deleted/relocated).
+                // Fail closed so putBackSteamDlls() runs on next launch; it's a safe no-op when
+                // there are no .orig backups either (some games genuinely don't ship the DLL).
+                Timber.w("DLL marker desync: no steam_api DLL found under %s but RESTORED marker present", appDirPath)
+                return false
             }
             true
         } catch (e: Exception) {

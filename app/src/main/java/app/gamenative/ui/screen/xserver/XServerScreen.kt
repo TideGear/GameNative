@@ -311,14 +311,16 @@ private fun buildEssentialProcessAllowlist(): Set<String> {
 }
 
 private suspend fun requestWineProcessSnapshot(winHandler: WinHandler): List<ProcessInfo>? {
-    val previousListener = winHandler.getOnGetProcessInfoListener()
     val lock = Any()
     var currentList = mutableListOf<ProcessInfo>()
     var expectedCount = 0
     val deferred = CompletableDeferred<List<ProcessInfo>?>()
 
+    // Register via add/removeOnGetProcessInfoListener so we don't clobber
+    // other concurrent watchers (e.g. startExitWatchForUnmappedGameWindow,
+    // or another awaitSteamShutdown poll on the same WinHandler) that also
+    // need process-info events.
     val listener = OnGetProcessInfoListener { index, count, processInfo ->
-        previousListener?.onGetProcessInfo(index, count, processInfo)
         synchronized(lock) {
             if (count == 0 && processInfo == null) {
                 if (!deferred.isCompleted) deferred.complete(emptyList())
@@ -342,13 +344,13 @@ private suspend fun requestWineProcessSnapshot(winHandler: WinHandler): List<Pro
     }
 
     return try {
-        winHandler.setOnGetProcessInfoListener(listener)
+        winHandler.addOnGetProcessInfoListener(listener)
         winHandler.listProcesses()
         withTimeoutOrNull(EXIT_PROCESS_RESPONSE_TIMEOUT_MS) {
             deferred.await()
         }
     } finally {
-        winHandler.setOnGetProcessInfoListener(previousListener)
+        winHandler.removeOnGetProcessInfoListener(listener)
     }
 }
 
@@ -825,14 +827,15 @@ fun XServerScreen(
 
         exitWatchJob = CoroutineScope(Dispatchers.IO).launch {
             val allowlist = buildEssentialProcessAllowlist()
-            val previousListener = winHandler.getOnGetProcessInfoListener()
             val lock = Any()
             var pendingSnapshot: CompletableDeferred<List<ProcessInfo>?>? = null
             var currentList = mutableListOf<ProcessInfo>()
             var expectedCount = 0
 
+            // Register via add/removeOnGetProcessInfoListener so that a concurrent
+            // awaitSteamShutdown (or other process-info consumer) can coexist
+            // without each install/remove cycle clobbering the other.
             val listener = OnGetProcessInfoListener { index, count, processInfo ->
-                previousListener?.onGetProcessInfo(index, count, processInfo)
                 synchronized(lock) {
                     val deferred = pendingSnapshot ?: return@synchronized
                     if (count == 0 && processInfo == null) {
@@ -852,7 +855,7 @@ fun XServerScreen(
                 }
             }
 
-            winHandler.setOnGetProcessInfoListener(listener)
+            winHandler.addOnGetProcessInfoListener(listener)
             try {
                 val startTime = System.currentTimeMillis()
                 while (System.currentTimeMillis() - startTime < EXIT_PROCESS_TIMEOUT_MS) {
@@ -886,7 +889,7 @@ fun XServerScreen(
                     delay(EXIT_PROCESS_POLL_INTERVAL_MS)
                 }
             } finally {
-                winHandler.setOnGetProcessInfoListener(previousListener)
+                winHandler.removeOnGetProcessInfoListener(listener)
                 synchronized(lock) {
                     pendingSnapshot = null
                 }
@@ -1312,8 +1315,12 @@ fun XServerScreen(
                                 delay(GRACEFUL_EXIT_GRACE_MS)
                             }
                             exit(winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
-                        } catch (_: kotlinx.coroutines.CancellationException) {
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
                             // Force-quit path already called exit().
+                            throw ce
+                        } catch (t: Throwable) {
+                            Timber.w(t, "graceful Steam exit failed, falling through to exit()")
+                            exit(winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
                         } finally {
                             steamShutdownDialogResolver?.let { if (!it.isCompleted) it.cancel() }
                             steamShutdownDialogResolver = null
@@ -3243,6 +3250,13 @@ private fun setupXEnvironment(
         guestProgramLauncherComponent.setSteamType(container.getSteamType())
 
         envVars.putAll(container.envVars)
+        // putAll above can overwrite the per-container WINEPREFIX we set earlier
+        // (line ~3135) if container.envVars carries a stale value. Re-pin it to
+        // the resolved imageFs.wineprefix so the launch always uses the prefix
+        // we actually prepared for this container.
+        if (!imageFs.wineprefix.isNullOrEmpty()) {
+            envVars.put("WINEPREFIX", imageFs.wineprefix)
+        }
         if (!envVars.has("WINEESYNC")) envVars.put("WINEESYNC", "1")
 
         // Disable the Steam overlay end-to-end when the user opts out:

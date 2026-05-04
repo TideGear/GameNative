@@ -83,8 +83,13 @@ object LudusaviRegistry {
                     .onFailure { Timber.w(it, "LudusaviRegistry: disk cache parse failed; will refetch") }
             }
 
-            val fetched = fetchAndFilter() ?: run {
-                // Fall back to a stale disk cache if fetch failed and one exists
+            val fetched = fetchAndFilter()
+            // Treat an empty parse as failure: guards against silent schema drift in the
+            // upstream manifest poisoning both caches with a no-data result for CACHE_TTL_MS.
+            if (fetched.isNullOrEmpty()) {
+                if (fetched != null) {
+                    Timber.w("LudusaviRegistry: parser returned 0 entries; refusing to cache (likely schema drift)")
+                }
                 if (cacheFile.isFile) {
                     runCatching { parseCacheJson(cacheFile.readText()) }
                         .onSuccess {

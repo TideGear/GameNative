@@ -219,24 +219,29 @@ object SteamAutoCloud {
         // ISteamRemoteStorage indexes the files for SDK-cloud games. With cloudenabled=0
         // Wine-Steam doesn't rescan remote/ on startup — it trusts this index.
         val writeRemoteCache: (Map<String, List<UserFileInfo>>, Long) -> Unit = { localMap, changeNumber ->
-            val entries = localMap.values.flatten()
-                .filter { it.root == PathType.SteamUserData }
-                .mapNotNull { file ->
-                    val absPath = file.getAbsPath(prefixToPath)
-                    try {
-                        if (!Files.exists(absPath)) return@mapNotNull null
-                        SteamUtils.RemoteCacheFile(
-                            relativePath = file.filename,
-                            size = Files.size(absPath),
-                            timeSeconds = file.timestamp / 1000,
-                            shaHex = file.sha.joinToString("") { "%02x".format(it) },
-                        )
-                    } catch (e: Exception) {
-                        Timber.w(e, "Skipping remotecache entry for ${file.filename}")
-                        null
+            // Auto-Cloud apps don't use SteamUserData/remote/ at all, so there's no
+            // remotecache.vdf to maintain for them — skip the write entirely.
+            if (autoCloudPatterns.isEmpty()) {
+                val entries = localMap.values.flatten()
+                    .filter { it.root == PathType.SteamUserData }
+                    .mapNotNull { file ->
+                        val absPath = file.getAbsPath(prefixToPath)
+                        try {
+                            if (!Files.exists(absPath)) return@mapNotNull null
+                            SteamUtils.RemoteCacheFile(
+                                relativePath = file.filename,
+                                size = Files.size(absPath),
+                                timeSeconds = file.timestamp / 1000,
+                                shaHex = file.sha.joinToString("") { "%02x".format(it) },
+                            )
+                        } catch (e: Exception) {
+                            Timber.w(e, "Skipping remotecache entry for ${file.filename}")
+                            null
+                        }
                     }
-                }
-            if (entries.isNotEmpty()) {
+                // Always write — including with an empty entry list — so a wipe of local
+                // saves truncates the manifest instead of leaving stale entries on disk
+                // for the next sync to (incorrectly) trust.
                 SteamUtils.writeRemoteCacheVdf(
                     remoteDir = File(steamUserDataBase),
                     appId = appInfo.id,

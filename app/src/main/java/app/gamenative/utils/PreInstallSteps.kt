@@ -52,7 +52,10 @@ object PreInstallSteps {
 
         if (containerVariantChanged) {
             resetMarkers(gameDirPath)
-            container.rootDir?.absolutePath?.let { resetMarkers(it) }
+            container.rootDir?.absolutePath?.let { containerRoot ->
+                resetMarkers(containerRoot)
+                resetVcRedistVersionMarkers(containerRoot)
+            }
         }
 
         val commands = mutableListOf<PreInstallCommand>()
@@ -98,17 +101,34 @@ object PreInstallSteps {
         MarkerUtils.addMarker(gameDirPath, marker)
         // Also persist container-scoped prereqs at the Wine prefix root so a
         // game reinstall doesn't force a redundant re-run of an installer that
-        // already landed system-wide. Matches the appliesTo check in VcRedistStep.
+        // already landed system-wide. For vcredist this is keyed per-year via
+        // VcRedistStep.recordInstalledVersions so a later game bundling a
+        // different MSVC year still triggers an install (just for the missing
+        // years), instead of being short-circuited by a coarse container-wide
+        // marker.
         if (marker == Marker.VCREDIST_INSTALLED) {
-            container.rootDir?.absolutePath?.let { containerRoot ->
-                MarkerUtils.addMarker(containerRoot, marker)
-            }
+            VcRedistStep.recordInstalledVersions(container, gameDir)
         }
     }
 
     private fun resetMarkers(gameDirPath: String) {
         for (marker in allMarkers()) {
             MarkerUtils.removeMarker(gameDirPath, marker)
+        }
+    }
+
+    /**
+     * Clears per-year vcredist sidecar markers (".vcredist_installed_<year>")
+     * at the container root. Called when the container variant changes so the
+     * Wine prefix gets re-seeded with the right redistributables.
+     */
+    private fun resetVcRedistVersionMarkers(containerRoot: String) {
+        val dir = java.io.File(containerRoot)
+        val files = dir.listFiles() ?: return
+        for (f in files) {
+            if (f.isFile && f.name.startsWith(".vcredist_installed_")) {
+                runCatching { f.delete() }
+            }
         }
     }
 

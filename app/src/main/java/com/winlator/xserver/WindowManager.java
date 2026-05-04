@@ -222,6 +222,19 @@ public class WindowManager extends XResourceManager {
             // Don't reap an ancestor of `created`; destroyWindow recurses into descendants
             // so this would destroy `created` too.
             if (ancestors.contains(cand.id)) continue;
+            // Tightened orphan-chain signature: mirror the compositor filter from
+            // dd3987be ("skip orphaned Wine GLX leak chain in compositor"). The proven
+            // leak marker is blank WM_CLASS + _NET_WM_PID==0 reparented under a 1x1
+            // blank-className/pid=0 orphanage. Without these extra predicates the
+            // reaper could destroy a legitimate unmapped popup from the same client
+            // that happens to share size and lack WM_CLASS at create time.
+            if (cand.getProcessId() != 0) continue;
+            if (!cand.getName().isEmpty()) continue;
+            if (!cand.getChildren().isEmpty()) continue;
+            Window candParent = cand.getParent();
+            if (candParent == null || candParent == rootWindow) continue;
+            if (!candParent.getClassName().isEmpty()) continue;
+            if (candParent.getProcessId() != 0) continue;
             matches.add(cand);
         }
         if (matches.size() < LEAK_CLIENT_CAP) return;

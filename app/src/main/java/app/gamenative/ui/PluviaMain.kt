@@ -801,10 +801,9 @@ fun PluviaMain(
                 preLaunchApp(
                     context = context,
                     appId = state.launchedAppId,
-                    // Only suppress the prompt next time when we actually persisted a subdir
-                    // (or the user picked "Don't ask again"). If persistence failed, leave
-                    // the prompt enabled so it fires again on the next attempt rather than
-                    // silently disabling itself in memory.
+                    // Always suppress for the current relaunch so the dialog doesn't immediately
+                    // resurface and loop; persistence (sdkCloudSaveSubdir / sdkCloudBridgePromptDismissed)
+                    // is what gates future launches.
                     skipBridgePrompt = suppressPrompt,
                     setLoadingDialogVisible = viewModel::setLoadingDialogVisible,
                     setLoadingProgress = viewModel::setLoadingDialogProgress,
@@ -828,14 +827,15 @@ fun PluviaMain(
                         container.saveData()
                     }.onFailure { Timber.w(it, "Failed to persist sdkCloudSaveSubdir=${rec.subdir}") }
                         .isSuccess
-                    withContext(Dispatchers.Main) { relaunch(persisted) }
+                    withContext(Dispatchers.Main) { relaunch(true) }
                 }
             }
             onDismissClick = {
-                // Skip this time — continue launch without setting the field. Don't suppress
-                // the prompt on the next launch since we didn't persist anything.
+                // Skip this time — continue launch without setting the field. Always suppress
+                // for the current relaunch so the dialog doesn't reappear; since nothing was
+                // persisted, future launches will still re-prompt.
                 msgDialogState = MessageDialogState(false)
-                relaunch(false)
+                relaunch(true)
             }
             onActionClick = {
                 // Don't ask again for this game.
@@ -847,12 +847,12 @@ fun PluviaMain(
                         container.saveData()
                     }.onFailure { Timber.w(it, "Failed to persist sdkCloudBridgePromptDismissed") }
                         .isSuccess
-                    withContext(Dispatchers.Main) { relaunch(persisted) }
+                    withContext(Dispatchers.Main) { relaunch(true) }
                 }
             }
             onDismissRequest = {
                 msgDialogState = MessageDialogState(false)
-                relaunch(false)
+                relaunch(true)
             }
         }
 

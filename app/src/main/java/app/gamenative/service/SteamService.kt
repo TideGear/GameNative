@@ -89,6 +89,7 @@ import `in`.dragonbra.javasteam.steam.handlers.steamapps.License
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.PICSRequest
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.SteamApps
 import `in`.dragonbra.javasteam.steam.handlers.steamapps.callback.LicenseListCallback
+import `in`.dragonbra.javasteam.steam.handlers.steamcloud.PendingRemoteOperation
 import `in`.dragonbra.javasteam.steam.handlers.steamcloud.SteamCloud
 import `in`.dragonbra.javasteam.steam.handlers.steamfriends.SteamFriends
 import `in`.dragonbra.javasteam.steam.handlers.steamfriends.callback.PersonaStateCallback
@@ -2305,6 +2306,15 @@ class SteamService : Service(), IChallengeUrlChanged {
             // the server that we completed uploads and reset cloud ChangeNumber to 0 —
             // Wine-Steam then "forgot" steam_autocloud.vdf and games with Steamworks
             // cloud integration (e.g. 868-HACK) exited with code 1.
+            //
+            // Cross-device pending ops surfaced by the real-Steam probe are also
+            // captured here. The main sync flow below skips signalAppLaunchIntent in
+            // real-Steam mode (so Wine-Steam's own localhost intent isn't fenced by
+            // ours), which makes the probe the ONLY chance to observe cross-device
+            // conflicts on this path; we propagate them into PostSyncInfo so the
+            // SYNC_CONFLICT dialog can fire.
+            var realSteamCrossDevicePending: List<PendingRemoteOperation> = emptyList()
+
             if (isLaunchRealSteam) {
                 runCatching { instance?._steamUser?.kickPlayingSession() }
                     .onFailure { Timber.w(it, "Proactive kickPlayingSession before real-Steam launch failed") }
@@ -2346,6 +2356,12 @@ class SteamService : Service(), IChallengeUrlChanged {
                                     crossDevice.size,
                                     crossDevice.joinToString { "${it.machineName}:${it.operation.name}" },
                                 )
+                                // Capture for propagation; if the caller passed
+                                // ignorePendingOperations=true (user already chose Play
+                                // Anyway in a prior pass), don't re-surface the dialog.
+                                if (!ignorePendingOperations) {
+                                    realSteamCrossDevicePending = crossDevice
+                                }
                             } else if (selfPhantoms.isNotEmpty()) {
                                 steamCloud.signalAppLaunchIntent(
                                     appId = appId,
@@ -2372,6 +2388,18 @@ class SteamService : Service(), IChallengeUrlChanged {
                     runCatching { steamInstance._steamUser?.kickPlayingSession() }
                         .onFailure { Timber.w(it, "Probe-session kick after proactive launch intent failed") }
                 }
+            }
+
+            // If the real-Steam probe surfaced cross-device pending ops, short-circuit
+            // before any further cloud work and let the conflict UI run. The main sync
+            // flow below skips signalAppLaunchIntent in real-Steam mode, so without this
+            // bail the detected ops would never reach PostSyncInfo.pendingRemoteOperations.
+            if (realSteamCrossDevicePending.isNotEmpty()) {
+                releaseSync(appId)
+                return@async PostSyncInfo(
+                    syncResult = SyncResult.PendingOperations,
+                    pendingRemoteOperations = realSteamCrossDevicePending,
+                )
             }
 
             try {
