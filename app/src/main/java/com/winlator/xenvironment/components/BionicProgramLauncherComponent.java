@@ -234,6 +234,10 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         final int enabledPlayerCount =
             Math.max(1, Math.min(connectedControllerCount, WinHandler.MAX_PLAYERS));
         envVars.put("EVSHIM_MAX_PLAYERS", String.valueOf(enabledPlayerCount));
+        // Surface evshim's "Rumble P%d" debug prints in logcat so we can see
+        // when the game writes rumble bytes to gamepad{,1,2,3}.mem. Gated on
+        // EVSHIM_DEBUG so it stays off in non-debug builds.
+        envVars.put("EVSHIM_DEBUG", "1");
         if (true) {
             envVars.put("EVSHIM_SHM_ID", 1);
         }
@@ -301,11 +305,30 @@ public class BionicProgramLauncherComponent extends GuestProgramLauncherComponen
         String evshimPath = imageFs.getLibDir() + "/libevshim.so";
         String replacePath = imageFs.getLibDir() + "/libredirect-bionic.so";
 
+        // The libevshim.so baked into imagefs_bionic.txz is stale: its gamepad-mem
+        // paths still point at the legacy com.winlator.cmod package, so open() fails
+        // and OnRumble never writes. Overwrite it on every launch with the freshly
+        // built copy bundled in the APK's jniLibs (built from app/src/main/cpp/extras/evshim.c
+        // via build-evshim.ps1) so evshim.c source changes propagate to the runtime.
+        File apkEvshim = new File(context.getApplicationInfo().nativeLibraryDir, "libevshim.so");
+        File ifsEvshim = new File(evshimPath);
+        if (apkEvshim.exists()) {
+            if (FileUtils.copy(apkEvshim, ifsEvshim)) {
+                FileUtils.chmod(ifsEvshim, 0755);
+                Log.i("EvshimDeploy", "Copied APK evshim -> " + evshimPath);
+            } else {
+                Log.e("EvshimDeploy", "Failed to copy APK evshim to " + evshimPath);
+            }
+        }
+
         if (new File(sysvPath).exists()) ld_preload += sysvPath;
 
-
-        ld_preload += ":" + evshimPath;
-        ld_preload += ":" + replacePath;
+        if (ifsEvshim.exists()) {
+            ld_preload += (ld_preload.isEmpty() ? "" : ":") + evshimPath;
+        } else {
+            Log.w("EvshimDeploy", "evshim not present at " + evshimPath + "; skipping LD_PRELOAD entry");
+        }
+        ld_preload += (ld_preload.isEmpty() ? "" : ":") + replacePath;
 
         envVars.put("LD_PRELOAD", ld_preload);
 

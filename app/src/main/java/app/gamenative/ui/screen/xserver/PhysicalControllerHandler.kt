@@ -256,11 +256,14 @@ class PhysicalControllerHandler(
             val slot = if (deviceId >= 0) controllerManager.autoAssignDevice(deviceId) else 0
             if (slot < 0) return
 
-            // Ensure we have a controller in this slot
+            // Ensure we have a controller in this slot.
+            // Real device first; profile (wildcard) fallback. Inverting this
+            // adopts the wildcard ExternalController (id == "*") for every
+            // physical device, collapsing all slots onto one shared instance.
             var slotController = winHandler.getControllerForSlot(slot)
             if (slotController == null || (deviceId >= 0 && slotController.deviceId != deviceId)) {
-                val adopted = profile?.getController(deviceId)
-                    ?: ExternalController.getController(deviceId)
+                val adopted = ExternalController.getController(deviceId)
+                    ?: profile?.getController(deviceId)
                     ?: return
                 winHandler.setControllerForSlot(slot, adopted)
                 slotController = adopted
