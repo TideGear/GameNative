@@ -139,17 +139,55 @@ public class WinHandler {
 
     /** Sets the vibration routing mode (off/controller/device), normalizing and validating input. */
     public void setVibrationMode(String mode) {
+        String newMode;
         if (mode == null) {
-            this.vibrationMode = DEFAULT_VIBRATION_MODE;
+            newMode = DEFAULT_VIBRATION_MODE;
         } else {
             String normalized = mode.trim().toLowerCase(Locale.US);
-            this.vibrationMode = VALID_VIBRATION_MODES.contains(normalized) ? normalized : DEFAULT_VIBRATION_MODE;
+            newMode = VALID_VIBRATION_MODES.contains(normalized) ? normalized : DEFAULT_VIBRATION_MODE;
         }
+        if (newMode.equals(this.vibrationMode)) return;
+        this.vibrationMode = newMode;
+        reconcileActiveRumble();
     }
 
     /** Sets the vibration intensity percentage, clamped to 0–100. */
     public void setVibrationIntensity(int intensity) {
-        this.vibrationIntensity = Math.max(0, Math.min(100, intensity));
+        int clamped = Math.max(0, Math.min(100, intensity));
+        if (clamped == this.vibrationIntensity) return;
+        this.vibrationIntensity = clamped;
+        reconcileActiveRumble();
+    }
+
+    /**
+     * Cancel any in-flight vibration and force the rumble poller to re-evaluate
+     * every slot under the new vibrationMode/vibrationIntensity on its next tick.
+     * Without this, a switch away from "device" mode would leave the 60s phone
+     * one-shot running until its timer expired, and an intensity change in
+     * "device" mode would not take effect for ~55s (the long device refresh).
+     * The handset vibrator is cancelled unconditionally because
+     * stopVibrationForPlayer gates its phone-cancel branch on the current mode,
+     * which has already been updated by the time we get here.
+     */
+    private void reconcileActiveRumble() {
+        try {
+            Vibrator phoneVibrator = (Vibrator) activity.getSystemService(Context.VIBRATOR_SERVICE);
+            if (phoneVibrator != null) phoneVibrator.cancel();
+        } catch (Exception e) {
+            Log.e(TAG, "reconcileActiveRumble: phone vibrator cancel failed", e);
+        }
+        for (int p = 0; p < MAX_PLAYERS; p++) {
+            if (isRumbling[p]) stopVibrationForPlayer(p);
+            playerPhoneAmplitudes[p] = 0;
+            // Zero last-seen frequencies so the next poller tick sees the current
+            // buffer as a transition and re-fires startVibrationForPlayer with the
+            // new mode/intensity.
+            lastLowFreqs[p] = 0;
+            lastHighFreqs[p] = 0;
+        }
+        synchronized (rumbleNotifyLock) {
+            rumbleNotifyLock.notifyAll();
+        }
     }
 
     public enum PreferredInputApi {
@@ -566,25 +604,39 @@ public class WinHandler {
                         this.gamepadClients.remove(Integer.valueOf(port));
                     }
                     final boolean finalEnabled = enabled;
+                    // Capture every value the lambda needs into final locals at queue-time.
+                    // this.currentController and inputControlsView.getProfile() can be
+                    // cleared or reassigned by RELEASE_GAMEPAD / other concurrent handlers
+                    // between when this is queued and when the send thread runs it.
+                    final int finalDeviceId;
+                    final byte finalMapperType;
+                    final byte[] finalNameBytes;
+                    if (finalEnabled) {
+                        finalDeviceId = !useVirtualGamepad ? this.currentController.getDeviceId() : profile.id;
+                        finalMapperType = this.dinputMapperType;
+                        String capturedName = useVirtualGamepad ? profile.getName() : this.currentController.getName();
+                        byte[] originalBytes = capturedName.getBytes();
+                        final int MAX_NAME_LENGTH = 54;
+                        if (originalBytes.length > MAX_NAME_LENGTH) {
+                            Log.w("WinHandler", "Controller name is too long ("+originalBytes.length+" bytes), truncating: "+capturedName);
+                            finalNameBytes = new byte[MAX_NAME_LENGTH];
+                            System.arraycopy(originalBytes, 0, finalNameBytes, 0, MAX_NAME_LENGTH);
+                        } else {
+                            finalNameBytes = originalBytes;
+                        }
+                    } else {
+                        finalDeviceId = 0;
+                        finalMapperType = 0;
+                        finalNameBytes = null;
+                    }
                     addAction(() -> {
                         this.sendData.rewind();
                         this.sendData.put((byte) RequestCodes.GET_GAMEPAD);
                         if (finalEnabled) {
-                            this.sendData.putInt(!useVirtualGamepad ? this.currentController.getDeviceId() : profile.id);
-                            this.sendData.put(this.dinputMapperType);
-                            String originalName = (useVirtualGamepad ? profile.getName() : currentController.getName());
-                            byte[] originalBytes = originalName.getBytes();
-                            final int MAX_NAME_LENGTH = 54;
-                            byte[] bytesToWrite;
-                            if (originalBytes.length > MAX_NAME_LENGTH) {
-                                Log.w("WinHandler", "Controller name is too long ("+originalBytes.length+" bytes), truncating: "+originalName);
-                                bytesToWrite = new byte[MAX_NAME_LENGTH];
-                                System.arraycopy(originalBytes, 0, bytesToWrite, 0, MAX_NAME_LENGTH);
-                            } else {
-                                bytesToWrite = originalBytes;
-                            }
-                            sendData.putInt(bytesToWrite.length);
-                            sendData.put(bytesToWrite);
+                            this.sendData.putInt(finalDeviceId);
+                            this.sendData.put(finalMapperType);
+                            sendData.putInt(finalNameBytes.length);
+                            sendData.put(finalNameBytes);
                         } else {
                             this.sendData.putInt(0);
                             this.sendData.put((byte) 0);
