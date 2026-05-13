@@ -462,6 +462,18 @@ public class WinHandler {
         synchronized (rumbleNotifyLock) {
             rumbleNotifyLock.notifyAll();
         }
+        // Block until the poller has fully exited so its FileObservers get stopWatching()'d
+        // before we return. Without this join, a subsequent start() that flips running=true
+        // again would resurrect the old poller alongside the new one. Bounded timeout so a
+        // wedged poller can't hang exit; guard against self-join from the poller thread.
+        Thread poller = this.rumblePollerThread;
+        if (poller != null && poller != Thread.currentThread()) {
+            try {
+                poller.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         for (int p = 0; p < MAX_PLAYERS; p++) {
             stopVibrationForPlayer(p);
         }
@@ -609,10 +621,15 @@ public class WinHandler {
                 final ControlsProfile profile2 = inputControlsView.getProfile();
                 final boolean useVirtualGamepad2 = inputControlsView != null && profile2 != null && profile2.isVirtualGamepad();
                 ExternalController externalController2 = this.currentController;
-                final boolean enabled3 = externalController2 != null || useVirtualGamepad2;
                 if (externalController2 != null && externalController2.getDeviceId() != gamepadId) {
                     this.currentController = null;
+                    externalController2 = null;
                 }
+                // Capture into a final local after the possible null-out above so the lambda
+                // doesn't dereference a this.currentController that another thread (or this
+                // request itself) cleared between snapshot and lambda execution.
+                final ExternalController capturedController = externalController2;
+                final boolean enabled3 = capturedController != null || useVirtualGamepad2;
                 addAction(() -> {
                     sendData.rewind();
                     sendData.put(RequestCodes.GET_GAMEPAD_STATE);
@@ -622,7 +639,7 @@ public class WinHandler {
                         if (useVirtualGamepad2) {
                             inputControlsView.getProfile().getGamepadState().writeTo(this.sendData);
                         } else {
-                            this.currentController.state.writeTo(this.sendData);
+                            capturedController.state.writeTo(this.sendData);
                         }
                     }
                     sendPacket(port);
