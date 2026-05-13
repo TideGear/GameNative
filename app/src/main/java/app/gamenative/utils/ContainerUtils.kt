@@ -1,11 +1,13 @@
 package app.gamenative.utils
 
 import android.content.Context
+import android.os.Build
 import app.gamenative.PrefManager
 import app.gamenative.data.GameSource
 import app.gamenative.enums.Marker
 import app.gamenative.service.SteamService
 import app.gamenative.service.amazon.AmazonService
+import app.gamenative.utils.LsfgVkManager
 import app.gamenative.service.epic.EpicService
 import app.gamenative.service.gog.GOGConstants
 import app.gamenative.service.gog.GOGService
@@ -17,6 +19,7 @@ import com.winlator.container.ContainerManager
 import com.winlator.core.DefaultVersion
 import com.winlator.core.FileUtils
 import com.winlator.core.GPUInformation
+import com.winlator.core.envvars.EnvVars
 import com.winlator.core.WineRegistryEditor
 import com.winlator.core.WineThemeManager
 import com.winlator.fexcore.FEXCoreManager
@@ -326,6 +329,8 @@ object ContainerUtils {
             ),
             vibrationIntensity = (container.getExtra("vibrationIntensity", "100").toIntOrNull() ?: 100)
                 .coerceIn(0, 100),
+            // LSFG Vulkan frame generation
+            lsfgEnabled = container.getExtra(LsfgVkManager.EXTRA_ARMED, "false").toBoolean(),
         )
     }
 
@@ -500,6 +505,8 @@ object ContainerUtils {
             "vibrationIntensity",
             containerData.vibrationIntensity.coerceIn(0, 100).toString(),
         )
+        // LSFG Vulkan frame generation
+        container.putExtra(LsfgVkManager.EXTRA_ARMED, containerData.lsfgEnabled.toString())
         try {
             container.language = containerData.language
         } catch (e: Exception) {
@@ -879,6 +886,14 @@ object ContainerUtils {
             applyBestConfigMapToContainerData(containerData, bestConfigMap)
         } else {
             containerData
+        }
+
+        if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+            val ev = EnvVars(containerData.envVars)
+            if (!ev.has("FD_DEV_FEATURES")) {
+                ev.put("FD_DEV_FEATURES", "enable_tp_ubwc_flag_hint=1")
+                containerData = containerData.copy(envVars = ev.toString())
+            }
         }
 
         // If custom config is provided, just apply it and return

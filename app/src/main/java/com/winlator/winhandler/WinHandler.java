@@ -132,6 +132,7 @@ public class WinHandler {
     private volatile String vibrationMode = "controller";
     private volatile int vibrationIntensity = 100;
 
+    // Add method to set InputControlsView
     public void setInputControlsView(InputControlsView view) {
         this.inputControlsView = view;
     }
@@ -250,8 +251,6 @@ public class WinHandler {
                 buf.putShort(34, (short) 0);
             }
         }
-        if (slot == 0) { currentController = controller; return; }
-        if (slot > 0 && slot <= extraControllers.length) extraControllers[slot - 1] = controller;
     }
 
     private boolean sendPacket(int port) {
@@ -1115,6 +1114,10 @@ public class WinHandler {
 
         ExternalController controller = getControllerForSlot(slot);
         if (controller == null || controller.getDeviceId() != deviceId) {
+            // Real device first, profile wildcard as fallback. bllendev's PR #1261
+            // inverted this and ended up adopting the wildcard ExternalController
+            // (id == "*") for every physical device, collapsing all slots to one
+            // controller. Keep the real-device-first order.
             ExternalController adopted = ExternalController.getController(deviceId);
             if (adopted == null && inputControlsView != null) {
                 ControlsProfile profile = inputControlsView.getProfile();
@@ -1149,25 +1152,47 @@ public class WinHandler {
 
     /** Handles controller button press/release events, routing them to the correct player slot. */
     public boolean onKeyEvent(KeyEvent event) {
-        InputDevice device = event.getDevice();
-        if (device == null || !ExternalController.isGameController(device) || event.getRepeatCount() != 0) {
-            return false;
-        }
-
-        int slot = resolveControllerSlot(event.getDeviceId());
-        if (slot < 0) return false;
-
-        ExternalController controller = getControllerForSlot(slot);
-        if (controller == null) return false;
-
+        MappedByteBuffer buffer = null;
         boolean handled = false;
-        int action = event.getAction();
-        if (action == KeyEvent.ACTION_DOWN || action == KeyEvent.ACTION_UP) {
-            handled = controller.updateStateFromKeyEvent(event);
+        ExternalController externalController = this.currentController;
+        buffer = gamepadBuffer;
+        // If this is a gamepad event but our controller is null or mismatched, adopt it
+        InputDevice device = event.getDevice();
+        if ((externalController == null || externalController.getDeviceId() != event.getDeviceId())
+                && device != null && ExternalController.isGameController(device)
+                && event.getRepeatCount() == 0) {
+            ExternalController adopted = null;
+            // Try to get controller from profile first (has saved bindings)
+            if (inputControlsView != null) {
+                ControlsProfile profile = inputControlsView.getProfile();
+                if (profile != null) {
+                    adopted = profile.getController(event.getDeviceId());
+                }
+            }
+            // Fallback to creating new controller if profile doesn't have one
+            if (adopted == null) {
+                adopted = ExternalController.getController(event.getDeviceId());
+            }
+            if (adopted != null && "*".equals(adopted.getId())) {
+                this.currentController = adopted;
+                externalController = adopted;
+                Timber.d("WinHandler.onKeyEvent: adopted controller %s(#%d)", adopted.getName(), adopted.getDeviceId());
+            }
         }
-        MappedByteBuffer buffer = getBufferForSlot(slot);
-        if (buffer != null) sendMemoryFileState(controller, buffer);
-        if (handled && slot == 0) sendGamepadState();
+
+
+        if (externalController != null && externalController.getDeviceId() == event.getDeviceId() && event.getRepeatCount() == 0) {
+            int action = event.getAction();
+            if (action == KeyEvent.ACTION_DOWN) {
+                handled = this.currentController.updateStateFromKeyEvent(event);
+            } else if (action == KeyEvent.ACTION_UP) {
+                handled = this.currentController.updateStateFromKeyEvent(event);
+            }
+            sendMemoryFileState(this.currentController, buffer);
+            if (handled) {
+                sendGamepadState();
+            }
+        }
         return handled;
     }
 

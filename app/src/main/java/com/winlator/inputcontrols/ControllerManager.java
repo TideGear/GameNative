@@ -4,6 +4,7 @@ import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.hardware.input.InputManager;
+import android.os.Build;
 import android.preference.PreferenceManager;
 import android.util.SparseArray;
 import android.view.InputDevice;
@@ -14,14 +15,17 @@ import app.gamenative.PrefManager;
 import com.winlator.winhandler.WinHandler;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
-public class ControllerManager implements InputManager.InputDeviceListener {
+public class ControllerManager {
 
     @SuppressLint("StaticFieldLeak")
     private static ControllerManager instance;
 
 
+    /** Returns the singleton instance, creating it on first access. */
     public static synchronized ControllerManager getInstance() {
         if (instance == null) {
             instance = new ControllerManager();
@@ -37,6 +41,11 @@ public class ControllerManager implements InputManager.InputDeviceListener {
     private Context context;
     private SharedPreferences preferences;
     private InputManager inputManager;
+
+    // Guards detectedDevices, slotAssignments, and enabledSlots against concurrent
+    // access from the UI thread (scanForDevices, autoAssignDevice, …) and the
+    // rumble poller thread (getAssignedDeviceForSlot, getDetectedDevices).
+    private final Object deviceStateLock = new Object();
 
     // This list will hold all physical game controllers detected by Android.
     private final List<InputDevice> detectedDevices = new ArrayList<>();
@@ -64,28 +73,6 @@ public class ControllerManager implements InputManager.InputDeviceListener {
         // On startup, we load saved settings and scan for connected devices.
         loadAssignments();
         scanForDevices();
-
-        // Keep detectedDevices in sync with hot-plug events. null Handler dispatches
-        // callbacks on the main thread, the same thread that handles input events,
-        // so detectedDevices needs no synchronization.
-        inputManager.registerInputDeviceListener(this, null);
-
-        // Single-controller correction: if only one controller is connected and it's
-        // not in slot 0, move it so P1 is always populated for games that may only check P1
-        if (detectedDevices.size() == 1) {
-            String id = getDeviceIdentifier(detectedDevices.get(0));
-            if (id != null && !id.equals(slotAssignments.get(0))) {
-                // Remove from whatever slot it was in
-                for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-                    if (id.equals(slotAssignments.get(i))) {
-                        slotAssignments.remove(i);
-                    }
-                }
-                slotAssignments.put(0, id);
-                enabledSlots[0] = true;
-                saveAssignments();
-            }
-        }
     }
 
 
@@ -93,44 +80,63 @@ public class ControllerManager implements InputManager.InputDeviceListener {
 
     /**
      * Scans for all physically connected game controllers and updates the internal list.
+     * After scanning, evicts stale (disconnected) slot assignments and compacts the
+     * remaining connected devices to the lowest-numbered slots so that e.g. a lone DS4
+     * always occupies slot 0 regardless of historical assignment order.
      */
     public void scanForDevices() {
-        detectedDevices.clear();
-        int[] deviceIds = inputManager.getInputDeviceIds();
-        for (int deviceId : deviceIds) {
-            InputDevice device = inputManager.getInputDevice(deviceId);
-            // We only want physical gamepads/joysticks, not virtual ones or touchscreens.
-            if (device != null && !device.isVirtual() && isGameController(device)) {
-                detectedDevices.add(device);
+        synchronized (deviceStateLock) {
+            detectedDevices.clear();
+            int[] deviceIds = inputManager.getInputDeviceIds();
+            for (int deviceId : deviceIds) {
+                InputDevice device = inputManager.getInputDevice(deviceId);
+                if (device != null && !device.isVirtual() && isGameController(device)) {
+                    detectedDevices.add(device);
+                }
+            }
+            evictDisconnectedAndCompact();
+        }
+    }
+
+    /**
+     * Removes slot assignments for devices that are no longer connected,
+     * then shifts the remaining assignments down to fill from slot 0.
+     * This prevents a single connected controller from being stuck at a
+     * high slot number while evshim only reads slot 0.
+     */
+    private void evictDisconnectedAndCompact() {
+        Set<String> connectedIds = new HashSet<>();
+        for (InputDevice dev : detectedDevices) {
+            String id = getDeviceIdentifier(dev);
+            if (id != null) connectedIds.add(id);
+        }
+
+        List<String> keptIdentifiers = new ArrayList<>();
+        List<Boolean> keptEnabled = new ArrayList<>();
+        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+            String identifier = slotAssignments.get(i);
+            if (identifier != null) {
+                if (connectedIds.contains(identifier)) {
+                    keptIdentifiers.add(identifier);
+                    keptEnabled.add(enabledSlots[i]);
+                } else {
+                    android.util.Log.i("ControllerSlot",
+                            "evicting stale slot=" + i + " identifier=" + identifier);
+                }
             }
         }
-    }
 
-    @Override
-    public void onInputDeviceAdded(int deviceId) {
-        InputDevice device = inputManager.getInputDevice(deviceId);
-        if (device == null || device.isVirtual() || !isGameController(device)) return;
-        for (InputDevice existing : detectedDevices) {
-            if (existing.getId() == deviceId) return;
-        }
-        detectedDevices.add(device);
-    }
-
-    @Override
-    public void onInputDeviceRemoved(int deviceId) {
-        // getInputDevice returns null for a removed device, so match by id.
-        for (int i = 0; i < detectedDevices.size(); i++) {
-            if (detectedDevices.get(i).getId() == deviceId) {
-                detectedDevices.remove(i);
-                return;
+        slotAssignments.clear();
+        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+            if (i < keptIdentifiers.size()) {
+                slotAssignments.put(i, keptIdentifiers.get(i));
+                enabledSlots[i] = keptEnabled.get(i);
+            } else {
+                enabledSlots[i] = false;
             }
         }
-    }
 
-    @Override
-    public void onInputDeviceChanged(int deviceId) {
-        onInputDeviceRemoved(deviceId);
-        onInputDeviceAdded(deviceId);
+        saveAssignments();
     }
 
     /**
@@ -139,14 +145,12 @@ public class ControllerManager implements InputManager.InputDeviceListener {
     private void loadAssignments() {
         slotAssignments.clear();
         for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            // Load which device is assigned to this slot
             String prefKey = PREF_PLAYER_SLOT_PREFIX + i;
             String deviceIdentifier = preferences.getString(prefKey, null);
             if (deviceIdentifier != null) {
                 slotAssignments.put(i, deviceIdentifier);
             }
 
-            // Load whether this slot is enabled. Default P1=true, P2-4=false.
             String enabledKey = PREF_ENABLED_SLOTS_PREFIX + i;
             enabledSlots[i] = preferences.getBoolean(enabledKey, i == 0);
         }
@@ -154,22 +158,30 @@ public class ControllerManager implements InputManager.InputDeviceListener {
 
     /**
      * Saves the current player slot assignments and enabled states to SharedPreferences.
+     * Takes a consistent snapshot under deviceStateLock before writing, so concurrent
+     * mutations on the rumble-poller or UI thread cannot produce a torn save.
+     * SharedPreferences.apply() is called outside the lock to avoid holding it during I/O.
      */
     public void saveAssignments() {
+        // Snapshot mutable state under lock for a consistent view.
+        String[] identifiers = new String[WinHandler.MAX_PLAYERS];
+        boolean[] enabled = new boolean[WinHandler.MAX_PLAYERS];
+        synchronized (deviceStateLock) {
+            for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+                identifiers[i] = slotAssignments.get(i);
+                enabled[i] = enabledSlots[i];
+            }
+        }
+
         SharedPreferences.Editor editor = preferences.edit();
         for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            // Save the assigned device identifier
-            String deviceIdentifier = slotAssignments.get(i);
             String prefKey = PREF_PLAYER_SLOT_PREFIX + i;
-            if (deviceIdentifier != null) {
-                editor.putString(prefKey, deviceIdentifier);
+            if (identifiers[i] != null) {
+                editor.putString(prefKey, identifiers[i]);
             } else {
                 editor.remove(prefKey);
             }
-
-            // Save the enabled state
-            String enabledKey = PREF_ENABLED_SLOTS_PREFIX + i;
-            editor.putBoolean(enabledKey, enabledSlots[i]);
+            editor.putBoolean(PREF_ENABLED_SLOTS_PREFIX + i, enabled[i]);
         }
         editor.apply();
     }
@@ -218,32 +230,37 @@ public class ControllerManager implements InputManager.InputDeviceListener {
      */
     public static String getDeviceIdentifier(InputDevice device) {
         if (device == null) return null;
-        // The descriptor is the most reliable unique ID for a device.
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            return device.getDescriptor();
+        // Pre-Q descriptors were unstable across reconnects for some vendors, so
+        // persisted assignments from old installs use "vendor_X_product_Y". Keep
+        // that format on < Q so upgrade paths don't lose slot bindings.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return "vendor_" + device.getVendorId() + "_product_" + device.getProductId();
         }
-        // Fallback for older Android versions
-        return "vendor_" + device.getVendorId() + "_product_" + device.getProductId();
+        return device.getDescriptor();
     }
 
     /**
      * Returns the list of all detected physical game controllers.
      */
     public List<InputDevice> getDetectedDevices() {
-        return detectedDevices;
+        synchronized (deviceStateLock) {
+            return new ArrayList<>(detectedDevices);
+        }
     }
 
     /**
      * Returns the number of player slots the user has enabled.
      */
     public int getEnabledPlayerCount() {
-        int count = 0;
-        for (boolean enabled : enabledSlots) {
-            if (enabled) {
-                count++;
+        synchronized (deviceStateLock) {
+            int count = 0;
+            for (boolean enabled : enabledSlots) {
+                if (enabled) {
+                    count++;
+                }
             }
+            return count;
         }
-        return count;
     }
 
     /**
@@ -258,16 +275,15 @@ public class ControllerManager implements InputManager.InputDeviceListener {
         String newDeviceIdentifier = getDeviceIdentifier(device);
         if (newDeviceIdentifier == null) return;
 
-        // First, remove the new device from any slot it might already be in.
-        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            if (newDeviceIdentifier.equals(slotAssignments.get(i))) {
-                slotAssignments.remove(i);
+        synchronized (deviceStateLock) {
+            for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+                if (newDeviceIdentifier.equals(slotAssignments.get(i))) {
+                    slotAssignments.remove(i);
+                }
             }
+            slotAssignments.put(slotIndex, newDeviceIdentifier);
         }
-
-        // Assign the new device to the target slot.
-        slotAssignments.put(slotIndex, newDeviceIdentifier);
-        saveAssignments(); // Persist the change immediately.
+        saveAssignments();
     }
 
     /**
@@ -276,7 +292,9 @@ public class ControllerManager implements InputManager.InputDeviceListener {
      */
     public void unassignSlot(int slotIndex) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return;
-        slotAssignments.remove(slotIndex);
+        synchronized (deviceStateLock) {
+            slotAssignments.remove(slotIndex);
+        }
         saveAssignments();
     }
 
@@ -290,16 +308,17 @@ public class ControllerManager implements InputManager.InputDeviceListener {
         String deviceIdentifier = getDeviceIdentifier(device);
         if (deviceIdentifier == null) return -1;
 
-        // Correctly loop through the sparse array to find the key for our value.
-        for (int i = 0; i < slotAssignments.size(); i++) {
-            int key = slotAssignments.keyAt(i);
-            String value = slotAssignments.valueAt(i);
-            if (deviceIdentifier.equals(value)) {
-                return key; // Return the key (the slot index), not the internal index!
+        synchronized (deviceStateLock) {
+            for (int i = 0; i < slotAssignments.size(); i++) {
+                int key = slotAssignments.keyAt(i);
+                String value = slotAssignments.valueAt(i);
+                if (deviceIdentifier.equals(value)) {
+                    return key;
+                }
             }
         }
 
-        return -1; // Not found
+        return -1;
     }
 
 
@@ -309,17 +328,18 @@ public class ControllerManager implements InputManager.InputDeviceListener {
      * @return The assigned InputDevice, or null if no device is assigned or if the device is not currently connected.
      */
     public InputDevice getAssignedDeviceForSlot(int slotIndex) {
-        String assignedIdentifier = slotAssignments.get(slotIndex);
-        if (assignedIdentifier == null) return null;
+        synchronized (deviceStateLock) {
+            String assignedIdentifier = slotAssignments.get(slotIndex);
+            if (assignedIdentifier == null) return null;
 
-        // Search our current list of connected devices for one that matches the saved identifier.
-        for (InputDevice device : detectedDevices) {
-            if (assignedIdentifier.equals(getDeviceIdentifier(device))) {
-                return device; // Found it.
+            for (InputDevice device : detectedDevices) {
+                if (assignedIdentifier.equals(getDeviceIdentifier(device))) {
+                    return device;
+                }
             }
-        }
 
-        return null; // The assigned device is not currently connected.
+            return null;
+        }
     }
 
     /**
@@ -329,57 +349,74 @@ public class ControllerManager implements InputManager.InputDeviceListener {
      */
     public void setSlotEnabled(int slotIndex, boolean isEnabled) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return;
-        enabledSlots[slotIndex] = isEnabled;
+        synchronized (deviceStateLock) {
+            enabledSlots[slotIndex] = isEnabled;
+        }
         saveAssignments();
     }
 
+    /** Returns whether the given player slot is enabled. */
     public boolean isSlotEnabled(int slotIndex) {
         if (slotIndex < 0 || slotIndex >= WinHandler.MAX_PLAYERS) return false;
-        return enabledSlots[slotIndex];
+        synchronized (deviceStateLock) {
+            return enabledSlots[slotIndex];
+        }
     }
 
     /**
      * Auto-assigns a device to the first available slot.
      * If the device is already assigned, returns its existing slot.
-     * When only one controller is connected, it always gets slot 0 (P1) — this
-     * prevents stale multi-controller assignments from stranding a single controller
-     * in a non-P1 slot where games won't see it.
      * @param deviceId The Android device ID from the input event.
      * @return The slot index (0-3), or -1 if no slot available or device is not a controller.
      */
     public int autoAssignDevice(int deviceId) {
-        InputDevice device = inputManager.getInputDevice(deviceId);
-        if (device == null || !isGameController(device)) return -1;
-
         int existingSlot = getSlotForDevice(deviceId);
-
-        // Single-controller fast path: if this is the only connected controller and
-        // it's not already in slot 0, move it there so P1 is always populated.
-        // Also require that detectedDevices actually contains the current device — without
-        // this, a stale cache (e.g. P2 just plugged in but onInputDeviceAdded hasn't fired
-        // yet) would see size==1 from the previous device and incorrectly evict P1 from slot 0.
-        if (detectedDevices.size() == 1 && detectedDevices.get(0).getId() == deviceId && existingSlot != 0) {
-            String deviceIdentifier = getDeviceIdentifier(device);
-            if (existingSlot >= 0) {
-                slotAssignments.remove(existingSlot);
-            }
-            slotAssignments.put(0, deviceIdentifier);
-            enabledSlots[0] = true;
-            saveAssignments();
-            return 0;
-        }
-
         if (existingSlot >= 0) {
             return isSlotEnabled(existingSlot) ? existingSlot : -1;
         }
 
-        for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
-            if (slotAssignments.get(i) == null) {
-                assignDeviceToSlot(i, device);
-                setSlotEnabled(i, true);
-                return i;
+        InputDevice device = inputManager.getInputDevice(deviceId);
+        if (device == null || !isGameController(device)) {
+            return -1;
+        }
+
+        int assignedSlot = -1;
+        synchronized (deviceStateLock) {
+            // Keep detectedDevices in sync so getAssignedDeviceForSlot can
+            // resolve this device without waiting for the next scanForDevices().
+            String identifier = getDeviceIdentifier(device);
+            if (identifier == null) return -1;
+            boolean alreadyDetected = false;
+            for (InputDevice d : detectedDevices) {
+                if (identifier.equals(getDeviceIdentifier(d))) { alreadyDetected = true; break; }
+            }
+            if (!alreadyDetected) detectedDevices.add(device);
+
+            for (int i = 0; i < WinHandler.MAX_PLAYERS; i++) {
+                if (slotAssignments.get(i) == null) {
+                    // Inline the mutations that assignDeviceToSlot/setSlotEnabled
+                    // would perform so both updates are atomic under one lock
+                    // acquisition and saveAssignments() is called only once.
+                    for (int j = 0; j < WinHandler.MAX_PLAYERS; j++) {
+                        if (identifier.equals(slotAssignments.get(j))) {
+                            slotAssignments.remove(j);
+                        }
+                    }
+                    slotAssignments.put(i, identifier);
+                    enabledSlots[i] = true;
+                    assignedSlot = i;
+                    break;
+                }
             }
         }
+        if (assignedSlot >= 0) {
+            saveAssignments();
+            android.util.Log.i("ControllerSlot", "autoAssign: '" + device.getName()
+                    + "' -> slot=" + assignedSlot);
+            return assignedSlot;
+        }
+        android.util.Log.w("ControllerSlot", "autoAssign: no slot available for '"
+                + device.getName() + "'");
         return -1;
     }
 }

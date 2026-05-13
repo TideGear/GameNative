@@ -10,13 +10,18 @@ import java.io.File;
 public final class ImageFSLegacyMigrator {
     private ImageFSLegacyMigrator() {}
 
-    public static boolean migrateLegacyDirsIfNeeded(Context context, File legacyImageFsRoot) {
+    /**
+     * Migrate legacy directories if needed. After that, ensure the shared home and proton are symlinked.
+     */
+    public static boolean migrateLegacyDirsIfNeeded(Context context, File legacyImageFsRoot, String wineVersion) {
         if (!migrateLegacyHomeToShared(context, legacyImageFsRoot)) {
             return false;
         }
         if (!migrateLegacyProtonToShared(context, legacyImageFsRoot)) {
             return false;
         }
+        ImageFsInstaller.ensureSharedHomeRoot(context, legacyImageFsRoot);
+        ImageFsInstaller.ensureProtonVersionSymlink(context, legacyImageFsRoot, wineVersion);
         return true;
     }
 
@@ -78,7 +83,11 @@ public final class ImageFSLegacyMigrator {
 
             File sharedProtonDir = new File(ImageFs.getSharedProtonDir(context), entry.getName());
             if (sharedProtonDir.exists()) {
-                Log.w("ImageFSLegacyMigrator", "Shared Proton already exists; refusing to overwrite during migration: " + entry.getName());
+                Log.w("ImageFSLegacyMigrator", "Shared Proton already exists; removing duplicate legacy opt entry: " + entry.getName());
+                if (!FileUtils.delete(entry)) {
+                    Log.w("ImageFSLegacyMigrator", "Failed to remove duplicate legacy Proton directory: " + entry.getAbsolutePath());
+                    return false;
+                }
                 continue;
             }
 
