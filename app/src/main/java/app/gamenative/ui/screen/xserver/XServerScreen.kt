@@ -1314,7 +1314,13 @@ fun XServerScreen(
                     // Resume processes before exiting so they can receive SIGTERM cleanly.
                     forceResumeIfSuspended()
                     val gameExe = extractExecutableBasename(container.executablePath)
-                    val shutdownSteam = container.isLaunchRealSteam
+                    // Bionic Steam runs the same steam.exe in Wine (just with
+                    // libsteamclient.so loaded in-process), so `steam.exe -shutdown`
+                    // works there too — it delivers the Steam quit callback to the
+                    // game via the standard SteamAPI path, the game saves and exits,
+                    // and Steam itself flushes. Without this, bionic mode fell
+                    // through to the else branch's hard-kill-after-delay.
+                    val shutdownSteam = container.isLaunchRealSteam || container.isLaunchBionicSteam
                     SnackbarManager.show(
                         context.getString(
                             if (shutdownSteam) R.string.exit_steam_shutdown_toast
