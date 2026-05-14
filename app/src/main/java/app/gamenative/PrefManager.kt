@@ -475,6 +475,13 @@ object PrefManager {
             setPref(DISABLE_STEAM_OVERLAY, value)
         }
 
+    private val LAUNCH_BIONIC_STEAM = booleanPreferencesKey("launch_bionic_steam")
+    var launchBionicSteam: Boolean
+        get() = getPref(LAUNCH_BIONIC_STEAM, false)
+        set(value) {
+            setPref(LAUNCH_BIONIC_STEAM, value)
+        }
+
     private val FORCE_DLC = booleanPreferencesKey("force_dlc")
     var forceDlc: Boolean
         get() = getPref(FORCE_DLC, false)
@@ -1061,6 +1068,21 @@ object PrefManager {
         get() = getPref(AMAZON_INSTALLED_GAMES_COUNT, 0)
         set(value) {
             setPref(AMAZON_INSTALLED_GAMES_COUNT, value)
+        }
+
+    // Cached recommendation JSON (single game) and timestamp
+    private val RECOMMENDATION_CACHE_JSON = stringPreferencesKey("recommendation_cache_json")
+    var recommendationCacheJson: String
+        get() = getPref(RECOMMENDATION_CACHE_JSON, "")
+        set(value) {
+            setPref(RECOMMENDATION_CACHE_JSON, value)
+        }
+
+    private val RECOMMENDATION_CACHE_TIMESTAMP = longPreferencesKey("recommendation_cache_timestamp")
+    var recommendationCacheTimestamp: Long
+        get() = getPref(RECOMMENDATION_CACHE_TIMESTAMP, 0L)
+        set(value) {
+            setPref(RECOMMENDATION_CACHE_TIMESTAMP, value)
         }
 
     // Show game recommendations in library

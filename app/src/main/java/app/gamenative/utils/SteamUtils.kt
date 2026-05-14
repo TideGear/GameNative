@@ -1519,7 +1519,12 @@ object SteamUtils {
             setupLightweightSteamConfig(imageFs, SteamService.userSteamId!!.accountID.toString(), container)
 
             putBackSteamDlls(appDirPath)
-            restoreOriginalExecutable(context, steamAppId)
+            // In bionic-Steam mode, the original executable must remain in place
+            // (the launch path runs steam.exe with the game's exe as its arg);
+            // don't restore the .orig swap in that mode.
+            if (!container.isLaunchBionicSteam) {
+                restoreOriginalExecutable(context, steamAppId)
+            }
             restoreSteamclientFiles(context, steamAppId)
 
             MarkerUtils.addMarker(appDirPath, Marker.STEAM_DLL_RESTORED)

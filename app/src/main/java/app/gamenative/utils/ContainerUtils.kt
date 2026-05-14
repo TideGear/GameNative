@@ -1,6 +1,7 @@
 package app.gamenative.utils
 
 import android.content.Context
+import android.os.Build
 import app.gamenative.PrefManager
 import app.gamenative.data.GameSource
 import app.gamenative.enums.Marker
@@ -18,6 +19,7 @@ import com.winlator.container.ContainerManager
 import com.winlator.core.DefaultVersion
 import com.winlator.core.FileUtils
 import com.winlator.core.GPUInformation
+import com.winlator.core.envvars.EnvVars
 import com.winlator.core.WineRegistryEditor
 import com.winlator.core.WineThemeManager
 import com.winlator.fexcore.FEXCoreManager
@@ -102,6 +104,7 @@ object ContainerUtils {
             showFPS = false,
             launchRealSteam = PrefManager.launchRealSteam,
             disableSteamOverlay = PrefManager.disableSteamOverlay,
+            launchBionicSteam = PrefManager.launchBionicSteam,
             cpuList = PrefManager.cpuList,
             cpuListWoW64 = PrefManager.cpuListWoW64,
             wow64Mode = PrefManager.wow64Mode,
@@ -162,6 +165,7 @@ object ContainerUtils {
         PrefManager.execArgs = containerData.execArgs
         PrefManager.launchRealSteam = containerData.launchRealSteam
         PrefManager.disableSteamOverlay = containerData.disableSteamOverlay
+        PrefManager.launchBionicSteam = containerData.launchBionicSteam
         PrefManager.cpuList = containerData.cpuList
         PrefManager.cpuListWoW64 = containerData.cpuListWoW64
         PrefManager.wow64Mode = containerData.wow64Mode
@@ -277,6 +281,7 @@ object ContainerUtils {
             launchRealSteam = container.isLaunchRealSteam,
             disableSteamOverlay = container.isDisableSteamOverlay,
             sdkCloudSaveSubdir = container.sdkCloudSaveSubdir,
+            launchBionicSteam = container.isLaunchBionicSteam,
             allowSteamUpdates = container.isAllowSteamUpdates,
             steamType = container.getSteamType(),
             cpuList = container.cpuList,
@@ -454,6 +459,7 @@ object ContainerUtils {
         container.isLaunchRealSteam = containerData.launchRealSteam
         container.isDisableSteamOverlay = containerData.disableSteamOverlay
         container.sdkCloudSaveSubdir = containerData.sdkCloudSaveSubdir
+        container.isLaunchBionicSteam = containerData.launchBionicSteam
         container.isAllowSteamUpdates = containerData.allowSteamUpdates
         container.setSteamType(containerData.steamType)
         container.cpuList = containerData.cpuList
@@ -827,6 +833,14 @@ object ContainerUtils {
             applyBestConfigMapToContainerData(containerData, bestConfigMap)
         } else {
             containerData
+        }
+
+        if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+            val ev = EnvVars(containerData.envVars)
+            if (!ev.has("FD_DEV_FEATURES")) {
+                ev.put("FD_DEV_FEATURES", "enable_tp_ubwc_flag_hint=1")
+                containerData = containerData.copy(envVars = ev.toString())
+            }
         }
 
         // If custom config is provided, just apply it and return

@@ -459,7 +459,11 @@ class MainViewModel @Inject constructor(
                     // we won't need until the next real-Steam launch. Re-extraction
                     // on the next transition is fast.
                     val previousMode = container.getExtra("lastSteamMode", "")
-                    val currentMode = if (container.isLaunchRealSteam()) "real" else "emu"
+                    val currentMode = when {
+                        container.isLaunchRealSteam() -> "real"
+                        container.isLaunchBionicSteam() -> "bionic"
+                        else -> "emu"
+                    }
                     if (previousMode != currentMode) {
                         container.putExtra("lastSteamMode", currentMode)
                         container.saveData()
@@ -467,7 +471,7 @@ class MainViewModel @Inject constructor(
                             SteamUtils.cleanupExtractedSteamFiles(context, container)
                         }
                     }
-                    if (container.isLaunchRealSteam()) {
+                    if (container.isLaunchRealSteam() || container.isLaunchBionicSteam()) {
                         SteamUtils.restoreSteamApi(context, appId)
                     } else {
                         val offline = _offline.value
@@ -662,7 +666,7 @@ class MainViewModel @Inject constructor(
                         // When launchRealSteam is true, let the real Steam client handle the "game is running" notification
                         val shouldLaunchRealSteam = try {
                             val container = ContainerUtils.getContainer(context, appId)
-                            container.isLaunchRealSteam()
+                            container.isLaunchRealSteam() || container.isLaunchBionicSteam()
                         } catch (e: Exception) {
                             // Container might not exist, default to notifying Steam
                             false
