@@ -2676,20 +2676,27 @@ object SteamUtils {
         }
         if (!gameSaveDir.exists()) gameSaveDir.mkdirs()
 
-        remoteDir.listFiles()?.forEach { src ->
-            if (!src.isFile) return@forEach
-            val dst = File(gameSaveDir, src.name)
-            try {
-                Files.copy(
-                    src.toPath(),
-                    dst.toPath(),
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.COPY_ATTRIBUTES,
-                )
-                Timber.i("SDK cloud mirror remote->save appId=$appId: ${src.name} (${src.length()} bytes)")
-            } catch (e: Exception) {
-                Timber.w(e, "Failed to mirror ${src.name} remote->save appId=$appId")
-            }
+        val remoteBase = remoteDir.toPath()
+        val saveBase = gameSaveDir.toPath()
+        Files.walk(remoteBase).use { stream ->
+            stream
+                .filter { Files.isRegularFile(it) }
+                .forEach { src ->
+                    val rel = remoteBase.relativize(src)
+                    val dst = saveBase.resolve(rel)
+                    try {
+                        dst.parent?.let { Files.createDirectories(it) }
+                        Files.copy(
+                            src,
+                            dst,
+                            StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.COPY_ATTRIBUTES,
+                        )
+                        Timber.i("SDK cloud mirror remote->save appId=$appId: $rel (${Files.size(src)} bytes)")
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to mirror $rel remote->save appId=$appId")
+                    }
+                }
         }
     }
 
@@ -2700,23 +2707,34 @@ object SteamUtils {
         if (!gameSaveDir.exists()) return
         if (!remoteDir.exists()) remoteDir.mkdirs()
 
-        gameSaveDir.listFiles()?.forEach { src ->
-            if (!src.isFile) return@forEach
-            // Skip local-only artifacts (e.g. Dead Cells writes backup-YYYY-MM-DD-N.zip snapshots
-            // alongside saves; those aren't cloud-synced).
-            if (src.name.startsWith("backup-") && src.name.endsWith(".zip")) return@forEach
-            val dst = File(remoteDir, src.name)
-            try {
-                Files.copy(
-                    src.toPath(),
-                    dst.toPath(),
-                    StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.COPY_ATTRIBUTES,
-                )
-                Timber.i("SDK cloud mirror save->remote appId=$appId: ${src.name} (${src.length()} bytes)")
-            } catch (e: Exception) {
-                Timber.w(e, "Failed to mirror ${src.name} save->remote appId=$appId")
-            }
+        val saveBase = gameSaveDir.toPath()
+        val remoteBase = remoteDir.toPath()
+        Files.walk(saveBase).use { stream ->
+            stream
+                .filter { Files.isRegularFile(it) }
+                .forEach { src ->
+                    // Skip local-only artifacts (e.g. Dead Cells writes
+                    // backup-YYYY-MM-DD-N.zip snapshots alongside saves; those aren't
+                    // cloud-synced). Filename-only check — a nested "backup-*.zip" deep
+                    // in a saves hierarchy is still treated the same; preserves the
+                    // pre-recursive behavior for that specific exclusion.
+                    val fname = src.fileName.toString()
+                    if (fname.startsWith("backup-") && fname.endsWith(".zip")) return@forEach
+                    val rel = saveBase.relativize(src)
+                    val dst = remoteBase.resolve(rel)
+                    try {
+                        dst.parent?.let { Files.createDirectories(it) }
+                        Files.copy(
+                            src,
+                            dst,
+                            StandardCopyOption.REPLACE_EXISTING,
+                            StandardCopyOption.COPY_ATTRIBUTES,
+                        )
+                        Timber.i("SDK cloud mirror save->remote appId=$appId: $rel (${Files.size(src)} bytes)")
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to mirror $rel save->remote appId=$appId")
+                    }
+                }
         }
     }
 

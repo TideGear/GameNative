@@ -1341,8 +1341,17 @@ fun XServerScreen(
                                     onEscalationResolved = { steamShutdownDialogResolver = null },
                                 )
                             } else {
-                                if (gameExe.isNotEmpty()) winHandler.killProcess(gameExe)
+                                // Non-Steam exit path: no Steam IPC to ask the game to
+                                // quit politely. WinHandler currently has no WM_CLOSE
+                                // primitive (would require a new RequestCode + a
+                                // winhandler.exe change), so we can't actively signal
+                                // the game. We still wait the grace window first to
+                                // let any in-flight game-side exit (autosave, an
+                                // in-game quit dialog the user also clicked) complete
+                                // before we hard-kill. killProcess runs as the
+                                // escalation after the timeout.
                                 delay(GRACEFUL_EXIT_GRACE_MS)
+                                if (gameExe.isNotEmpty()) winHandler.killProcess(gameExe)
                             }
                             exit(winHandler, frameRating, currentAppInfo, container, appId, onExit, navigateBack)
                         } catch (ce: kotlinx.coroutines.CancellationException) {
