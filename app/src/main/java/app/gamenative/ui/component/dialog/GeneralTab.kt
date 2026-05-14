@@ -389,7 +389,6 @@ fun GeneralTabContent(
                 state = config.disableSteamOverlay,
                 onCheckedChange = { state.config.value = config.copy(disableSteamOverlay = it) },
             )
-            SdkCloudSaveSubdirField(state = state, config = config)
         }
         if (config.containerVariant.equals(Container.BIONIC, ignoreCase = true)) {
             SettingsSwitch(
@@ -405,6 +404,9 @@ fun GeneralTabContent(
                     }
                 },
             )
+        }
+        if (config.launchRealSteam || config.launchBionicSteam) {
+            SdkCloudSaveSubdirField(state = state, config = config)
         }
         val steamTypeItems = listOf("Normal", "Light", "Ultra Light")
         val currentSteamTypeIndex = when (config.steamType.lowercase()) {

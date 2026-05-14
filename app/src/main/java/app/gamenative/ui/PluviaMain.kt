@@ -1659,7 +1659,7 @@ fun preLaunchApp(
             !ignorePendingOperations &&
             preferredSave == SaveLocation.None &&
             gameSource == GameSource.STEAM &&
-            container.isLaunchRealSteam &&
+            (container.isLaunchRealSteam || container.isLaunchBionicSteam) &&
             container.sdkCloudSaveSubdir.isBlank() &&
             container.getExtra("sdkCloudBridgePromptDismissed", "") != "1"
         ) {
